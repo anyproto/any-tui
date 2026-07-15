@@ -20,11 +20,22 @@ const PEER: Color = Color::Magenta;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
-    let cols =
-        Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(20)]).split(root[0]);
 
-    draw_sidebar(f, app, cols[0]);
-    draw_chat(f, app, cols[1]);
+    app.single_now = app.layout.is_single(f.area().width);
+    if app.single_now {
+        // One pane at a time: whichever has focus. The status bar still carries
+        // unread for every other chat, which is the only cue left when the
+        // sidebar is hidden.
+        match app.focus {
+            Focus::Sidebar => draw_sidebar(f, app, root[0]),
+            Focus::Messages => draw_chat(f, app, root[0]),
+        }
+    } else {
+        let cols =
+            Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(20)]).split(root[0]);
+        draw_sidebar(f, app, cols[0]);
+        draw_chat(f, app, cols[1]);
+    }
     draw_status(f, app, root[1]);
 
     if app.show_help {
@@ -170,7 +181,10 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
     let focused = app.focus == Focus::Messages;
+    // With the sidebar hidden, the title is the only breadcrumb, so it also
+    // advertises the way back.
     let title = match app.active_chat() {
+        Some(c) if app.single_now => format!(" ‹ Esc  {} ", c.qualified()),
         Some(c) => format!(" {} ", c.qualified()),
         None => " no chat open ".to_string(),
     };
@@ -287,8 +301,10 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
                     )
                 })
                 .unwrap_or_else(|| "…".to_string());
+            // Truncate against the real pane width, otherwise a narrow pane
+            // clips this mid-word with no ellipsis to show it was cut.
             lines.push(Line::from(Span::styled(
-                format!("  ↪ {snippet}"),
+                format!("  ↪ {}", one_line(&snippet, text_w.saturating_sub(2))),
                 Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
             )));
         }
@@ -346,10 +362,14 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         let cx = inner.x + (app.input.width() as u16).min(inner.width.saturating_sub(1));
         f.set_cursor_position((cx, inner.y));
     } else {
-        let hint = if app.active.is_some() {
-            "  i  compose   r  reply   ?  help"
-        } else {
-            "  Enter  open chat   ?  help"
+        // Keep the hint short enough for a phone-width pane.
+        let narrow = area.width < 60;
+        let hint = match (app.active.is_some(), app.single_now, narrow) {
+            (true, true, true) => "  Esc back · i compose",
+            (true, true, false) => "  Esc  back to chats   i  compose   r  reply   ?  help",
+            (true, false, _) => "  i  compose   r  reply   ?  help",
+            (false, _, true) => "  Enter open · ? help",
+            (false, _, false) => "  Enter  open chat   ?  help",
         };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
@@ -373,11 +393,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let label = match app.mode {
+        Mode::Insert => " INSERT ",
+        Mode::Normal => " NORMAL ",
+    };
     let mut spans = vec![Span::styled(
-        match app.mode {
-            Mode::Insert => " INSERT ",
-            Mode::Normal => " NORMAL ",
-        },
+        label,
         Style::default()
             .fg(Color::Black)
             .bg(match app.mode {
@@ -387,51 +408,90 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )];
 
-    // The headline feature: unread elsewhere, always visible.
+    // Everything here is budgeted against the real width: on a phone-width
+    // pane this bar is the only unread cue, so it must never wrap away.
+    let total = area.width as usize;
+    let mut used = label.width();
+    let narrow = total < 60;
+
+    let scroll_txt = if app.scroll > 0 {
+        format!("  ↑{}", app.scroll)
+    } else {
+        String::new()
+    };
+    let reserve = scroll_txt.width();
+
     let others = app.other_unread();
     if others.is_empty() {
-        spans.push(Span::styled(
-            "  no unread elsewhere",
-            Style::default().fg(DIM),
-        ));
-    } else {
-        spans.push(Span::styled("  new: ", Style::default().fg(DIM)));
-        for c in others.iter().take(4) {
-            spans.push(Span::styled(
-                format!("●{} {}  ", c.qualified(), c.unread),
-                Style::default().fg(UNREAD),
-            ));
+        let t = if narrow {
+            "  no unread"
+        } else {
+            "  no unread elsewhere"
+        };
+        if used + t.width() + reserve <= total {
+            spans.push(Span::styled(t, Style::default().fg(DIM)));
         }
-        if others.len() > 4 {
-            spans.push(Span::styled(
-                format!("+{} more", others.len() - 4),
-                Style::default().fg(DIM),
-            ));
+    } else {
+        let head = "  new: ";
+        if used + head.width() + reserve <= total {
+            spans.push(Span::styled(head, Style::default().fg(DIM)));
+            used += head.width();
+        }
+        let mut shown = 0;
+        for c in others.iter() {
+            // Narrow screens get the space name: it distinguishes chats better
+            // than the label, which is almost always "general".
+            let name = if narrow {
+                c.space_name.clone()
+            } else {
+                c.qualified()
+            };
+            let e = format!("●{} {}  ", name, c.unread);
+            // Leave room for a "+N" overflow marker.
+            if used + e.width() + reserve + 4 > total {
+                break;
+            }
+            spans.push(Span::styled(e.clone(), Style::default().fg(UNREAD)));
+            used += e.width();
+            shown += 1;
+        }
+        if shown < others.len() {
+            let more = format!("+{}", others.len() - shown);
+            if used + more.width() + reserve <= total {
+                spans.push(Span::styled(more, Style::default().fg(UNREAD).bold()));
+            }
         }
     }
 
-    if app.scroll > 0 {
-        spans.push(Span::styled(
-            format!("  ↑{} lines", app.scroll),
-            Style::default().fg(Color::Blue),
-        ));
+    if !scroll_txt.is_empty() {
+        spans.push(Span::styled(scroll_txt, Style::default().fg(Color::Blue)));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help(f: &mut Frame, area: Rect, version: &str) {
+    // A phone-width pane can't fit the roomy keymap, and clipped help is worse
+    // than terse help.
+    if area.width < 56 {
+        return draw_help_compact(f, area, version);
+    }
     let text = vec![
         "  Navigation",
         "    j / k, ↓ / ↑    move selection · scroll messages",
-        "    Tab             switch pane (chats ⇄ messages)",
         "    Enter           open selected chat",
-        "    n               jump to next chat with unread",
+        "    Esc / h         back to chat list",
+        "    Tab             switch pane",
+        "    n               next chat with unread",
         "    g / G           oldest / newest message",
         "    Ctrl-d / Ctrl-u half page down / up",
         "",
+        "  Layout",
+        "    z               one pane ⇄ two panes",
+        "                    (one pane is automatic under 80 cols)",
+        "",
         "  Messages",
-        "    i               compose (Esc to cancel, Enter to send)",
+        "    i               compose (Esc cancels, Enter sends)",
         "    r               reply to newest message",
         "    R               mark chat read now",
         "",
@@ -439,8 +499,8 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    ?               toggle this help",
         "    q / Ctrl-c      quit",
         "",
-        "  Unread counts update live; the bar at the bottom",
-        "  tracks new messages in every other chat.",
+        "  The bottom bar tracks unread in every other chat,",
+        "  live, even when the chat list is hidden.",
     ];
     let w = 60.min(area.width.saturating_sub(4));
     // +1 for the daemon line appended below, +2 for the border.
@@ -464,7 +524,58 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::Gray))))
         .collect();
     lines.push(Line::from(Span::styled(
-        format!("  daemon: {}", truncate(version, 52)),
+        one_line(
+            &format!("  daemon: {version}"),
+            inner.width as usize,
+        ),
+        Style::default().fg(DIM),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
+    let text = vec![
+        "  Navigate",
+        "   j/k      move · scroll",
+        "   Enter    open chat",
+        "   Esc/h    back to list",
+        "   Tab      switch pane",
+        "   n        next unread",
+        "   g/G      oldest/newest",
+        "   C-d/C-u  half page",
+        "",
+        "  Layout",
+        "   z        1 ⇄ 2 panes",
+        "",
+        "  Message",
+        "   i        compose",
+        "   r        reply",
+        "   R        mark read",
+        "",
+        "   ?  help      q  quit",
+    ];
+    let w = 30.min(area.width.saturating_sub(2));
+    let h = (text.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" keys ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let mut lines: Vec<Line> = text
+        .iter()
+        .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::Gray))))
+        .collect();
+    lines.push(Line::from(Span::styled(
+        one_line(&format!("  {version}"), inner.width as usize),
         Style::default().fg(DIM),
     )));
     f.render_widget(Paragraph::new(lines), inner);

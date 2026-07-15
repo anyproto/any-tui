@@ -25,6 +25,27 @@ struct Args {
     /// Don't mark chats read automatically when you view them.
     #[arg(long)]
     no_auto_read: bool,
+    /// Pane layout: auto shows one pane below 80 columns (phone-width tmux),
+    /// two above. Toggle at runtime with z.
+    #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
+    layout: LayoutArg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum LayoutArg {
+    Auto,
+    Split,
+    Single,
+}
+
+impl From<LayoutArg> for app::Layout {
+    fn from(a: LayoutArg) -> app::Layout {
+        match a {
+            LayoutArg::Auto => app::Layout::Auto,
+            LayoutArg::Split => app::Layout::Split,
+            LayoutArg::Single => app::Layout::Single,
+        }
+    }
 }
 
 #[tokio::main]
@@ -48,6 +69,7 @@ async fn main() -> Result<()> {
         health.account.clone(),
         health.version.clone(),
         !args.no_auto_read,
+        args.layout.into(),
     );
     for id in identities {
         app.names.insert(id.identity, id.name);
@@ -216,11 +238,15 @@ fn on_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
-        KeyCode::Esc => {
+        KeyCode::Char('z') => app.toggle_layout(),
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
             if app.show_help {
                 app.show_help = false;
-            } else {
+            } else if app.reply_to.is_some() {
                 app.reply_to = None;
+            } else {
+                // Primary way back to the chat list when it's the hidden pane.
+                app.back_to_list();
             }
         }
         KeyCode::Tab => {
@@ -262,6 +288,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('i') => {
             if app.active.is_some() {
                 app.mode = Mode::Insert;
+                // The input box lives in the message pane; in single-pane mode
+                // it isn't on screen unless we focus it.
+                app.focus = Focus::Messages;
             } else {
                 app.toast("open a chat first (Enter)");
             }
@@ -270,6 +299,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             if let Some(last) = app.msgs.last() {
                 app.reply_to = Some(last.id.clone());
                 app.mode = Mode::Insert;
+                app.focus = Focus::Messages;
             }
         }
         KeyCode::Char('R') => app.mark_read_now(),

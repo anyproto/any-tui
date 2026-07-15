@@ -38,6 +38,28 @@ pub enum Mode {
     Insert,
 }
 
+/// Below this width a sidebar plus a message pane leaves too little room for
+/// either, so we show one at a time. Phone-sized tmux panes land here.
+pub const NARROW_COLS: u16 = 80;
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Layout {
+    /// Single pane when the terminal is narrow, split when it's wide.
+    Auto,
+    Split,
+    Single,
+}
+
+impl Layout {
+    pub fn is_single(&self, width: u16) -> bool {
+        match self {
+            Layout::Auto => width < NARROW_COLS,
+            Layout::Split => false,
+            Layout::Single => true,
+        }
+    }
+}
+
 pub struct App {
     pub api: Api,
     pub tx: UnboundedSender<Ev>,
@@ -53,6 +75,10 @@ pub struct App {
     pub msgs: Vec<Message>,
     pub focus: Focus,
     pub mode: Mode,
+    pub layout: Layout,
+    /// Whether the last frame actually rendered as a single pane; `z` flips
+    /// relative to what's on screen, which Auto only knows at draw time.
+    pub single_now: bool,
     pub input: String,
     /// Lines scrolled up from the bottom. 0 == pinned to newest.
     pub scroll: usize,
@@ -75,7 +101,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(api: Api, tx: UnboundedSender<Ev>, me: String, version: String, auto_read: bool) -> App {
+    pub fn new(
+        api: Api,
+        tx: UnboundedSender<Ev>,
+        me: String,
+        version: String,
+        auto_read: bool,
+        layout: Layout,
+    ) -> App {
         App {
             api,
             tx,
@@ -90,6 +123,8 @@ impl App {
             msgs: Vec::new(),
             focus: Focus::Sidebar,
             mode: Mode::Normal,
+            layout,
+            single_now: false,
             input: String::new(),
             scroll: 0,
             reply_to: None,
@@ -145,6 +180,26 @@ impl App {
 
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Flips between one pane and two, relative to what's currently on screen,
+    /// and pins the choice so Auto stops overriding it.
+    pub fn toggle_layout(&mut self) {
+        self.layout = if self.single_now {
+            Layout::Split
+        } else {
+            Layout::Single
+        };
+        self.toast(match self.layout {
+            Layout::Split => "two panes (z to go back)",
+            _ => "one pane (z to go back)",
+        });
+    }
+
+    /// Back out of the message pane to the chat list. On a narrow screen this
+    /// is what actually swaps the visible pane.
+    pub fn back_to_list(&mut self) {
+        self.focus = Focus::Sidebar;
     }
 
     // ---- chat list -------------------------------------------------------
