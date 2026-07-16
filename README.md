@@ -159,10 +159,21 @@ A `── new ──` rule marks where your unread starts.
 | `i` | compose |
 | `Enter` | send |
 | `Alt-Enter` (or `Ctrl-j`) | newline — `Enter` is taken by send |
-| `Ctrl-u` | clear the box |
 | `r` | reply to the message under the cursor |
 | `R` | mark this chat read right now |
 | `Esc` | cancel |
+
+The composer supports the usual **readline editing** — a movable cursor, not
+just append-and-backspace. The same keys work in the `Space` picker's query:
+
+| key | action |
+| --- | --- |
+| `←` / `→`, `Ctrl-b` / `Ctrl-f` | move by character |
+| `Ctrl-←` / `Ctrl-→`, `Alt-b` / `Alt-f` | move by word |
+| `Ctrl-a` / `Ctrl-e`, `Home` / `End` | start / end |
+| `Backspace`, `Delete` (`Ctrl-d`) | delete char before / after |
+| `Ctrl-w` (`Alt-Backspace`), `Alt-d` | delete word before / after |
+| `Ctrl-u` | clear to start · `Ctrl-k` clear to end |
 
 The composer wraps at word boundaries and **grows as you type**, up to 8 lines,
 then scrolls. Replying pins a banner above it naming exactly who and what

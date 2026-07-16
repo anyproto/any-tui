@@ -82,12 +82,13 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled("> ", Style::default().fg(ACCENT).bold()),
-            Span::raw(p.query.clone()),
+            Span::raw(p.query.value().to_string()),
         ])),
         parts[0],
     );
+    // Cursor tracks the edit position, not just the end of the text.
     f.set_cursor_position((
-        parts[0].x + 4 + (p.query.width() as u16).min(parts[0].width.saturating_sub(5)),
+        parts[0].x + 4 + (p.query.visual_cursor() as u16).min(parts[0].width.saturating_sub(5)),
         parts[0].y,
     ));
 
@@ -527,7 +528,7 @@ fn input_height(app: &App, width: u16) -> u16 {
         return 1;
     }
     let inner_w = (width.saturating_sub(2) as usize).max(1);
-    let lines = wrap_input(&app.input, inner_w).len().clamp(1, MAX_INPUT_LINES);
+    let lines = wrap_input(app.input.value(), inner_w).len().clamp(1, MAX_INPUT_LINES);
     let banner = if app.reply_to.is_some() { 1 } else { 0 };
     lines as u16 + 2 + banner
 }
@@ -576,19 +577,21 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let wrapped = wrap_input(&app.input, inner.width.max(1) as usize);
-        // Show the tail once the text outgrows the box.
-        let start = wrapped.len().saturating_sub(inner.height as usize);
+        let w = inner.width.max(1) as usize;
+        let (wrapped, crow, ccol) =
+            wrap_input_cursor(app.input.value(), w, app.input.cursor());
+        // Scroll so the cursor row stays visible once the text outgrows the box,
+        // keeping the cursor on the bottom visible row as it moves past the end.
+        let h = inner.height as usize;
+        let start = (crow as usize + 1).saturating_sub(h);
         let shown: Vec<Line> = wrapped[start..]
             .iter()
             .map(|l| Line::from(l.clone()))
             .collect();
-        let last = wrapped.last().cloned().unwrap_or_default();
         f.render_widget(Paragraph::new(shown), inner);
 
-        // Park the cursor at the end of the typed text.
-        let cy = inner.y + (wrapped.len().saturating_sub(start + 1) as u16).min(inner.height - 1);
-        let cx = inner.x + (last.width() as u16).min(inner.width.saturating_sub(1));
+        let cy = inner.y + (crow.saturating_sub(start as u16)).min(inner.height.saturating_sub(1));
+        let cx = inner.x + ccol.min(inner.width.saturating_sub(1));
         f.set_cursor_position((cx, cy));
     } else {
         // Keep the hint short enough for a phone-width pane.
@@ -857,6 +860,64 @@ fn wrap_input(s: &str, width: usize) -> Vec<String> {
 
 fn line_width(cs: &[char]) -> usize {
     cs.iter().map(|c| c.to_string().width()).sum()
+}
+
+/// Like [`wrap_input`], but also reports where the edit cursor (a source char
+/// index) lands in the wrapped output as `(row, col)`. Kept in lock-step with
+/// `wrap_input`'s breaking rules so the cursor sits exactly on the glyph it
+/// edits, including across soft wraps and explicit newlines.
+fn wrap_input_cursor(s: &str, width: usize, cursor: usize) -> (Vec<String>, u16, u16) {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur: Vec<char> = Vec::new();
+    let mut cpos: Option<(usize, usize)> = None;
+    let mut gi = 0usize; // source chars consumed so far
+
+    // The cursor sits before the char at index `cursor`; record its position
+    // the moment we've consumed exactly that many source chars.
+    macro_rules! mark {
+        () => {
+            if cpos.is_none() && gi == cursor {
+                cpos = Some((out.len(), line_width(&cur)));
+            }
+        };
+    }
+
+    mark!();
+    for ch in s.chars() {
+        if ch == '\n' {
+            out.push(cur.iter().collect());
+            cur = Vec::new();
+            gi += 1;
+            mark!();
+            continue;
+        }
+        cur.push(ch);
+        if line_width(&cur) > width {
+            match cur.iter().rposition(|c| *c == ' ') {
+                Some(b) if b > 0 => {
+                    let rest: Vec<char> = cur.split_off(b + 1);
+                    while cur.last() == Some(&' ') {
+                        cur.pop();
+                    }
+                    out.push(cur.iter().collect());
+                    cur = rest;
+                }
+                _ => {
+                    let last = cur.pop().unwrap_or(' ');
+                    out.push(cur.iter().collect());
+                    cur = vec![last];
+                }
+            }
+        }
+        gi += 1;
+        mark!();
+    }
+    out.push(cur.iter().collect());
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    let (row, col) = cpos.unwrap_or((out.len() - 1, 0));
+    (out, row as u16, col as u16)
 }
 
 /// Greedy word wrap on display width, preserving explicit newlines.

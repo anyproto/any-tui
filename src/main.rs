@@ -5,6 +5,7 @@
 
 mod api;
 mod app;
+mod edit;
 mod fuzzy;
 mod model;
 mod sse;
@@ -227,25 +228,17 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('p') if ctrl => app.picker_move(-1),
             KeyCode::Char('j') if ctrl => app.picker_move(1),
             KeyCode::Char('k') if ctrl => app.picker_move(-1),
-            KeyCode::Char('u') if ctrl => {
-                if let Some(p) = &mut app.picker {
-                    p.query.clear();
+            // Everything else is line editing on the query.
+            _ => {
+                let edited = app
+                    .picker
+                    .as_mut()
+                    .map(|p| edit::apply_edit_key(&mut p.query, &k, false))
+                    .unwrap_or(false);
+                if edited {
+                    app.picker_filter();
                 }
-                app.picker_filter();
             }
-            KeyCode::Backspace => {
-                if let Some(p) = &mut app.picker {
-                    p.query.pop();
-                }
-                app.picker_filter();
-            }
-            KeyCode::Char(c) if !ctrl => {
-                if let Some(p) = &mut app.picker {
-                    p.query.push(c);
-                }
-                app.picker_filter();
-            }
-            _ => {}
         }
         return;
     }
@@ -268,18 +261,16 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.reply_to = None;
             }
             // Enter sends, so an explicit newline needs its own key. Alt-Enter
-            // is the common one; Ctrl-J is the terminal-friendly fallback.
+            // is the common one; Ctrl-J (handled by the editor) is the
+            // terminal-friendly fallback.
             KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
-                app.input.push('\n')
+                app.input.handle(tui_input::InputRequest::InsertChar('\n'));
             }
-            KeyCode::Char('j') if ctrl => app.input.push('\n'),
             KeyCode::Enter => app.send_input(),
-            KeyCode::Backspace => {
-                app.input.pop();
+            // Full readline editing: cursor movement, word jumps, kill keys.
+            _ => {
+                edit::apply_edit_key(&mut app.input, &k, true);
             }
-            KeyCode::Char('u') if ctrl => app.input.clear(),
-            KeyCode::Char(c) if !ctrl => app.input.push(c),
-            _ => {}
         }
         return;
     }

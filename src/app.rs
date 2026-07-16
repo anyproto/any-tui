@@ -1,6 +1,7 @@
 use crate::api::Api;
 use crate::model::{Chat, Message, Space};
 use crate::sse::{Frame, SseReader};
+use tui_input::Input;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -76,7 +77,7 @@ pub struct PickItem {
 
 /// Centred fuzzy chat picker, in the spirit of helix's buffer/file menus.
 pub struct Picker {
-    pub query: String,
+    pub query: Input,
     pub sel: usize,
     pub items: Vec<PickItem>,
 }
@@ -105,7 +106,7 @@ pub struct App {
     /// Whether the last frame actually rendered as a single pane; `z` flips
     /// relative to what's on screen, which Auto only knows at draw time.
     pub single_now: bool,
-    pub input: String,
+    pub input: Input,
     /// Lines scrolled up from the bottom. 0 == pinned to newest.
     pub scroll: usize,
     pub reply_to: Option<String>,
@@ -154,7 +155,7 @@ impl App {
             mode: Mode::Normal,
             layout,
             single_now: false,
-            input: String::new(),
+            input: Input::default(),
             scroll: 0,
             reply_to: None,
             toast: None,
@@ -517,7 +518,7 @@ impl App {
     }
 
     pub fn send_input(&mut self) {
-        let text = self.input.trim().to_string();
+        let text = self.input.value().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -525,7 +526,7 @@ impl App {
             self.toast("no chat open");
             return;
         };
-        self.input.clear();
+        self.input.reset();
         let reply = self.reply_to.take();
         self.scroll = 0;
         // Jump to the bottom so you see what you just sent land.
@@ -556,7 +557,7 @@ impl App {
             return;
         }
         self.picker = Some(Picker {
-            query: String::new(),
+            query: Input::default(),
             sel: 0,
             items: Vec::new(),
         });
@@ -571,7 +572,7 @@ impl App {
     /// otherwise rows are ranked by fuzzy score.
     pub fn picker_filter(&mut self) {
         let Some(p) = &self.picker else { return };
-        let query = p.query.clone();
+        let query = p.query.value().to_string();
         let keep = p.items.get(p.sel).map(|i| i.object_id.clone());
 
         let mut scored: Vec<(i32, PickItem)> = Vec::new();
