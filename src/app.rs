@@ -121,6 +121,9 @@ pub struct App {
     pub view_lines: usize,
     pub view_height: usize,
     msg_task: Option<JoinHandle<()>>,
+    /// One live preview subscription per chat, keyed by object id so we spawn
+    /// each once and can abort it when the chat goes away.
+    preview_subs: HashMap<String, JoinHandle<()>>,
     last_read_marked: HashMap<String, String>,
 }
 
@@ -164,6 +167,7 @@ impl App {
             view_lines: 0,
             view_height: 0,
             msg_task: None,
+            preview_subs: HashMap::new(),
             last_read_marked: HashMap::new(),
         }
     }
@@ -232,46 +236,42 @@ impl App {
 
     pub fn upsert_chat(&mut self, mut chat: Chat) {
         let keep = self.selected_chat().map(|c| c.object_id.clone());
-        let mut need_preview = true;
         match self
             .chats
             .iter_mut()
             .find(|c| c.object_id == chat.object_id)
         {
             Some(existing) => {
-                // The subscription record has no message preview, so carry the
-                // one we already fetched rather than blanking the row.
+                // The objects-subscription record carries no message preview, so
+                // keep the one the preview subscription supplied rather than
+                // blanking the row.
                 chat.last_text = existing.last_text.clone();
                 chat.last_creator = existing.last_creator.clone();
                 chat.last_at = existing.last_at;
-                // Unread moved => new activity => the preview is stale.
-                need_preview =
-                    existing.last_text.is_none() || existing.unread != chat.unread;
                 *existing = chat.clone();
             }
             None => self.chats.push(chat.clone()),
         }
         self.sort_chats();
         self.restore_selection(keep);
-        if need_preview {
-            self.fetch_preview(&chat);
-        }
+        self.ensure_preview_sub(&chat);
     }
 
-    /// Pulls just the newest message of a chat to show as a sidebar preview.
-    fn fetch_preview(&self, chat: &Chat) {
-        let api = self.api.clone();
-        let tx = self.tx.clone();
-        let space_id = chat.space_id.clone();
-        let object_id = chat.object_id.clone();
-        tokio::spawn(async move {
-            if let Ok(msgs) = api.messages(&space_id, &object_id, 1, 0).await {
-                let _ = tx.send(Ev::Preview {
-                    object_id,
-                    msg: msgs.into_iter().next_back(),
-                });
-            }
-        });
+    /// Keeps each chat's sidebar preview live with its own tiny (window-of-1)
+    /// message subscription. The objects subscription only fires on unread
+    /// changes, so a message that doesn't move unread — e.g. one you send
+    /// yourself from another device — would otherwise never refresh the row.
+    fn ensure_preview_sub(&mut self, chat: &Chat) {
+        if self.preview_subs.contains_key(&chat.object_id) {
+            return; // already running
+        }
+        let handle = spawn_preview_sub(
+            self.api.clone(),
+            chat.space_id.clone(),
+            chat.object_id.clone(),
+            self.tx.clone(),
+        );
+        self.preview_subs.insert(chat.object_id.clone(), handle);
     }
 
     /// Refreshes the open chat's sidebar preview straight from the messages we
@@ -302,6 +302,9 @@ impl App {
     pub fn remove_chat(&mut self, object_id: &str) {
         let keep = self.selected_chat().map(|c| c.object_id.clone());
         self.chats.retain(|c| c.object_id != object_id);
+        if let Some(h) = self.preview_subs.remove(object_id) {
+            h.abort();
+        }
         self.restore_selection(keep);
     }
 
@@ -798,6 +801,68 @@ async fn pump_messages(mut reader: SseReader, object_id: &str, tx: &UnboundedSen
             }
         }
     }
+}
+
+/// Window-of-1 subscription that keeps one chat's sidebar preview live. Cheap:
+/// one message in flight at a time. Reconnects with backoff like the others.
+fn spawn_preview_sub(
+    api: Api,
+    space_id: String,
+    object_id: String,
+    tx: UnboundedSender<Ev>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = 1u64;
+        loop {
+            match api.subscribe_messages(&space_id, &object_id, 1).await {
+                Ok(mut reader) => {
+                    backoff = 1;
+                    loop {
+                        // Reduce each frame to "what is the newest message now",
+                        // where None means the chat is empty. Outer None means
+                        // this frame carries no preview update. The window holds
+                        // exactly one message, so a change that only removes has
+                        // emptied it.
+                        let update: Option<Option<Message>> = match reader.next_frame().await {
+                            Ok(Some(Frame::Snapshot(recs))) => {
+                                Some(recs.iter().filter_map(Message::from_record).next_back())
+                            }
+                            Ok(Some(Frame::Changes(changes))) => {
+                                let newest = changes
+                                    .iter()
+                                    .flat_map(|c| c.added.iter().chain(c.updated.iter()))
+                                    .filter_map(Message::from_record)
+                                    .max_by(|a, b| a.created_at.total_cmp(&b.created_at));
+                                let removed = changes.iter().any(|c| !c.removed.is_empty());
+                                match (newest, removed) {
+                                    (Some(m), _) => Some(Some(m)),
+                                    (None, true) => Some(None), // emptied
+                                    (None, false) => None,
+                                }
+                            }
+                            Ok(Some(Frame::Closed(_))) | Ok(None) => break,
+                            Ok(Some(_)) => continue,
+                            Err(_) => break,
+                        };
+                        if let Some(msg) = update {
+                            if tx
+                                .send(Ev::Preview {
+                                    object_id: object_id.clone(),
+                                    msg,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
+    })
 }
 
 /// Live view of one space's chat objects: unread counters and new chats.

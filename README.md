@@ -240,5 +240,12 @@ Contract, verified against the server source:
 | `ui.rs` | rendering, wrapping, scroll geometry, pane layout |
 | `main.rs` | CLI, terminal lifecycle, keymap, event loop |
 
-One subscription runs per space for the whole session (unread + chat list); a
-second is opened for the chat currently on screen and aborted when you switch.
+Three kinds of subscription run concurrently:
+
+- **one per space** — chat list and unread counts. This fires only when unread
+  or reaction counts change, so it is an *unread* signal, not a *message* one.
+- **one per chat**, a window of a single message — keeps the sidebar preview
+  live. Needed because a message that doesn't move unread (one you send
+  yourself from another device) produces no event on the per-space stream.
+- **one for the open chat**, a full window — the message list; aborted when you
+  switch chats.
