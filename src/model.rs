@@ -106,6 +106,9 @@ pub struct Message {
     pub reply_to: Option<String>,
     /// (emoji, count) pairs, sorted for stable rendering.
     pub reactions: Vec<(String, usize)>,
+    /// Attachment kinds ("image", "file", …), one per attached file. Sending
+    /// attachments isn't supported yet; this is only to show they exist.
+    pub attachments: Vec<String>,
 }
 
 impl Message {
@@ -131,6 +134,22 @@ impl Message {
             .unwrap_or_default();
         reactions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
+        // {"f0": {"type": "image", "link": "any://<space>/files/<id>"}, …}
+        let attachments: Vec<String> = v
+            .get("attachments")
+            .and_then(|a| a.as_object())
+            .map(|obj| {
+                obj.values()
+                    .map(|a| {
+                        a.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("file")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Some(Message {
             id,
             text: v
@@ -151,10 +170,108 @@ impl Message {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
             reactions,
+            attachments,
         })
     }
 
     pub fn edited(&self) -> bool {
         self.modified_at > self.created_at + 1.0
+    }
+
+    /// e.g. "3 images", "1 image, 2 files". Empty when nothing is attached.
+    pub fn attachment_summary(&self) -> String {
+        if self.attachments.is_empty() {
+            return String::new();
+        }
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        for a in &self.attachments {
+            match kinds.iter_mut().find(|(k, _)| k == a) {
+                Some((_, n)) => *n += 1,
+                None => kinds.push((a.clone(), 1)),
+            }
+        }
+        kinds
+            .iter()
+            .map(|(k, n)| {
+                if *n == 1 {
+                    format!("1 {k}")
+                } else {
+                    format!("{n} {k}s")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What to show in a one-line preview. An image-only message has no text,
+    /// so fall back to describing the attachments rather than showing nothing.
+    pub fn preview_text(&self) -> String {
+        if !self.text.trim().is_empty() {
+            return self.text.clone();
+        }
+        match self.attachment_summary().as_str() {
+            "" => String::new(),
+            s => format!("📎 {s}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The shape the server actually sends, taken from a live response.
+    fn record_with_attachments(text: &str, kinds: &[&str]) -> Value {
+        let mut atts = serde_json::Map::new();
+        for (i, k) in kinds.iter().enumerate() {
+            atts.insert(
+                format!("f{i}"),
+                json!({"type": k, "link": "any://space.x/files/abc"}),
+            );
+        }
+        json!({
+            "id": "m1",
+            "text": text,
+            "creator": "A8qy",
+            "createdAt": 1784141327.0,
+            "attachments": Value::Object(atts),
+        })
+    }
+
+    #[test]
+    fn parses_attachment_kinds() {
+        let m = Message::from_record(&record_with_attachments("scr", &["image"])).unwrap();
+        assert_eq!(m.attachments, vec!["image"]);
+        assert_eq!(m.attachment_summary(), "1 image");
+    }
+
+    #[test]
+    fn groups_and_pluralises() {
+        let m =
+            Message::from_record(&record_with_attachments("x", &["image", "image", "image"]))
+                .unwrap();
+        assert_eq!(m.attachment_summary(), "3 images");
+    }
+
+    #[test]
+    fn summarises_mixed_kinds() {
+        let m = Message::from_record(&record_with_attachments("x", &["image", "file"])).unwrap();
+        let s = m.attachment_summary();
+        assert!(s.contains("1 image") && s.contains("1 file"), "{s}");
+    }
+
+    #[test]
+    fn no_attachments_yields_empty_summary() {
+        let m = Message::from_record(&json!({"id":"m","text":"hi","createdAt":1.0})).unwrap();
+        assert_eq!(m.attachment_summary(), "");
+        assert_eq!(m.preview_text(), "hi");
+    }
+
+    #[test]
+    fn image_only_message_previews_as_attachment() {
+        // Otherwise an image-only message shows a blank row in the sidebar.
+        let m = Message::from_record(&record_with_attachments("", &["image"])).unwrap();
+        assert_eq!(m.preview_text(), "📎 1 image");
     }
 }

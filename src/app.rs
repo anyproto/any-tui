@@ -94,6 +94,9 @@ pub struct App {
     /// When the current chat became active, for the auto-read dwell check.
     pub active_since: Instant,
     pub msgs: Vec<Message>,
+    /// The message under the cursor. Reply targets this, and it's drawn
+    /// highlighted so you can see what you're replying to.
+    pub sel_msg: Option<String>,
     pub focus: Focus,
     pub mode: Mode,
     pub layout: Layout,
@@ -115,9 +118,6 @@ pub struct App {
     /// scrolling can be clamped correctly.
     pub view_lines: usize,
     pub view_height: usize,
-    /// Set when messages were appended at the bottom, so the renderer can hold
-    /// the viewport steady for a user who is scrolled up reading history.
-    pub pending_append: bool,
     msg_task: Option<JoinHandle<()>>,
     last_read_marked: HashMap<String, String>,
 }
@@ -143,6 +143,7 @@ impl App {
             user_selected: false,
             active: None,
             active_since: Instant::now(),
+            sel_msg: None,
             msgs: Vec::new(),
             focus: Focus::Sidebar,
             mode: Mode::Normal,
@@ -160,7 +161,6 @@ impl App {
             exhausted: false,
             view_lines: 0,
             view_height: 0,
-            pending_append: false,
             msg_task: None,
             last_read_marked: HashMap::new(),
         }
@@ -286,7 +286,7 @@ impl App {
         if let Some(c) = self.chats.iter_mut().find(|c| c.object_id == object_id) {
             match msg {
                 Some(m) => {
-                    c.last_text = Some(m.text.clone());
+                    c.last_text = Some(m.preview_text());
                     c.last_creator = m.creator.clone();
                     c.last_at = m.created_at;
                 }
@@ -340,17 +340,6 @@ impl App {
     }
 
     // ---- messages --------------------------------------------------------
-
-    /// Flags whether `incoming` extends the bottom of the timeline (a genuinely
-    /// new message) rather than filling in older history.
-    pub fn note_append(&mut self, incoming: &[Message]) {
-        let newest = self.msgs.last().map(|m| m.created_at).unwrap_or(f64::MIN);
-        if incoming.iter().any(|m| {
-            m.created_at >= newest && !self.msgs.iter().any(|x| x.id == m.id)
-        }) {
-            self.pending_append = true;
-        }
-    }
 
     pub fn mark_read_now(&mut self) {
         let Some(chat) = self.active_chat().cloned() else {
@@ -406,6 +395,7 @@ impl App {
         self.active = Some(chat.object_id.clone());
         self.active_since = Instant::now();
         self.msgs.clear();
+        self.sel_msg = None;
         self.scroll = 0;
         self.reply_to = None;
         self.exhausted = false;
@@ -482,7 +472,9 @@ impl App {
     /// chat, and browsing past unread chats must not silently clear them.
     /// Read state has no undo in the API, so the bias is towards not marking.
     pub fn maybe_mark_read(&mut self) {
-        if !self.auto_read || self.scroll != 0 {
+        // Only once the cursor is on the newest message: reading history must
+        // not clear unread.
+        if !self.auto_read || !self.at_newest() {
             return;
         }
         if self.active_since.elapsed() < DWELL {
@@ -531,6 +523,8 @@ impl App {
         self.input.clear();
         let reply = self.reply_to.take();
         self.scroll = 0;
+        // Jump to the bottom so you see what you just sent land.
+        self.select_newest();
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -649,25 +643,55 @@ impl App {
         self.toast("no unread chats");
     }
 
-    // ---- scrolling -------------------------------------------------------
+    // ---- message cursor --------------------------------------------------
 
-    pub fn max_scroll(&self) -> usize {
-        self.view_lines.saturating_sub(self.view_height)
+    pub fn sel_msg_idx(&self) -> Option<usize> {
+        let id = self.sel_msg.as_ref()?;
+        self.msgs.iter().position(|m| &m.id == id)
     }
 
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = (self.scroll + n).min(self.max_scroll());
-        // Near the top: pull in older history.
-        if self.scroll + self.view_height + 10 >= self.view_lines {
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.sel_msg_idx().and_then(|i| self.msgs.get(i))
+    }
+
+    /// True when the cursor is on the newest message, i.e. you've seen the
+    /// bottom of the chat.
+    pub fn at_newest(&self) -> bool {
+        match (self.sel_msg_idx(), self.msgs.len()) {
+            (Some(i), n) if n > 0 => i + 1 == n,
+            (None, 0) => true,
+            _ => false,
+        }
+    }
+
+    pub fn select_newest(&mut self) {
+        self.sel_msg = self.msgs.last().map(|m| m.id.clone());
+    }
+
+    /// Moves the message cursor by `d`. The viewport follows it at render time,
+    /// so there's no separate scroll position to keep in sync.
+    pub fn move_msg_cursor(&mut self, d: isize) {
+        if self.msgs.is_empty() {
+            return;
+        }
+        let cur = self.sel_msg_idx().unwrap_or(self.msgs.len() - 1) as isize;
+        let last = self.msgs.len() as isize - 1;
+        let next = (cur + d).clamp(0, last) as usize;
+        self.sel_msg = Some(self.msgs[next].id.clone());
+        // Near the top of what we've loaded: pull in more history.
+        if next < 5 {
             self.load_more();
         }
-    }
-
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
-        if self.scroll == 0 {
+        if self.at_newest() {
             self.maybe_mark_read();
         }
+    }
+
+    pub fn select_oldest(&mut self) {
+        if let Some(m) = self.msgs.first() {
+            self.sel_msg = Some(m.id.clone());
+        }
+        self.load_more();
     }
 }
 

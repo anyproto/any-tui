@@ -118,15 +118,32 @@ because "general" tells you nothing:
 
 ### Reading
 
+Inside a chat, `j`/`k` move a **message cursor**, drawn as an accent bar down
+the left of the message it's on:
+
+```
+tolya  07:13
+▌ #105 — появилось ощущение что в any стало все в кучу
+▌ 📎 2 images
+  надо подумать, но тема нужная
+```
+
+The cursor matters because it's what `r` replies to. Consecutive messages from
+one author are grouped under a single header, so "the last message" is often
+ambiguous — the bar removes the guesswork.
+
 | key | action |
 | --- | --- |
-| `j` / `k`, `↓` / `↑` | scroll messages (or move selection in the list) |
+| `j` / `k`, `↓` / `↑` | move the message cursor (or the selection in the list) |
 | `Ctrl-n` / `Ctrl-p` | next / previous chat, without leaving the message pane |
-| `Ctrl-d` / `Ctrl-u` | half page down / up |
+| `Ctrl-d` / `Ctrl-u` | jump 5 messages |
 | `G` | jump to newest |
 | `g` | jump to oldest — pulls in older history as you go |
 | `n` | jump to the next chat with unread, wherever it is |
 | `Tab` | switch pane / swap which pane is visible |
+
+Messages carrying files show `📎 2 images` under the text. Attachments can't be
+opened or sent yet — this only tells you they're there.
 
 New messages arrive live over SSE — no polling, no refresh key. If you're
 scrolled up reading history, an arriving message **won't yank you to the
@@ -139,9 +156,24 @@ A `── new ──` rule marks where your unread starts.
 
 | key | action |
 | --- | --- |
-| `i` | compose (`Enter` sends, `Esc` cancels) |
-| `r` | reply to the newest message |
+| `i` | compose |
+| `Enter` | send |
+| `Alt-Enter` (or `Ctrl-j`) | newline — `Enter` is taken by send |
+| `Ctrl-u` | clear the box |
+| `r` | reply to the message under the cursor |
 | `R` | mark this chat read right now |
+| `Esc` | cancel |
+
+The composer wraps at word boundaries and **grows as you type**, up to 8 lines,
+then scrolls. Replying pins a banner above it naming exactly who and what
+you're answering, so the target stays visible while you type:
+
+```
+ ↩ replying to km: Толя, Серега, гляньте плиз ПРы: 1. https://gi…
+╭ message ─────────────────────────────────────────╮
+│reply text that is long enough to wrap here       │
+╰ Enter send · Alt-Enter newline · Esc cancel ─────╯
+```
 
 ### Read state
 
@@ -149,11 +181,13 @@ Opening a chat marks it read once the newest message is actually on screen —
 scrolled to the bottom, not merely opened. It never marks read while you're
 scrolled up in history.
 
-Because the cursor previews chats as it moves, marking read also waits for you
-to **stay put for ~1.5s**: walking `j`/`k` past a stack of unread chats, or
-cycling through them with `Ctrl-n`, leaves them unread. In one-pane mode a chat
-loaded behind the list is never marked read, since you haven't seen it. Read
-state has no undo in the API, so the bias is always towards *not* marking.
+"On screen" means the **message cursor is on the newest message** — reading
+history never clears unread. Because the cursor previews chats as it moves,
+marking read also waits for you to **stay put for ~1.5s**: walking `j`/`k` past
+a stack of unread chats, or cycling with `Ctrl-n`, leaves them unread. In
+one-pane mode a chat loaded behind the list is never marked read, since you
+haven't seen it. Read state has no undo in the API, so the bias is always
+towards *not* marking.
 
 ```sh
 any-tui --no-auto-read    # read without ever touching read state

@@ -11,6 +11,8 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 const SIDEBAR_W: u16 = 34;
+/// The composer grows with the text, then scrolls instead of eating the chat.
+const MAX_INPUT_LINES: usize = 8;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -308,7 +310,7 @@ fn selected_line_index(app: &App) -> usize {
 }
 
 fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
-    let input_h = if app.mode == Mode::Insert { 3 } else { 1 };
+    let input_h = input_height(app, area.width);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
     let focused = app.focus == Focus::Messages;
@@ -328,24 +330,35 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(rows[0]);
     f.render_widget(block, rows[0]);
 
-    let lines = render_messages(app, inner.width as usize);
+    let (lines, ranges) = render_messages(app, inner.width as usize);
 
-    // A reader scrolled up should stay on the text they're reading when new
-    // messages land at the bottom, so absorb the growth into the offset.
-    // History loaded at the top needs no adjustment: scroll is bottom-anchored.
-    if app.pending_append && app.scroll > 0 {
-        app.scroll += lines.len().saturating_sub(app.view_lines);
-    }
-    app.pending_append = false;
-
-    // Record geometry so scroll can be clamped against real wrapped height.
     app.view_lines = lines.len();
     app.view_height = inner.height as usize;
-    if app.scroll > app.max_scroll() {
-        app.scroll = app.max_scroll();
+    let h = (inner.height as usize).max(1);
+
+    // The viewport follows the message cursor: nudge the offset just enough to
+    // keep the selected message on screen, so appends at the bottom and history
+    // loaded at the top both leave the reader where they were.
+    if let Some(id) = &app.sel_msg {
+        if let Some((_, s, e)) = ranges.iter().find(|(mid, _, _)| mid == id) {
+            let (s, e) = (*s, *e);
+            let mut end = lines.len().saturating_sub(app.scroll);
+            if e > end {
+                app.scroll = lines.len().saturating_sub(e);
+                end = lines.len().saturating_sub(app.scroll);
+            }
+            let start = end.saturating_sub(h);
+            if s < start {
+                // Taller than the pane: pin its top rather than its bottom.
+                app.scroll = lines.len().saturating_sub(s + h).min(lines.len());
+            }
+        }
+    }
+    let max_scroll = lines.len().saturating_sub(h);
+    if app.scroll > max_scroll {
+        app.scroll = max_scroll;
     }
 
-    let h = inner.height as usize;
     let end = lines.len().saturating_sub(app.scroll);
     let start = end.saturating_sub(h);
     let visible: Vec<Line> = lines[start..end].to_vec();
@@ -354,14 +367,20 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     draw_input(f, app, rows[1]);
 }
 
-fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
+/// Returns the rendered lines plus, for each message, the half-open line range
+/// `[start, end)` it occupies — the caller needs those to keep the cursor in
+/// view.
+type MsgRanges = Vec<(String, usize, usize)>;
+
+fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut ranges: MsgRanges = Vec::new();
     if app.active.is_none() {
         lines.push(Line::from(Span::styled(
             "  select a chat and press Enter",
             Style::default().fg(DIM),
         )));
-        return lines;
+        return (lines, ranges);
     }
     if app.msgs.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -372,7 +391,7 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
             },
             Style::default().fg(DIM),
         )));
-        return lines;
+        return (lines, ranges);
     }
 
     if app.exhausted {
@@ -394,6 +413,7 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut prev_creator = String::new();
     let mut prev_time = 0f64;
 
+    let sel_id = app.sel_msg.clone().unwrap_or_default();
     for (i, m) in app.msgs.iter().enumerate() {
         if first_unread == Some(i) {
             lines.push(unread_separator(width));
@@ -419,6 +439,7 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
             ]));
         }
 
+        let start_line = lines.len();
         if let Some(rid) = &m.reply_to {
             let snippet = app
                 .msgs
@@ -440,12 +461,23 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
             )));
         }
 
-        for (n, l) in wrap(&m.text, text_w).into_iter().enumerate() {
-            let mut spans = vec![Span::raw("  "), Span::raw(l)];
-            if n == 0 && m.edited() {
-                spans.push(Span::styled(" (edited)", Style::default().fg(DIM)));
+        if !m.text.is_empty() {
+            for (n, l) in wrap(&m.text, text_w).into_iter().enumerate() {
+                let mut spans = vec![Span::raw("  "), Span::raw(l)];
+                if n == 0 && m.edited() {
+                    spans.push(Span::styled(" (edited)", Style::default().fg(DIM)));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
+        }
+
+        // Attachments can't be opened yet, but you should be able to see that
+        // a message carries them.
+        if !m.attachments.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  📎 {}", m.attachment_summary()),
+                Style::default().fg(Color::Blue),
+            )));
         }
 
         if !m.reactions.is_empty() {
@@ -459,10 +491,30 @@ fn render_messages(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(spans));
         }
 
+        let end_line = lines.len();
+        ranges.push((m.id.clone(), start_line, end_line));
+
+        // Mark the cursor message: a left bar on its own lines, so it's obvious
+        // which message `r` will reply to.
+        if m.id == sel_id && app.focus == Focus::Messages {
+            for l in lines.iter_mut().take(end_line).skip(start_line) {
+                let mut spans = vec![Span::styled("▌", Style::default().fg(ACCENT))];
+                // Replace the two-space indent the body lines already carry.
+                let mut rest = l.spans.clone();
+                if !rest.is_empty() && rest[0].content.starts_with("  ") {
+                    let trimmed = rest[0].content[2..].to_string();
+                    rest[0] = Span::styled(trimmed, rest[0].style);
+                    spans.push(Span::raw(" "));
+                }
+                spans.extend(rest);
+                *l = Line::from(spans).style(Style::default().bg(Color::Rgb(32, 32, 42)));
+            }
+        }
+
         prev_creator = m.creator.clone();
         prev_time = m.created_at;
     }
-    lines
+    (lines, ranges)
 }
 
 fn unread_separator(width: usize) -> Line<'static> {
@@ -475,23 +527,76 @@ fn unread_separator(width: usize) -> Line<'static> {
     ])
 }
 
+/// Height of the composer: it grows with the wrapped text (plus a banner line
+/// when replying), and stops growing at MAX_INPUT_LINES.
+fn input_height(app: &App, width: u16) -> u16 {
+    if app.mode != Mode::Insert {
+        return 1;
+    }
+    let inner_w = (width.saturating_sub(2) as usize).max(1);
+    let lines = wrap_input(&app.input, inner_w).len().clamp(1, MAX_INPUT_LINES);
+    let banner = if app.reply_to.is_some() { 1 } else { 0 };
+    lines as u16 + 2 + banner
+}
+
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     if app.mode == Mode::Insert {
-        let mut title = " message ".to_string();
-        if app.reply_to.is_some() {
-            title = " reply ".to_string();
+        let mut area = area;
+        // Banner above the box: say exactly who is being replied to, since the
+        // reply target is otherwise invisible once you start typing.
+        if let Some(rid) = &app.reply_to {
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            let who = app
+                .msgs
+                .iter()
+                .find(|m| &m.id == rid)
+                .map(|m| {
+                    format!(
+                        "{}: {}",
+                        app.display_name(&m.creator),
+                        one_line(&m.preview_text(), rows[0].width as usize)
+                    )
+                })
+                .unwrap_or_else(|| "…".to_string());
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ↩ replying to ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        one_line(&who, rows[0].width.saturating_sub(16) as usize),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])),
+                rows[0],
+            );
+            area = rows[1];
         }
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
-            .title(title);
+            .title(" message ")
+            .title_bottom(Line::from(Span::styled(
+                " Enter send · Alt-Enter newline · Esc cancel ",
+                Style::default().fg(DIM),
+            )));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        f.render_widget(Paragraph::new(app.input.as_str()), inner);
+
+        let wrapped = wrap_input(&app.input, inner.width.max(1) as usize);
+        // Show the tail once the text outgrows the box.
+        let start = wrapped.len().saturating_sub(inner.height as usize);
+        let shown: Vec<Line> = wrapped[start..]
+            .iter()
+            .map(|l| Line::from(l.clone()))
+            .collect();
+        let last = wrapped.last().cloned().unwrap_or_default();
+        f.render_widget(Paragraph::new(shown), inner);
+
         // Park the cursor at the end of the typed text.
-        let cx = inner.x + (app.input.width() as u16).min(inner.width.saturating_sub(1));
-        f.set_cursor_position((cx, inner.y));
+        let cy = inner.y + (wrapped.len().saturating_sub(start + 1) as u16).min(inner.height - 1);
+        let cx = inner.x + (last.width() as u16).min(inner.width.saturating_sub(1));
+        f.set_cursor_position((cx, cy));
     } else {
         // Keep the hint short enough for a phone-width pane.
         let narrow = area.width < 60;
@@ -545,10 +650,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mut used = label.width();
     let narrow = total < 60;
 
-    let scroll_txt = if app.scroll > 0 {
-        format!("  ↑{}", app.scroll)
-    } else {
-        String::new()
+    // Position of the message cursor, shown only when you're off the bottom.
+    let scroll_txt = match app.sel_msg_idx() {
+        Some(i) if i + 1 < app.msgs.len() => format!("  ↑{}/{}", i + 1, app.msgs.len()),
+        _ => String::new(),
     };
     let reserve = scroll_txt.width();
 
@@ -611,21 +716,22 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "  Navigation",
         "    Space           fuzzy-find a chat",
         "    Ctrl-n / Ctrl-p next / previous chat",
-        "    j / k, ↓ / ↑    move selection · scroll messages",
+        "    j / k, ↓ / ↑    move chat · move message cursor",
         "    Enter           step into the chat",
         "    Esc / h         back to chat list",
         "    Tab             switch pane",
         "    n               next chat with unread",
         "    g / G           oldest / newest message",
-        "    Ctrl-d / Ctrl-u half page down / up",
+        "    Ctrl-d / Ctrl-u jump 5 messages",
         "",
         "  Layout",
         "    z               one pane ⇄ two panes",
         "                    (one pane is automatic under 80 cols)",
         "",
         "  Messages",
-        "    i               compose (Esc cancels, Enter sends)",
-        "    r               reply to newest message",
+        "    i               compose",
+        "                    Enter sends · Alt-Enter newline",
+        "    r               reply to the message under ▌",
         "    R               mark chat read now",
         "",
         "  Other",
@@ -671,20 +777,21 @@ fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
         "  Navigate",
         "   Space    find a chat",
         "   C-n/C-p  next/prev chat",
-        "   j/k      move · scroll",
+        "   j/k      move cursor",
         "   Enter    step into chat",
         "   Esc/h    back to list",
         "   Tab      switch pane",
         "   n        next unread",
         "   g/G      oldest/newest",
-        "   C-d/C-u  half page",
+        "   C-d/C-u  jump 5 msgs",
         "",
         "  Layout",
         "   z        1 ⇄ 2 panes",
         "",
         "  Message",
         "   i        compose",
-        "   r        reply",
+        "   A-Enter  newline",
+        "   r        reply to ▌",
         "   R        mark read",
         "",
         "   ?  help      q  quit",
@@ -717,6 +824,47 @@ fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
 }
 
 // ---- text helpers --------------------------------------------------------
+
+/// Wraps composer text. Unlike `wrap`, this preserves the text verbatim
+/// (spaces included) so the cursor column matches what was typed, and it keeps
+/// empty lines produced by explicit newlines.
+fn wrap_input(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        let mut cur: Vec<char> = Vec::new();
+        for ch in para.chars() {
+            cur.push(ch);
+            if line_width(&cur) > width {
+                match cur.iter().rposition(|c| *c == ' ') {
+                    // Break at the last space so words stay whole.
+                    Some(b) if b > 0 => {
+                        let rest: Vec<char> = cur.split_off(b + 1);
+                        while cur.last() == Some(&' ') {
+                            cur.pop();
+                        }
+                        out.push(cur.iter().collect());
+                        cur = rest;
+                    }
+                    // A single word longer than the box: hard break.
+                    _ => {
+                        let last = cur.pop().unwrap_or(' ');
+                        out.push(cur.iter().collect());
+                        cur = vec![last];
+                    }
+                }
+            }
+        }
+        out.push(cur.iter().collect());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn line_width(cs: &[char]) -> usize {
+    cs.iter().map(|c| c.to_string().width()).sum()
+}
 
 /// Greedy word wrap on display width, preserving explicit newlines.
 fn wrap(text: &str, width: usize) -> Vec<String> {

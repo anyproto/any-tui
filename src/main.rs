@@ -168,26 +168,27 @@ fn handle(app: &mut App, ev: Ev) {
         }
         Ev::ChatUpsert(c) => app.upsert_chat(c),
         Ev::ChatRemoved { object_id } => app.remove_chat(&object_id),
-        Ev::MsgSnapshot { chat, msgs } => {
+        Ev::MsgSnapshot { chat, msgs } | Ev::MsgUpsert { chat, msgs } => {
             if app.active.as_deref() == Some(chat.as_str()) {
                 app.loading = false;
-                app.note_append(&msgs);
+                // Follow new arrivals only if already at the bottom; someone
+                // reading history keeps their place.
+                let follow = app.at_newest();
                 app.merge_msgs(msgs);
-                app.refresh_active_preview();
-                app.maybe_mark_read();
-            }
-        }
-        Ev::MsgUpsert { chat, msgs } => {
-            if app.active.as_deref() == Some(chat.as_str()) {
-                app.note_append(&msgs);
-                app.merge_msgs(msgs);
+                if follow {
+                    app.select_newest();
+                }
                 app.refresh_active_preview();
                 app.maybe_mark_read();
             }
         }
         Ev::MsgRemoved { chat, id } => {
             if app.active.as_deref() == Some(chat.as_str()) {
+                let was_sel = app.sel_msg.as_deref() == Some(id.as_str());
                 app.msgs.retain(|m| m.id != id);
+                if was_sel {
+                    app.select_newest();
+                }
                 app.refresh_active_preview();
             }
         }
@@ -260,17 +261,24 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 
     if app.mode == Mode::Insert {
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 app.reply_to = None;
             }
+            // Enter sends, so an explicit newline needs its own key. Alt-Enter
+            // is the common one; Ctrl-J is the terminal-friendly fallback.
+            KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.input.push('\n')
+            }
+            KeyCode::Char('j') if ctrl => app.input.push('\n'),
             KeyCode::Enter => app.send_input(),
             KeyCode::Backspace => {
                 app.input.pop();
             }
             KeyCode::Char('u') if ctrl => app.input.clear(),
-            KeyCode::Char(c) => app.input.push(c),
+            KeyCode::Char(c) if !ctrl => app.input.push(c),
             _ => {}
         }
         return;
@@ -281,7 +289,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    let half = (app.view_height / 2).max(1);
+    // The cursor steps over messages, not lines, so a "page" is a message
+    // count rather than a fraction of the pane height.
+    let page: isize = 5;
     match k.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
@@ -304,13 +314,15 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         // In the list, moving the cursor previews the chat straight away;
         // Enter is only needed to step into it.
+        // In the message pane j/k walk messages rather than lines: the cursor
+        // is what `r` replies to, so it has to be a message.
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
             Focus::Sidebar => app.select_delta(1),
-            Focus::Messages => app.scroll_down(1),
+            Focus::Messages => app.move_msg_cursor(1),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Sidebar => app.select_delta(-1),
-            Focus::Messages => app.scroll_up(1),
+            Focus::Messages => app.move_msg_cursor(-1),
         },
         KeyCode::Char(' ') => app.open_picker(),
         KeyCode::Enter => {
@@ -318,15 +330,15 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.open_selected();
         }
         KeyCode::Char('n') => app.next_unread(),
-        KeyCode::Char('d') if ctrl => app.scroll_down(half),
-        KeyCode::Char('u') if ctrl => app.scroll_up(half),
-        KeyCode::PageDown => app.scroll_down(half),
-        KeyCode::PageUp => app.scroll_up(half),
-        KeyCode::Char('G') | KeyCode::End => app.scroll_down(usize::MAX),
-        KeyCode::Char('g') | KeyCode::Home => {
-            app.scroll_up(app.max_scroll());
-            app.load_more();
+        KeyCode::Char('d') if ctrl => app.move_msg_cursor(page),
+        KeyCode::Char('u') if ctrl => app.move_msg_cursor(-page),
+        KeyCode::PageDown => app.move_msg_cursor(page),
+        KeyCode::PageUp => app.move_msg_cursor(-page),
+        KeyCode::Char('G') | KeyCode::End => {
+            app.select_newest();
+            app.maybe_mark_read();
         }
+        KeyCode::Char('g') | KeyCode::Home => app.select_oldest(),
         KeyCode::Char('i') => {
             if app.active.is_some() {
                 app.mode = Mode::Insert;
@@ -338,10 +350,14 @@ fn on_key(app: &mut App, k: KeyEvent) {
             }
         }
         KeyCode::Char('r') => {
-            if let Some(last) = app.msgs.last() {
-                app.reply_to = Some(last.id.clone());
+            // Reply to the message under the cursor — the one drawn with the
+            // accent bar — not just whatever happens to be newest.
+            if let Some(m) = app.selected_message() {
+                app.reply_to = Some(m.id.clone());
                 app.mode = Mode::Insert;
                 app.focus = Focus::Messages;
+            } else {
+                app.toast("no message selected");
             }
         }
         KeyCode::Char('R') => app.mark_read_now(),
