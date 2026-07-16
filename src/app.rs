@@ -135,6 +135,9 @@ pub struct SearchHit {
     pub chat_id: String,
     pub msg_id: String,
     pub creator: String,
+    /// Agent name when the message was agent-authored (shown instead of the
+    /// human sender, matching the message list).
+    pub agent: Option<String>,
     pub text: String,
     pub created_at: f64,
 }
@@ -332,6 +335,7 @@ impl App {
                 // blanking the row.
                 chat.last_text = existing.last_text.clone();
                 chat.last_creator = existing.last_creator.clone();
+                chat.last_agent = existing.last_agent.clone();
                 chat.last_at = existing.last_at;
                 *existing = chat.clone();
             }
@@ -372,9 +376,12 @@ impl App {
         let keep = self.selected_chat().map(|c| c.object_id.clone());
         if let Some(c) = self.chats.iter_mut().find(|c| c.object_id == object_id) {
             match msg {
+                // A bare "…" ping isn't worth previewing; leave the prior one.
+                Some(m) if m.is_agent_presence_marker() => {}
                 Some(m) => {
                     c.last_text = Some(m.preview_text());
                     c.last_creator = m.creator.clone();
+                    c.last_agent = m.agent.as_ref().map(|a| a.name.clone());
                     c.last_at = m.created_at;
                 }
                 None => c.last_text = Some(String::new()),
@@ -456,6 +463,11 @@ impl App {
 
     pub fn merge_msgs(&mut self, msgs: Vec<Message>) {
         for m in msgs {
+            // Agent run-start "…" pings aren't real messages; keep them out of
+            // the list so the cursor never lands on an empty row.
+            if m.is_agent_presence_marker() {
+                continue;
+            }
             match self.msgs.iter_mut().find(|x| x.id == m.id) {
                 Some(existing) => *existing = m,
                 None => self.msgs.push(m),
@@ -1044,10 +1056,14 @@ async fn run_search_task(
         // A failed enrichment for one chat shouldn't sink the whole search.
         let msgs = api.messages_by_ids(&sp, &chat, &ids).await.unwrap_or_default();
         for m in msgs {
+            if m.is_agent_presence_marker() {
+                continue;
+            }
             rows.push(SearchHit {
                 chat_id: chat.clone(),
                 msg_id: m.id,
                 creator: m.creator,
+                agent: m.agent.map(|a| a.name),
                 text: m.text,
                 created_at: m.created_at,
             });

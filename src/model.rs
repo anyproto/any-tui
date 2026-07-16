@@ -32,6 +32,9 @@ pub struct Chat {
     /// named "general", so the preview is what actually tells them apart.
     pub last_text: Option<String>,
     pub last_creator: String,
+    /// Agent name when the newest message was agent-authored — the preview
+    /// shows this instead of the human account that signed it.
+    pub last_agent: Option<String>,
     pub last_at: f64,
 }
 
@@ -77,6 +80,7 @@ impl Chat {
             pos,
             last_text: None,
             last_creator: String::new(),
+            last_agent: None,
             last_at: 0.0,
         })
     }
@@ -96,11 +100,23 @@ impl Chat {
     }
 }
 
+/// Marks a message written by an AI agent. Agent messages are posted under the
+/// human account (so `creator` is the account, not a distinct identity) — the
+/// presence of this field is the only thing that tells them apart. `done` is
+/// false while the agent is still streaming its reply.
+#[derive(Debug, Clone)]
+pub struct Agent {
+    pub name: String,
+    pub done: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: String,
     pub text: String,
     pub creator: String,
+    /// Set when an agent authored this message; see [`Agent`].
+    pub agent: Option<Agent>,
     pub created_at: f64,
     pub modified_at: f64,
     pub reply_to: Option<String>,
@@ -162,6 +178,15 @@ impl Message {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string(),
+            // {"agent": {"name": "bao", "done": true}} on agent-authored messages.
+            agent: v.get("agent").and_then(|a| a.as_object()).map(|a| Agent {
+                name: a
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("agent")
+                    .to_string(),
+                done: a.get("done").and_then(|d| d.as_bool()).unwrap_or(true),
+            }),
             created_at,
             modified_at,
             reply_to: v
@@ -176,6 +201,12 @@ impl Message {
 
     pub fn edited(&self) -> bool {
         self.modified_at > self.created_at + 1.0
+    }
+
+    /// Old agent run-start pings post a bare "…" placeholder; it carries no
+    /// content and shouldn't show as a message.
+    pub fn is_agent_presence_marker(&self) -> bool {
+        self.agent.is_some() && self.text.trim() == "…"
     }
 
     /// e.g. "3 images", "1 image, 2 files". Empty when nothing is attached.

@@ -196,6 +196,12 @@ ambiguous — the bar removes the guesswork.
 Messages carrying files show `📎 2 images` under the text. Attachments can't be
 opened or sent yet — this only tells you they're there.
 
+**Agent messages** (written by an AI agent acting in the space) are marked with
+a `✦` and the agent's name in a distinct colour — the daemon signs them with the
+human account, so without this they'd read as that person. While an agent is
+still working, its newest message shows a `✦ <name> is working…` line, live over
+SSE. The sidebar preview and search results use the agent's name too.
+
 New messages arrive live over SSE — no polling, no refresh key. If you're
 scrolled up reading history, an arriving message **won't yank you to the
 bottom**; the viewport stays where you put it and `↑N` in the status bar shows

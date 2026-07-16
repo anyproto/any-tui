@@ -22,6 +22,40 @@ const SEL: Color = Color::White;
 const SEL_UNREAD: Color = Color::LightYellow;
 const ME: Color = Color::Green;
 const PEER: Color = Color::Magenta;
+/// Agent-authored messages get their own hue and a `✦` marker, since they're
+/// signed by the human account and would otherwise read as that person.
+const AGENT: Color = Color::LightBlue;
+
+/// The author label + colour for a message: the agent's name when
+/// agent-authored (never the human that signed it), otherwise the sender.
+fn author_label(app: &App, m: &crate::model::Message) -> (String, Color) {
+    match &m.agent {
+        Some(a) => (format!("✦ {}", a.name), AGENT),
+        None => (
+            app.display_name(&m.creator),
+            if m.creator == app.me { ME } else { PEER },
+        ),
+    }
+}
+
+/// Sender label for a chat's last-message preview: the agent name (with the
+/// `✦` marker) when the newest message was agent-authored, else the human.
+fn preview_sender(app: &App, chat: &crate::model::Chat) -> String {
+    match &chat.last_agent {
+        Some(name) => format!("✦ {}", short_name(name)),
+        None => short_name(&app.display_name(&chat.last_creator)),
+    }
+}
+
+/// A stable key identifying who "spoke", for consecutive-message grouping.
+/// Agent messages share the human's creator, so grouping must key on the agent
+/// name too or an agent reply would fold silently under the preceding human.
+fn speaker_key(m: &crate::model::Message) -> String {
+    match &m.agent {
+        Some(a) => format!("agent:{}", a.name),
+        None => m.creator.clone(),
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
@@ -154,7 +188,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
             Some(t) if t.is_empty() => "no messages".to_string(),
             Some(t) => format!(
                 "{}: {}",
-                short_name(&app.display_name(&chat.last_creator)),
+                preview_sender(app, chat),
                 one_line(t, width)
             ),
             None => "…".to_string(),
@@ -253,7 +287,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             Some(t) if t.is_empty() => "no messages".to_string(),
             Some(t) => format!(
                 "{}: {}",
-                short_name(&app.display_name(&chat.last_creator)),
+                preview_sender(app, chat),
                 one_line(t, width)
             ),
             None => "…".to_string(),
@@ -449,14 +483,15 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let is_me = hit.creator == app.me;
-        let mut head = vec![
-            Span::styled(
+        let (label, color) = match &hit.agent {
+            Some(name) => (format!("✦ {name}"), AGENT),
+            None => (
                 app.display_name(&hit.creator),
-                Style::default()
-                    .fg(if is_me { ME } else { PEER })
-                    .add_modifier(Modifier::BOLD),
+                if hit.creator == app.me { ME } else { PEER },
             ),
+        };
+        let mut head = vec![
+            Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(fmt_time(hit.created_at), Style::default().fg(DIM)),
         ];
@@ -575,7 +610,7 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
     };
 
     let text_w = width.saturating_sub(2).max(10);
-    let mut prev_creator = String::new();
+    let mut prev_speaker = String::new();
     let mut prev_time = 0f64;
 
     let sel_id = app.sel_msg.clone().unwrap_or_default();
@@ -584,21 +619,17 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             lines.push(unread_separator(width));
         }
 
-        // Group consecutive messages from one author within 5 minutes.
-        let grouped = m.creator == prev_creator && (m.created_at - prev_time).abs() < 300.0;
+        // Group consecutive messages from one speaker within 5 minutes. Agent
+        // and human turns never group together (see speaker_key).
+        let speaker = speaker_key(m);
+        let grouped = speaker == prev_speaker && (m.created_at - prev_time).abs() < 300.0;
         if !grouped {
             if i > 0 {
                 lines.push(Line::from(""));
             }
-            let is_me = m.creator == app.me;
-            let name = app.display_name(&m.creator);
+            let (label, color) = author_label(app, m);
             lines.push(Line::from(vec![
-                Span::styled(
-                    name,
-                    Style::default()
-                        .fg(if is_me { ME } else { PEER })
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled(fmt_time(m.created_at), Style::default().fg(DIM)),
             ]));
@@ -656,6 +687,21 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             lines.push(Line::from(spans));
         }
 
+        // Only the newest message reflects a live run: a trailing not-done
+        // agent message means the agent is still working. Older not-done
+        // messages are just intermediate turns, not ongoing activity.
+        let is_last = i + 1 == app.msgs.len();
+        if is_last {
+            if let Some(a) = &m.agent {
+                if !a.done {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ✦ {} is working…", a.name),
+                        Style::default().fg(AGENT).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+        }
+
         let end_line = lines.len();
         ranges.push((m.id.clone(), start_line, end_line));
 
@@ -678,7 +724,7 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             }
         }
 
-        prev_creator = m.creator.clone();
+        prev_speaker = speaker;
         prev_time = m.created_at;
     }
     (lines, ranges)

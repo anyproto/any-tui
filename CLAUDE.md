@@ -59,6 +59,13 @@ Verified against the daemon and the Go source in `../any` (server code under
   `creator` is an identity address; resolve names via `GET /identities`. The
   `query` endpoint also takes a `filter` — e.g. `{"id":{"$in":[…]}}` fetches
   specific messages by id (used to enrich search hits).
+- **Agent messages** carry an optional `agent` object `{name, debugLink?, done}`
+  — its *presence* is the only marker, and `creator` stays the **human account**
+  (agents sign as the signer, not a distinct identity; nothing in `/identities`
+  or members flags an agent). So render by `agent`, never by creator, or agent
+  replies show as the account owner and fold into their message group. `done ==
+  false` means the run is still streaming (show a "working…" hint on the trailing
+  message only). Old run-start pings post a bare `"…"` text — hide those.
 - **Search** is `POST /spaces/{id}/search` — **per-space only**, there is no
   global `/v1/search` (404). Body: `{query, scopes[], limit (≤100), mode,
   require[], exclude[]}`. `scopes:["chat"]` restricts to chat messages (the
