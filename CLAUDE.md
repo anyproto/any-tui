@@ -56,7 +56,19 @@ Verified against the daemon and the Go source in `../any` (server code under
   distinguishes them — it is load-bearing, not decoration.
 - **Messages** live in the per-object `chat_messages` dataset
   (`POST /spaces/{id}/query` with `{objectId, dataset, sort, limit, offset}`).
-  `creator` is an identity address; resolve names via `GET /identities`.
+  `creator` is an identity address; resolve names via `GET /identities`. The
+  `query` endpoint also takes a `filter` — e.g. `{"id":{"$in":[…]}}` fetches
+  specific messages by id (used to enrich search hits).
+- **Search** is `POST /spaces/{id}/search` — **per-space only**, there is no
+  global `/v1/search` (404). Body: `{query, scopes[], limit (≤100), mode,
+  require[], exclude[]}`. `scopes:["chat"]` restricts to chat messages (the
+  only scope we use); there is **no** objectId/offset filter, so single-chat
+  scoping and paging are client-side. `mode` is `hybrid|fts|vector` (semantic
+  is `vector`, not `"semantic"`). Hits are `{scope, objectId (the chat),
+  recordId (the message id), data (text), score}` — **no creator/timestamp**,
+  so enrich via the `$in` query above. The index is **forward-only** (content
+  written before indexing isn't found) and `vectorStatus` says whether the
+  semantic leg ran (`used|unavailable|disabled|skipped`).
 - **SSE** (`…/query/subscribe`, `…/objects/query/subscribe`): events are exactly
   `ready` → `snapshot` → `changes`* → `closed`. `changes` data is a JSON
   **array** of `{versionId, added[], updated[], removed[]}`. `removed` entries

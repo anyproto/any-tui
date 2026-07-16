@@ -1,4 +1,4 @@
-use crate::api::Api;
+use crate::api::{Api, SearchResults};
 use crate::model::{Chat, Message, Space};
 use crate::sse::{Frame, SseReader};
 use tui_input::Input;
@@ -16,6 +16,13 @@ const PAGE: usize = 100;
 /// invisible when you actually stop to read.
 const DWELL: Duration = Duration::from_millis(1500);
 
+/// How long to wait after the last keystroke before firing a search, so typing
+/// doesn't launch a request per character.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Top-N hits fetched per space. The endpoint has no offset, so this is the
+/// whole result set; we re-sort it by time client-side.
+const SEARCH_LIMIT: usize = 100;
+
 #[derive(Debug)]
 pub enum Ev {
     Key(ratatui::crossterm::event::KeyEvent),
@@ -28,6 +35,9 @@ pub enum Ev {
     MsgRemoved { chat: String, id: String },
     History { chat: String, msgs: Vec<Message>, exhausted: bool },
     Preview { object_id: String, msg: Option<Message> },
+    /// Enriched, time-sorted search results for the query identified by `seq`.
+    SearchResults { seq: u64, hits: Vec<SearchHit>, note: String },
+    SearchFailed { seq: u64, msg: String },
     Toast(String),
     Error(String),
 }
@@ -82,6 +92,70 @@ pub struct Picker {
     pub items: Vec<PickItem>,
 }
 
+/// How wide the search reaches. The `/search` endpoint is per-space, so `Chat`
+/// and `Space` both hit the current space (Chat additionally filters hits to
+/// the active chat), while `AllSpaces` fans the request out across every space.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SearchScope {
+    Chat,
+    Space,
+    AllSpaces,
+}
+
+/// Relevance mode passed to the search engine.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SearchMode {
+    Hybrid,
+    Fts,
+    Vector,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Fts => "fts",
+            SearchMode::Vector => "vector",
+        }
+    }
+    fn next(self) -> SearchMode {
+        match self {
+            SearchMode::Hybrid => SearchMode::Fts,
+            SearchMode::Fts => SearchMode::Vector,
+            SearchMode::Vector => SearchMode::Hybrid,
+        }
+    }
+}
+
+/// One enriched search result. The raw hit gives only id + text; creator and
+/// timestamp are backfilled so the row reads like a real message and can be
+/// time-sorted and `from:`-filtered.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub chat_id: String,
+    pub msg_id: String,
+    pub creator: String,
+    pub text: String,
+    pub created_at: f64,
+}
+
+/// The full-text/semantic search view. Takes over the message pane; the query
+/// lives where the composer normally sits.
+pub struct Search {
+    pub query: Input,
+    pub scope: SearchScope,
+    pub mode: SearchMode,
+    pub results: Vec<SearchHit>,
+    /// Cursor over `results`, keyed by message id (the list re-sorts on each run).
+    pub sel: Option<String>,
+    pub scroll: usize,
+    /// What the last response reports (mode / semantic status), for the status bar.
+    pub note: String,
+    /// True while a debounced query is in flight.
+    pub searching: bool,
+}
+
+
 pub struct App {
     pub api: Api,
     pub tx: UnboundedSender<Ev>,
@@ -112,6 +186,12 @@ pub struct App {
     pub reply_to: Option<String>,
     pub toast: Option<(String, Instant)>,
     pub picker: Option<Picker>,
+    pub search: Option<Search>,
+    /// Bumped per keystroke; a returning result whose gen is stale is dropped.
+    pub search_gen: u64,
+    search_task: Option<JoinHandle<()>>,
+    /// Message id we want the cursor on once its chat's history reaches it.
+    pending_jump: Option<String>,
     pub show_help: bool,
     pub auto_read: bool,
     pub quit: bool,
@@ -160,6 +240,10 @@ impl App {
             reply_to: None,
             toast: None,
             picker: None,
+            search: None,
+            search_gen: 0,
+            search_task: None,
+            pending_jump: None,
             show_help: false,
             auto_read,
             quit: false,
@@ -658,6 +742,189 @@ impl App {
         self.toast("no unread chats");
     }
 
+    // ---- search ----------------------------------------------------------
+
+    /// Turns the message pane into the search view. Anchored on the active
+    /// chat, which seeds the default "this chat" scope.
+    pub fn open_search(&mut self) {
+        if self.active_chat().is_none() {
+            self.toast("open a chat to search");
+            return;
+        }
+        self.search = Some(Search {
+            query: Input::default(),
+            scope: SearchScope::Chat,
+            mode: SearchMode::Hybrid,
+            results: Vec::new(),
+            sel: None,
+            scroll: 0,
+            note: String::new(),
+            searching: false,
+        });
+        self.focus = Focus::Messages;
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+        if let Some(t) = self.search_task.take() {
+            t.abort();
+        }
+    }
+
+    pub fn search_cycle_scope(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.scope = match s.scope {
+                SearchScope::Chat => SearchScope::Space,
+                SearchScope::Space => SearchScope::AllSpaces,
+                SearchScope::AllSpaces => SearchScope::Chat,
+            };
+        }
+        self.run_search();
+    }
+
+    pub fn search_cycle_mode(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.mode = s.mode.next();
+        }
+        self.run_search();
+    }
+
+    /// (Re)launches a debounced search for the current query/scope/mode. Bumps
+    /// the generation so a slower earlier request can't overwrite a newer one,
+    /// and aborts the previous in-flight task (which also cancels its debounce).
+    pub fn run_search(&mut self) {
+        let Some(s) = &self.search else { return };
+        self.search_gen += 1;
+        let seq = self.search_gen;
+        if let Some(t) = self.search_task.take() {
+            t.abort();
+        }
+
+        let raw = s.query.value().to_string();
+        let mode = s.mode.as_str().to_string();
+        let scope = s.scope;
+
+        // Which space(s) to hit, and whether to keep only one chat's hits.
+        let (spaces, chat_filter): (Vec<String>, Option<String>) = match scope {
+            SearchScope::Chat => match self.active_chat() {
+                Some(c) => (vec![c.space_id.clone()], Some(c.object_id.clone())),
+                None => (vec![], None),
+            },
+            SearchScope::Space => match self.active_chat() {
+                Some(c) => (vec![c.space_id.clone()], None),
+                None => (vec![], None),
+            },
+            SearchScope::AllSpaces => (self.spaces.iter().map(|sp| sp.id.clone()).collect(), None),
+        };
+
+        let names = self.names.clone();
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+
+        if let Some(s) = &mut self.search {
+            s.searching = true;
+        }
+
+        self.search_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(SEARCH_DEBOUNCE).await;
+            let (query, from) = parse_from_filter(&raw);
+            if query.trim().is_empty() {
+                let _ = tx.send(Ev::SearchResults {
+                    seq,
+                    hits: Vec::new(),
+                    note: String::new(),
+                });
+                return;
+            }
+            match run_search_task(&api, &spaces, &query, &mode, chat_filter.as_deref(), from.as_deref(), &names)
+                .await
+            {
+                Ok((hits, note)) => {
+                    let _ = tx.send(Ev::SearchResults { seq, hits, note });
+                }
+                Err(e) => {
+                    let _ = tx.send(Ev::SearchFailed {
+                        seq,
+                        msg: format!("search: {e}"),
+                    });
+                }
+            }
+        }));
+    }
+
+    pub fn search_move(&mut self, d: isize) {
+        let Some(s) = &mut self.search else { return };
+        if s.results.is_empty() {
+            return;
+        }
+        let cur = s
+            .sel
+            .as_ref()
+            .and_then(|id| s.results.iter().position(|h| &h.msg_id == id))
+            .unwrap_or(s.results.len() - 1) as isize;
+        let last = s.results.len() as isize - 1;
+        let next = (cur + d).clamp(0, last) as usize;
+        s.sel = Some(s.results[next].msg_id.clone());
+    }
+
+    /// Opens the message under the search cursor in its real chat. `reply` also
+    /// drops straight into a reply. Closes the search view (Enter/Ctrl-r are
+    /// one-shot).
+    pub fn search_accept(&mut self, reply: bool) {
+        let Some(s) = &self.search else { return };
+        let Some(sel) = s.sel.clone() else { return };
+        let Some(hit) = s.results.iter().find(|h| h.msg_id == sel).cloned() else {
+            return;
+        };
+        let Some(idx) = self.chats.iter().position(|c| c.object_id == hit.chat_id) else {
+            self.toast("chat not in list");
+            return;
+        };
+        self.close_search();
+        self.pending_jump = Some(hit.msg_id.clone());
+        self.sel = idx;
+        self.user_selected = true;
+        // Activates the target chat (clears msgs + reply_to) and shows the pane.
+        self.open_selected();
+        if reply {
+            // A reply only needs the id, so arm it now — it works even before
+            // the message pages in; the banner fills in once it loads.
+            self.reply_to = Some(hit.msg_id.clone());
+            self.mode = Mode::Insert;
+        }
+        self.try_resolve_jump();
+    }
+
+    /// Places the message cursor on a pending jump target, paging history until
+    /// the message appears. Called after each message load; a no-op when there's
+    /// nothing pending.
+    pub fn try_resolve_jump(&mut self) {
+        let Some(target) = self.pending_jump.clone() else {
+            return;
+        };
+        if self.active.is_none() {
+            self.pending_jump = None;
+            return;
+        }
+        if self.msgs.iter().any(|m| m.id == target) {
+            self.sel_msg = Some(target);
+            self.focus = Focus::Messages;
+            self.pending_jump = None;
+            return;
+        }
+        if self.exhausted {
+            // Ran out of history without finding it (pre-index message, or the
+            // window never reached it): land on the oldest we have.
+            self.toast("message not in loaded history");
+            self.select_oldest();
+            self.pending_jump = None;
+            return;
+        }
+        // Not loaded yet — pull another page (no-op if one is already in flight;
+        // the next load will call us again).
+        self.load_more();
+    }
+
     // ---- message cursor --------------------------------------------------
 
     pub fn sel_msg_idx(&self) -> Option<usize> {
@@ -708,6 +975,102 @@ impl App {
         }
         self.load_more();
     }
+}
+
+// ---- search helpers ------------------------------------------------------
+
+/// Splits a `from:@name` (or `from:name`) token out of the query. The search
+/// API can't filter by sender, so we strip it and filter client-side. Returns
+/// (remaining query, optional name needle).
+fn parse_from_filter(raw: &str) -> (String, Option<String>) {
+    let mut from = None;
+    let mut rest: Vec<&str> = Vec::new();
+    for tok in raw.split_whitespace() {
+        if let Some(name) = tok.strip_prefix("from:") {
+            let name = name.trim_start_matches('@');
+            if !name.is_empty() {
+                from = Some(name.to_string());
+            }
+        } else {
+            rest.push(tok);
+        }
+    }
+    (rest.join(" "), from)
+}
+
+/// Human-readable summary of what the search engine did, for the status bar.
+fn search_note(res: &SearchResults) -> String {
+    match res.vector_status.as_str() {
+        "used" => format!("{} · semantic", res.mode),
+        "unavailable" => format!("{} · semantic offline", res.mode),
+        "disabled" => format!("{} · keyword only", res.mode),
+        _ => res.mode.clone(),
+    }
+}
+
+/// Runs the actual search: fan out per space, keep chat-scope hits, enrich each
+/// (one query per chat), apply the `from:` filter, and sort chronologically.
+async fn run_search_task(
+    api: &Api,
+    spaces: &[String],
+    query: &str,
+    mode: &str,
+    chat_filter: Option<&str>,
+    from: Option<&str>,
+    names: &HashMap<String, String>,
+) -> anyhow::Result<(Vec<SearchHit>, String)> {
+    // (space, chat) -> message ids of the hits in that chat.
+    let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut note = String::new();
+
+    for sp in spaces {
+        let res = api.search(sp, query, mode, SEARCH_LIMIT).await?;
+        note = search_note(&res);
+        for h in res.hits {
+            if let Some(cf) = chat_filter {
+                if h.object_id != cf {
+                    continue;
+                }
+            }
+            groups
+                .entry((sp.clone(), h.object_id.clone()))
+                .or_default()
+                .push(h.record_id.clone());
+        }
+    }
+
+    let mut rows: Vec<SearchHit> = Vec::new();
+    for ((sp, chat), ids) in groups {
+        // A failed enrichment for one chat shouldn't sink the whole search.
+        let msgs = api.messages_by_ids(&sp, &chat, &ids).await.unwrap_or_default();
+        for m in msgs {
+            rows.push(SearchHit {
+                chat_id: chat.clone(),
+                msg_id: m.id,
+                creator: m.creator,
+                text: m.text,
+                created_at: m.created_at,
+            });
+        }
+    }
+
+    if let Some(from) = from {
+        let needle = from.to_lowercase();
+        rows.retain(|r| {
+            names
+                .get(&r.creator)
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        });
+    }
+
+    // Chronological, like the chat itself; the cursor then lands on the newest.
+    rows.sort_by(|a, b| {
+        a.created_at
+            .total_cmp(&b.created_at)
+            .then(a.msg_id.cmp(&b.msg_id))
+    });
+    Ok((rows, note))
 }
 
 // ---- subscription tasks --------------------------------------------------

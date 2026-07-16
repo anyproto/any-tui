@@ -74,6 +74,57 @@ the last-message preview and any counters (`● 3` unread, `♥ 1` reactions).
 | `Ctrl-u` | clear the query |
 | `Esc` | dismiss |
 
+### Searching messages: `/`
+
+`/` (while a chat is open) turns the message pane into a **full-text / semantic
+search** over chat messages. The query lives where the composer usually sits;
+results appear above it, oldest→newest, enriched with sender and time and
+navigable exactly like a chat:
+
+```
+╭ search ──────────────────────────────────────────╮
+│ tolya  10 Jul 15:55  · bao/general               │
+│   create a comic book type in the foo space…     │
+│▌tolya  10 Jul 16:02  · bao/general               │
+│▌ Good — got the confirmed fix. Now building it.  │
+╰──────────────────────────────────────────────────╯
+╭ / ───────────────────────────────────────────────╮
+│> comic book                                      │
+╰ Enter open · Ctrl-r reply · Tab scope · Esc ─────╯
+ SEARCH  space: bao · hybrid · semantic  7 hits
+```
+
+Typing searches after a short pause (results update as you go). The query is
+always live, so navigation and actions are on `Ctrl`/arrow keys:
+
+| key | action |
+| --- | --- |
+| type | edit the query (full readline editing) |
+| `↓` / `↑`, `Ctrl-n` / `Ctrl-p` | move the result cursor |
+| `PgDn` / `PgUp` | move by a page |
+| `Tab` | cycle **scope**: this chat → this space → all spaces |
+| `Ctrl-t` | cycle **mode**: hybrid → fts → vector |
+| `Enter` | jump to the message in its real chat |
+| `Ctrl-r` | jump there **and** start a reply |
+| `Esc` | close search |
+
+The status bar shows the active **scope**, the **mode** that actually ran, and
+whether semantic recall participated (`semantic` / `keyword only` / `semantic
+offline`). **Scopes** map onto the per-space search endpoint: `chat` filters the
+current space's hits to the open chat, `space` searches the whole space, and
+`all spaces` fans the query out across every space.
+
+You can filter by sender with a **`from:@name`** token anywhere in the query
+(e.g. `deploy from:alice`) — the search engine has no sender filter, so it's
+stripped out and applied to the results.
+
+Two things worth knowing:
+
+- The index is **forward-only**: messages written before the daemon started
+  indexing won't be found (see `docs/13-index.md` in `any`).
+- There's no result pagination — you get the top 100 by relevance, re-sorted by
+  time. Narrow the query or scope if what you want isn't there.
+
 ### Narrow screens (mobile tmux)
 
 Under **80 columns** the app shows **one pane at a time** — the chat list, or the

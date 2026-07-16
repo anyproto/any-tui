@@ -181,6 +181,7 @@ fn handle(app: &mut App, ev: Ev) {
                 }
                 app.refresh_active_preview();
                 app.maybe_mark_read();
+                app.try_resolve_jump();
             }
         }
         Ev::MsgRemoved { chat, id } => {
@@ -202,9 +203,36 @@ fn handle(app: &mut App, ev: Ev) {
                 app.loading = false;
                 app.exhausted = exhausted;
                 app.merge_msgs(msgs);
+                app.try_resolve_jump();
             }
         }
         Ev::Preview { object_id, msg } => app.set_preview(&object_id, msg),
+        Ev::SearchResults { seq, hits, note } => {
+            // Ignore results for a query the user has already typed past.
+            if seq == app.search_gen {
+                if let Some(s) = &mut app.search {
+                    s.searching = false;
+                    let keep = s.sel.clone();
+                    s.results = hits;
+                    s.note = note;
+                    // Hold the cursor on the same message when it survives the
+                    // new result set; otherwise fall to the newest.
+                    s.sel = keep
+                        .filter(|id| s.results.iter().any(|h| &h.msg_id == id))
+                        .or_else(|| s.results.last().map(|h| h.msg_id.clone()));
+                    s.scroll = 0;
+                }
+            }
+        }
+        Ev::SearchFailed { seq, msg } => {
+            if seq == app.search_gen {
+                if let Some(s) = &mut app.search {
+                    s.searching = false;
+                    s.note = msg.clone();
+                }
+                app.toast(msg);
+            }
+        }
         Ev::Toast(m) => app.toast(m),
         Ev::Error(m) => app.toast(m),
     }
@@ -237,6 +265,37 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     .unwrap_or(false);
                 if edited {
                     app.picker_filter();
+                }
+            }
+        }
+        return;
+    }
+
+    // The search view owns the keyboard while it's up. The query is always
+    // live, so navigation and actions are on non-letter / Ctrl keys.
+    if app.search.is_some() {
+        let page: isize = 5;
+        match k.code {
+            KeyCode::Esc => app.close_search(),
+            KeyCode::Enter => app.search_accept(false),
+            KeyCode::Char('r') if ctrl => app.search_accept(true),
+            KeyCode::Tab | KeyCode::BackTab => app.search_cycle_scope(),
+            KeyCode::Char('t') if ctrl => app.search_cycle_mode(),
+            KeyCode::Down => app.search_move(1),
+            KeyCode::Up => app.search_move(-1),
+            KeyCode::Char('n') if ctrl => app.search_move(1),
+            KeyCode::Char('p') if ctrl => app.search_move(-1),
+            KeyCode::PageDown => app.search_move(page),
+            KeyCode::PageUp => app.search_move(-page),
+            // Everything else edits the query and re-runs (debounced).
+            _ => {
+                let edited = app
+                    .search
+                    .as_mut()
+                    .map(|s| edit::apply_edit_key(&mut s.query, &k, false))
+                    .unwrap_or(false);
+                if edited {
+                    app.run_search();
                 }
             }
         }
@@ -316,6 +375,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             Focus::Messages => app.move_msg_cursor(-1),
         },
         KeyCode::Char(' ') => app.open_picker(),
+        KeyCode::Char('/') => app.open_search(),
         KeyCode::Enter => {
             app.user_selected = true;
             app.open_selected();

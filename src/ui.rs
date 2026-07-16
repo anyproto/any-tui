@@ -1,4 +1,4 @@
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, Focus, Mode, SearchScope};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
@@ -302,6 +302,12 @@ fn selected_line_index(app: &App) -> usize {
 }
 
 fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
+    // The search view lives in the message pane; the query takes the composer
+    // slot at the bottom (see draw_search_view).
+    if app.search.is_some() {
+        draw_search_view(f, app, area);
+        return;
+    }
     let input_h = input_height(app, area.width);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
@@ -357,6 +363,173 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(visible), inner);
 
     draw_input(f, app, rows[1]);
+}
+
+/// The search view: ranked-then-time-sorted results fill the pane, the live
+/// query sits in the composer slot. Mirrors `draw_chat`'s follow-the-cursor
+/// scroll so paging through results feels like paging through a chat.
+fn draw_search_view(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_style(true))
+        .title(" search ")
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(rows[0]);
+    f.render_widget(block, rows[0]);
+
+    let (lines, ranges) = render_search_results(app, inner.width as usize);
+    let h = (inner.height as usize).max(1);
+    let sel = app.search.as_ref().and_then(|s| s.sel.clone());
+    let mut scroll = app.search.as_ref().map(|s| s.scroll).unwrap_or(0);
+    if let Some(id) = &sel {
+        if let Some((_, s0, e0)) = ranges.iter().find(|(mid, _, _)| mid == id) {
+            let (s0, e0) = (*s0, *e0);
+            let mut end = lines.len().saturating_sub(scroll);
+            if e0 > end {
+                scroll = lines.len().saturating_sub(e0);
+                end = lines.len().saturating_sub(scroll);
+            }
+            let start = end.saturating_sub(h);
+            if s0 < start {
+                scroll = lines.len().saturating_sub(s0 + h).min(lines.len());
+            }
+        }
+    }
+    let max_scroll = lines.len().saturating_sub(h);
+    if scroll > max_scroll {
+        scroll = max_scroll;
+    }
+    if let Some(s) = &mut app.search {
+        s.scroll = scroll;
+    }
+
+    let end = lines.len().saturating_sub(scroll);
+    let start = end.saturating_sub(h);
+    let visible: Vec<Line> = lines[start..end].to_vec();
+    f.render_widget(Paragraph::new(visible), inner);
+
+    draw_search_query(f, app, rows[1]);
+}
+
+fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut ranges: MsgRanges = Vec::new();
+    let Some(s) = &app.search else {
+        return (lines, ranges);
+    };
+
+    if s.query.value().trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  type to search messages",
+            Style::default().fg(DIM),
+        )));
+        return (lines, ranges);
+    }
+    if s.results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if s.searching {
+                "  searching…"
+            } else {
+                "  no matches"
+            },
+            Style::default().fg(DIM),
+        )));
+        return (lines, ranges);
+    }
+
+    let text_w = width.saturating_sub(2).max(10);
+    // With a wider scope the results span chats, so each row names its chat.
+    let show_loc = s.scope != SearchScope::Chat;
+    let sel_id = s.sel.clone().unwrap_or_default();
+
+    for (i, hit) in s.results.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        let is_me = hit.creator == app.me;
+        let mut head = vec![
+            Span::styled(
+                app.display_name(&hit.creator),
+                Style::default()
+                    .fg(if is_me { ME } else { PEER })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(fmt_time(hit.created_at), Style::default().fg(DIM)),
+        ];
+        if show_loc {
+            let loc = app
+                .chats
+                .iter()
+                .find(|c| c.object_id == hit.chat_id)
+                .map(|c| {
+                    if s.scope == SearchScope::AllSpaces {
+                        c.qualified()
+                    } else {
+                        c.label().to_string()
+                    }
+                })
+                .unwrap_or_default();
+            if !loc.is_empty() {
+                head.push(Span::raw("  "));
+                head.push(Span::styled(format!("· {loc}"), Style::default().fg(ACCENT)));
+            }
+        }
+
+        let start_line = lines.len();
+        lines.push(Line::from(head));
+        for l in wrap(&hit.text, text_w) {
+            lines.push(Line::from(vec![Span::raw("  "), Span::raw(l)]));
+        }
+        let end_line = lines.len();
+        ranges.push((hit.msg_id.clone(), start_line, end_line));
+
+        // Cursor bar, same treatment as the message list.
+        if hit.msg_id == sel_id {
+            for l in lines.iter_mut().take(end_line).skip(start_line) {
+                let mut spans = vec![Span::styled("▌", Style::default().fg(ACCENT))];
+                let mut rest = l.spans.clone();
+                if !rest.is_empty() && rest[0].content.starts_with("  ") {
+                    let trimmed = rest[0].content[2..].to_string();
+                    rest[0] = Span::styled(trimmed, rest[0].style);
+                    spans.push(Span::raw(" "));
+                }
+                spans.extend(rest);
+                *l = Line::from(spans);
+            }
+        }
+    }
+    (lines, ranges)
+}
+
+fn draw_search_query(f: &mut Frame, app: &App, area: Rect) {
+    let Some(s) = &app.search else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" / ")
+        .title_bottom(Line::from(Span::styled(
+            " Enter open · Ctrl-r reply · Tab scope · Esc ",
+            Style::default().fg(DIM),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT).bold()),
+            Span::raw(s.query.value().to_string()),
+        ])),
+        inner,
+    );
+    let cx = inner.x + 2 + (s.query.visual_cursor() as u16).min(inner.width.saturating_sub(3));
+    f.set_cursor_position((cx, inner.y));
 }
 
 /// Returns the rendered lines plus, for each message, the half-open line range
@@ -625,6 +798,48 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Search takes over the mode indicator, and carries the scope/mode/count
+    // the user needs to steer it (Tab and Ctrl-t change these live).
+    if let Some(s) = &app.search {
+        let scope = match s.scope {
+            SearchScope::Chat => app
+                .active_chat()
+                .map(|c| format!("chat: {}", c.label()))
+                .unwrap_or_else(|| "chat".to_string()),
+            SearchScope::Space => app
+                .active_chat()
+                .map(|c| format!("space: {}", c.space_name))
+                .unwrap_or_else(|| "space".to_string()),
+            SearchScope::AllSpaces => "all spaces".to_string(),
+        };
+        let detail = if s.note.is_empty() {
+            s.mode.as_str().to_string()
+        } else {
+            s.note.clone()
+        };
+        let count = if s.searching {
+            "  …".to_string()
+        } else if s.query.value().trim().is_empty() {
+            String::new()
+        } else {
+            format!("  {} hits", s.results.len())
+        };
+        let spans = vec![
+            Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(PEER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {scope}"), Style::default().fg(ACCENT).bold()),
+            Span::styled(format!("  · {detail}"), Style::default().fg(DIM)),
+            Span::styled(count, Style::default().fg(DIM)),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let label = match app.mode {
         Mode::Insert => " INSERT ",
         Mode::Normal => " NORMAL ",
@@ -711,6 +926,7 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
     let text = vec![
         "  Navigation",
         "    Space           fuzzy-find a chat",
+        "    /               search messages",
         "    Ctrl-n / Ctrl-p next / previous chat",
         "    j / k, ↓ / ↑    move chat · move message cursor",
         "    Enter           step into the chat",
@@ -719,6 +935,15 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    n               next chat with unread",
         "    g / G           oldest / newest message",
         "    Ctrl-d / Ctrl-u jump 5 messages",
+        "",
+        "  Search (/)",
+        "    type            query (updates as you type)",
+        "    Tab             scope: chat → space → all",
+        "    Ctrl-t          mode: hybrid → fts → vector",
+        "    ↓ / ↑, PgDn/PgUp move / page through results",
+        "    Enter           jump to the message",
+        "    Ctrl-r          jump there and reply",
+        "    from:@name      filter by sender",
         "",
         "  Layout",
         "    z               one pane ⇄ two panes",

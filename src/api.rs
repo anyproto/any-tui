@@ -18,6 +18,26 @@ pub struct Health {
     pub account: String,
 }
 
+/// One raw search hit. For a chat-scope hit, `object_id` is the chat and
+/// `record_id` is the message id. The matched text is fetched during
+/// enrichment (alongside creator/timestamp), so it isn't kept here. The wire
+/// also carries a `score`, but results are re-sorted by time, so we drop it.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub object_id: String,
+    pub record_id: String,
+}
+
+/// A search response: ranked hits plus what the engine actually did. `mode` is
+/// the mode that ran (hybrid can degrade to fts) and `vector_status` says
+/// whether semantic recall participated (used | unavailable | disabled | skipped).
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    pub mode: String,
+    pub vector_status: String,
+}
+
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -118,6 +138,87 @@ impl Api {
                 .then(a.id.cmp(&b.id))
         });
         Ok(msgs)
+    }
+
+    /// Full-text / semantic search over chat messages in one space. `mode` is
+    /// "hybrid" | "fts" | "vector"; we always restrict to the "chat" scope so
+    /// only messages come back (never pages or object names).
+    pub async fn search(
+        &self,
+        space_id: &str,
+        query: &str,
+        mode: &str,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        let v = self
+            .post_json(
+                &format!("/spaces/{space_id}/search"),
+                json!({
+                    "query": query,
+                    "scopes": ["chat"],
+                    "mode": mode,
+                    "limit": limit,
+                }),
+            )
+            .await?;
+        let hits = v
+            .get("hits")
+            .and_then(|h| h.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| {
+                        Some(SearchHit {
+                            object_id: h.get("objectId")?.as_str()?.to_string(),
+                            record_id: h.get("recordId")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(SearchResults {
+            hits,
+            mode: v
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string(),
+            vector_status: v
+                .get("vectorStatus")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    /// Fetches specific chat messages by id. Search hits carry only the message
+    /// id and text, so this backfills creator/timestamp for the results view.
+    pub async fn messages_by_ids(
+        &self,
+        space_id: &str,
+        object_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<Message>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let v = self
+            .post_json(
+                &format!("/spaces/{space_id}/query"),
+                json!({
+                    "objectId": object_id,
+                    "dataset": DATASET_CHAT_MESSAGES,
+                    "filter": { "id": { "$in": ids } },
+                    "sort": ["-createdAt"],
+                    "limit": ids.len(),
+                }),
+            )
+            .await?;
+        let recs = v
+            .get("records")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(recs.iter().filter_map(Message::from_record).collect())
     }
 
     pub async fn send(
