@@ -65,9 +65,11 @@ impl Layout {
     }
 }
 
-/// One row of the fuzzy picker.
+/// One row of the fuzzy picker. Keyed by object id, not by index into `chats`:
+/// an arriving message re-sorts that list by recency, and a stale index would
+/// silently open the wrong chat.
 pub struct PickItem {
-    pub chat_idx: usize,
+    pub object_id: String,
     /// Indices into the label's chars that matched, for highlighting.
     pub indices: Vec<usize>,
 }
@@ -567,16 +569,16 @@ impl App {
     pub fn picker_filter(&mut self) {
         let Some(p) = &self.picker else { return };
         let query = p.query.clone();
-        let keep = p.items.get(p.sel).map(|i| i.chat_idx);
+        let keep = p.items.get(p.sel).map(|i| i.object_id.clone());
 
         let mut scored: Vec<(i32, PickItem)> = Vec::new();
-        for (idx, chat) in self.chats.iter().enumerate() {
+        for chat in self.chats.iter() {
             let label = self.pick_label(chat);
             if let Some((score, indices)) = crate::fuzzy::fuzzy_match(&label, &query) {
                 scored.push((
                     score,
                     PickItem {
-                        chat_idx: idx,
+                        object_id: chat.object_id.clone(),
                         indices,
                     },
                 ));
@@ -592,7 +594,7 @@ impl App {
             // Hold the highlight on the same chat when possible, so typing
             // doesn't yank the selection out from under you.
             p.sel = keep
-                .and_then(|c| items.iter().position(|i| i.chat_idx == c))
+                .and_then(|c| items.iter().position(|i| i.object_id == c))
                 .unwrap_or(0)
                 .min(items.len().saturating_sub(1));
             p.items = items;
@@ -620,7 +622,16 @@ impl App {
             self.close_picker();
             return;
         };
-        self.sel = item.chat_idx;
+        // Resolve the id now: the list may have re-sorted since we filtered.
+        let Some(idx) = self
+            .chats
+            .iter()
+            .position(|c| c.object_id == item.object_id)
+        else {
+            self.close_picker();
+            return;
+        };
+        self.sel = idx;
         self.user_selected = true;
         self.close_picker();
         self.open_selected();

@@ -17,6 +17,9 @@ const MAX_INPUT_LINES: usize = 8;
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const UNREAD: Color = Color::Yellow;
+/// Selected rows brighten their text instead of taking a background tint.
+const SEL: Color = Color::White;
+const SEL_UNREAD: Color = Color::LightYellow;
 const ME: Color = Color::Green;
 const PEER: Color = Color::Magenta;
 
@@ -97,11 +100,10 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
     for (i, item) in p.items.iter().enumerate() {
-        let Some(chat) = app.chats.get(item.chat_idx) else {
+        let Some(chat) = app.chats.iter().find(|c| c.object_id == item.object_id) else {
             continue;
         };
         let selected = i == p.sel;
-        let row_bg = Style::default().bg(Color::Rgb(38, 38, 48));
 
         let badge = if chat.unread > 0 {
             format!("● {} ", chat.unread)
@@ -112,13 +114,14 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         };
 
         // Highlight the chars the query matched, like helix does.
+        // Selection is the ▌ bar plus brighter text — same reasoning as the
+        // sidebar: a background tint stops short on truncated rows.
         let label = app.pick_label(chat);
-        let base = if chat.unread > 0 {
-            Style::default().fg(UNREAD)
-        } else if selected {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::Gray)
+        let base = match (selected, chat.unread > 0) {
+            (true, true) => Style::default().fg(SEL_UNREAD).add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
+            (false, true) => Style::default().fg(UNREAD),
+            (false, false) => Style::default().fg(Color::Gray),
         };
         let avail = width.saturating_sub(badge.width() + 3);
         let mut spans = vec![Span::styled(
@@ -144,11 +147,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         if !badge.is_empty() {
             spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
         }
-        let mut line = Line::from(spans);
-        if selected {
-            line = line.style(row_bg);
-        }
-        lines.push(line);
+        lines.push(Line::from(spans));
 
         let preview = match &chat.last_text {
             Some(t) if t.is_empty() => "no messages".to_string(),
@@ -159,14 +158,10 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
             ),
             None => "…".to_string(),
         };
-        let mut pline = Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             format!("    {}", one_line(&preview, width.saturating_sub(5))),
-            Style::default().fg(DIM),
-        ));
-        if selected {
-            pline = pline.style(row_bg);
-        }
-        lines.push(pline);
+            Style::default().fg(if selected { Color::Gray } else { DIM }),
+        )));
     }
 
     // Keep the highlighted row in view.
@@ -216,7 +211,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         }
 
         let selected = i == app.sel;
-        let is_active = app.active.as_deref() == Some(chat.object_id.as_str());
         let has_unread = chat.unread > 0;
 
         let marker = if has_unread { "●" } else { "○" };
@@ -225,10 +219,14 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         } else {
             String::new()
         };
-        let name_style = match (has_unread, is_active) {
-            (true, _) => Style::default().fg(UNREAD).bold(),
-            (false, true) => Style::default().fg(ACCENT),
-            _ => Style::default().fg(Color::Gray),
+        // Selection is the ▌ bar plus brighter text, not a background tint: a
+        // tint only paints cells that hold text, so it stops short on
+        // truncated rows and leaves the highlight looking cut off.
+        let name_style = match (selected, has_unread) {
+            (true, true) => Style::default().fg(SEL_UNREAD).add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
+            (false, true) => Style::default().fg(UNREAD),
+            (false, false) => Style::default().fg(Color::Gray),
         };
 
         let width = inner.width as usize;
@@ -246,12 +244,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         if !badge.is_empty() {
             spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
         }
-        let mut line = Line::from(spans);
-        let row_bg = Style::default().bg(Color::Rgb(38, 38, 48));
-        if selected {
-            line = line.style(row_bg);
-        }
-        lines.push(line);
+        lines.push(Line::from(spans));
 
         // Preview line: several chats per space share the name "general", so
         // this is what actually distinguishes them.
@@ -264,14 +257,12 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             ),
             None => "…".to_string(),
         };
-        let mut pline = Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             format!("   {}", one_line(&preview, width.saturating_sub(4))),
-            Style::default().fg(DIM),
-        ));
-        if selected {
-            pline = pline.style(row_bg);
-        }
-        lines.push(pline);
+            // Lift the preview out of DIM when selected so the whole row reads
+            // as one unit.
+            Style::default().fg(if selected { Color::Gray } else { DIM }),
+        )));
     }
 
     if app.chats.is_empty() {
@@ -507,7 +498,9 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                     spans.push(Span::raw(" "));
                 }
                 spans.extend(rest);
-                *l = Line::from(spans).style(Style::default().bg(Color::Rgb(32, 32, 42)));
+                // The bar alone marks the cursor; a background tint would only
+                // cover each line's text and end ragged against short lines.
+                *l = Line::from(spans);
             }
         }
 
