@@ -10,6 +10,11 @@ use tokio::task::JoinHandle;
 const WINDOW: usize = 150;
 const PAGE: usize = 100;
 
+/// How long a chat must stay open before auto-read fires. Long enough that
+/// cursoring through the list doesn't clear unread, short enough to be
+/// invisible when you actually stop to read.
+const DWELL: Duration = Duration::from_millis(1500);
+
 #[derive(Debug)]
 pub enum Ev {
     Key(ratatui::crossterm::event::KeyEvent),
@@ -60,6 +65,20 @@ impl Layout {
     }
 }
 
+/// One row of the fuzzy picker.
+pub struct PickItem {
+    pub chat_idx: usize,
+    /// Indices into the label's chars that matched, for highlighting.
+    pub indices: Vec<usize>,
+}
+
+/// Centred fuzzy chat picker, in the spirit of helix's buffer/file menus.
+pub struct Picker {
+    pub query: String,
+    pub sel: usize,
+    pub items: Vec<PickItem>,
+}
+
 pub struct App {
     pub api: Api,
     pub tx: UnboundedSender<Ev>,
@@ -72,6 +91,8 @@ pub struct App {
     /// True once the user has moved the cursor themselves.
     pub user_selected: bool,
     pub active: Option<String>,
+    /// When the current chat became active, for the auto-read dwell check.
+    pub active_since: Instant,
     pub msgs: Vec<Message>,
     pub focus: Focus,
     pub mode: Mode,
@@ -84,6 +105,7 @@ pub struct App {
     pub scroll: usize,
     pub reply_to: Option<String>,
     pub toast: Option<(String, Instant)>,
+    pub picker: Option<Picker>,
     pub show_help: bool,
     pub auto_read: bool,
     pub quit: bool,
@@ -120,6 +142,7 @@ impl App {
             sel: 0,
             user_selected: false,
             active: None,
+            active_since: Instant::now(),
             msgs: Vec::new(),
             focus: Focus::Sidebar,
             mode: Mode::Normal,
@@ -129,6 +152,7 @@ impl App {
             scroll: 0,
             reply_to: None,
             toast: None,
+            picker: None,
             show_help: false,
             auto_read,
             quit: false,
@@ -366,30 +390,57 @@ impl App {
         });
     }
 
-    pub fn open_selected(&mut self) {
+    /// Loads the selected chat without touching focus, so moving the cursor in
+    /// the list previews chats in place (and, in single-pane mode, makes the
+    /// subsequent Enter instant).
+    pub fn activate_selected(&mut self) {
         let Some(chat) = self.selected_chat().cloned() else {
             return;
         };
         if self.active.as_deref() == Some(chat.object_id.as_str()) {
-            self.focus = Focus::Messages;
             return;
         }
         if let Some(t) = self.msg_task.take() {
             t.abort();
         }
         self.active = Some(chat.object_id.clone());
+        self.active_since = Instant::now();
         self.msgs.clear();
         self.scroll = 0;
         self.reply_to = None;
         self.exhausted = false;
         self.loading = true;
-        self.focus = Focus::Messages;
         self.msg_task = Some(spawn_messages_sub(
             self.api.clone(),
             chat.space_id.clone(),
             chat.object_id.clone(),
             self.tx.clone(),
         ));
+    }
+
+    /// Explicitly enter the chat: load it and move into the message pane.
+    pub fn open_selected(&mut self) {
+        self.activate_selected();
+        if self.active.is_some() {
+            self.focus = Focus::Messages;
+        }
+    }
+
+    /// Moves the selection by `d` and previews the chat it lands on. Focus is
+    /// left alone, so this works while reading (Ctrl-n/Ctrl-p) and while
+    /// browsing the list alike.
+    pub fn select_delta(&mut self, d: isize) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let last = self.chats.len() - 1;
+        let next = (self.sel as isize + d).clamp(0, last as isize) as usize;
+        if next == self.sel && self.active.is_some() {
+            return;
+        }
+        self.sel = next;
+        self.user_selected = true;
+        self.activate_selected();
     }
 
     /// Pages backwards through history when the user scrolls near the top.
@@ -426,8 +477,20 @@ impl App {
 
     /// Marks the chat read once the newest message is actually on screen.
     /// Skipped when `--no-auto-read` is set, and never re-sends for the same id.
+    ///
+    /// Requires a short dwell: moving the cursor down the list previews each
+    /// chat, and browsing past unread chats must not silently clear them.
+    /// Read state has no undo in the API, so the bias is towards not marking.
     pub fn maybe_mark_read(&mut self) {
         if !self.auto_read || self.scroll != 0 {
+            return;
+        }
+        if self.active_since.elapsed() < DWELL {
+            return;
+        }
+        // In single-pane mode the cursor loads chats that aren't on screen.
+        // Never mark those read: nobody has seen them.
+        if self.single_now && self.focus != Focus::Messages {
             return;
         }
         let Some(chat) = self.active_chat().cloned() else {
@@ -478,6 +541,95 @@ impl App {
                 let _ = tx.send(Ev::Error(format!("send: {e}")));
             }
         });
+    }
+
+    // ---- fuzzy picker ----------------------------------------------------
+
+    /// The string the picker matches against and displays, e.g.
+    /// "sync team: general".
+    pub fn pick_label(&self, chat: &Chat) -> String {
+        format!("{}: {}", chat.space_name, chat.label())
+    }
+
+    pub fn open_picker(&mut self) {
+        if self.chats.is_empty() {
+            self.toast("no chats yet");
+            return;
+        }
+        self.picker = Some(Picker {
+            query: String::new(),
+            sel: 0,
+            items: Vec::new(),
+        });
+        self.picker_filter();
+    }
+
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Recomputes matches. An empty query lists every chat in sidebar order;
+    /// otherwise rows are ranked by fuzzy score.
+    pub fn picker_filter(&mut self) {
+        let Some(p) = &self.picker else { return };
+        let query = p.query.clone();
+        let keep = p.items.get(p.sel).map(|i| i.chat_idx);
+
+        let mut scored: Vec<(i32, PickItem)> = Vec::new();
+        for (idx, chat) in self.chats.iter().enumerate() {
+            let label = self.pick_label(chat);
+            if let Some((score, indices)) = crate::fuzzy::fuzzy_match(&label, &query) {
+                scored.push((
+                    score,
+                    PickItem {
+                        chat_idx: idx,
+                        indices,
+                    },
+                ));
+            }
+        }
+        if !query.trim().is_empty() {
+            // Stable sort keeps sidebar order among equally good matches.
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        let items: Vec<PickItem> = scored.into_iter().map(|(_, i)| i).collect();
+
+        if let Some(p) = &mut self.picker {
+            // Hold the highlight on the same chat when possible, so typing
+            // doesn't yank the selection out from under you.
+            p.sel = keep
+                .and_then(|c| items.iter().position(|i| i.chat_idx == c))
+                .unwrap_or(0)
+                .min(items.len().saturating_sub(1));
+            p.items = items;
+        }
+    }
+
+    pub fn picker_move(&mut self, d: isize) {
+        if let Some(p) = &mut self.picker {
+            if p.items.is_empty() {
+                return;
+            }
+            let last = p.items.len() - 1;
+            // Wrap: the list is short and cycling is what these menus do.
+            p.sel = match (p.sel as isize + d).rem_euclid(p.items.len() as isize) as usize {
+                x if x > last => last,
+                x => x,
+            };
+        }
+    }
+
+    /// Opens the highlighted chat and dismisses the picker.
+    pub fn picker_accept(&mut self) {
+        let Some(p) = &self.picker else { return };
+        let Some(item) = p.items.get(p.sel) else {
+            self.close_picker();
+            return;
+        };
+        self.sel = item.chat_idx;
+        self.user_selected = true;
+        self.close_picker();
+        self.open_selected();
     }
 
     pub fn next_unread(&mut self) {

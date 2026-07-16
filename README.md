@@ -20,8 +20,17 @@ The any daemon must be running and authorized (`GET /v1/health` returns an
 
 ### Starting out
 
-You land on the **chat list**, grouped by space. Move with `j`/`k`, open with
-`Enter`, get back with `Esc`. Press `?` at any time for the keymap, `q` to quit.
+You land on the **chat list**, grouped by space. Move with `j`/`k` — each chat
+opens as you land on it, no `Enter` needed. `Enter` steps *into* the chat to
+scroll and reply; `Esc` steps back out. Press `?` for the keymap, `q` to quit.
+
+Three ways to get around, in rough order of how often you'll want them:
+
+| | |
+| --- | --- |
+| `Space` | **fuzzy-find any chat** — the fastest way when you know where you're going |
+| `Ctrl-n` / `Ctrl-p` | next / previous chat in list order, **without leaving the chat you're reading** |
+| `j` / `k` | walk the list, previewing as you go |
 
 Every row shows a preview of its last message:
 
@@ -37,6 +46,33 @@ The preview is load-bearing, not decoration: a space usually contains several
 chats **all named `general`**, and the preview is the only thing that tells them
 apart. `●` means unread, `○` read; the count sits on the right. Chats are ordered
 by most recent activity within each space, so live ones float to the top.
+
+### Finding a chat: `Space`
+
+`Space` opens a centred fuzzy picker over every chat, in the style of helix's
+file/buffer menus:
+
+```
+╭ chats (4) ───────────────────────────────────────╮
+│  > stg                                           │
+│                                                  │
+│▌ sync team: general                              │
+│    tolya: Завел третий мобильный клиент.         │
+│  sync team: general                          ● 3 │
+│    km: Толя, Серега, гляньте плиз ПРы…           │
+╰──────────────────────────────────────────────────╯
+```
+
+Type to filter — matching is fuzzy over `space: chat`, so `stg` finds
+**s**ync **t**eam: **g**eneral and matched letters are highlighted. Rows carry
+the last-message preview and any counters (`● 3` unread, `♥ 1` reactions).
+
+| key | action |
+| --- | --- |
+| `Ctrl-n` / `Ctrl-p`, `↓` / `↑` | move (wraps around) |
+| `Enter` | open it |
+| `Ctrl-u` | clear the query |
+| `Esc` | dismiss |
 
 ### Narrow screens (mobile tmux)
 
@@ -85,6 +121,7 @@ because "general" tells you nothing:
 | key | action |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | scroll messages (or move selection in the list) |
+| `Ctrl-n` / `Ctrl-p` | next / previous chat, without leaving the message pane |
 | `Ctrl-d` / `Ctrl-u` | half page down / up |
 | `G` | jump to newest |
 | `g` | jump to oldest — pulls in older history as you go |
@@ -111,6 +148,12 @@ A `── new ──` rule marks where your unread starts.
 Opening a chat marks it read once the newest message is actually on screen —
 scrolled to the bottom, not merely opened. It never marks read while you're
 scrolled up in history.
+
+Because the cursor previews chats as it moves, marking read also waits for you
+to **stay put for ~1.5s**: walking `j`/`k` past a stack of unread chats, or
+cycling through them with `Ctrl-n`, leaves them unread. In one-pane mode a chat
+loaded behind the list is never marked read, since you haven't seen it. Read
+state has no undo in the API, so the bias is always towards *not* marking.
 
 ```sh
 any-tui --no-auto-read    # read without ever touching read state
@@ -158,7 +201,8 @@ Contract, verified against the server source:
 | `api.rs` | REST calls + subscription setup |
 | `sse.rs` | SSE frame parser (`ready`/`snapshot`/`changes`/`closed`) |
 | `model.rs` | `Space`, `Chat`, `Message` and record parsing |
-| `app.rs` | state, event enum, subscription tasks |
+| `fuzzy.rs` | scored subsequence matcher behind the `Space` picker |
+| `app.rs` | state, event enum, picker, subscription tasks |
 | `ui.rs` | rendering, wrapping, scroll geometry, pane layout |
 | `main.rs` | CLI, terminal lifecycle, keymap, event loop |
 

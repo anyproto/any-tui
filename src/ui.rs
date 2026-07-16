@@ -38,9 +38,140 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, app, root[1]);
 
+    if app.picker.is_some() {
+        draw_picker(f, app, f.area());
+    }
     if app.show_help {
         draw_help(f, f.area(), &app.version);
     }
+}
+
+fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.picker else { return };
+
+    // Fixed size: the box must not resize and re-centre itself on every
+    // keystroke as the match count changes.
+    let w = 72.min(area.width.saturating_sub(2));
+    let h = 24.min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+
+    let title = format!(" chats ({}) ", p.items.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+
+    // Query line.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("> ", Style::default().fg(ACCENT).bold()),
+            Span::raw(p.query.clone()),
+        ])),
+        parts[0],
+    );
+    f.set_cursor_position((
+        parts[0].x + 4 + (p.query.width() as u16).min(parts[0].width.saturating_sub(5)),
+        parts[0].y,
+    ));
+
+    let width = parts[1].width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if p.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(DIM),
+        )));
+    }
+    for (i, item) in p.items.iter().enumerate() {
+        let Some(chat) = app.chats.get(item.chat_idx) else {
+            continue;
+        };
+        let selected = i == p.sel;
+        let row_bg = Style::default().bg(Color::Rgb(38, 38, 48));
+
+        let badge = if chat.unread > 0 {
+            format!("● {} ", chat.unread)
+        } else if chat.unread_reactions > 0 {
+            format!("♥ {} ", chat.unread_reactions)
+        } else {
+            String::new()
+        };
+
+        // Highlight the chars the query matched, like helix does.
+        let label = app.pick_label(chat);
+        let base = if chat.unread > 0 {
+            Style::default().fg(UNREAD)
+        } else if selected {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let avail = width.saturating_sub(badge.width() + 3);
+        let mut spans = vec![Span::styled(
+            if selected { "▌ " } else { "  " },
+            Style::default().fg(if selected { ACCENT } else { Color::Reset }),
+        )];
+        let mut shown = 0usize;
+        for (ci, ch) in label.chars().enumerate() {
+            if shown >= avail {
+                spans.push(Span::styled("…", base));
+                break;
+            }
+            let st = if item.indices.contains(&ci) {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            spans.push(Span::styled(ch.to_string(), st));
+            shown += ch.to_string().width();
+        }
+        let pad = width.saturating_sub(2 + shown + badge.width());
+        spans.push(Span::raw(" ".repeat(pad)));
+        if !badge.is_empty() {
+            spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
+        }
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(row_bg);
+        }
+        lines.push(line);
+
+        let preview = match &chat.last_text {
+            Some(t) if t.is_empty() => "no messages".to_string(),
+            Some(t) => format!(
+                "{}: {}",
+                short_name(&app.display_name(&chat.last_creator)),
+                one_line(t, width)
+            ),
+            None => "…".to_string(),
+        };
+        let mut pline = Line::from(Span::styled(
+            format!("    {}", one_line(&preview, width.saturating_sub(5))),
+            Style::default().fg(DIM),
+        ));
+        if selected {
+            pline = pline.style(row_bg);
+        }
+        lines.push(pline);
+    }
+
+    // Keep the highlighted row in view.
+    let h = parts[1].height as usize;
+    let sel_line = p.sel * 2 + 2;
+    let offset = sel_line.saturating_sub(h);
+    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), parts[1]);
 }
 
 fn focus_style(active: bool) -> Style {
@@ -478,8 +609,10 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
     }
     let text = vec![
         "  Navigation",
+        "    Space           fuzzy-find a chat",
+        "    Ctrl-n / Ctrl-p next / previous chat",
         "    j / k, ↓ / ↑    move selection · scroll messages",
-        "    Enter           open selected chat",
+        "    Enter           step into the chat",
         "    Esc / h         back to chat list",
         "    Tab             switch pane",
         "    n               next chat with unread",
@@ -536,8 +669,10 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
 fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
     let text = vec![
         "  Navigate",
+        "   Space    find a chat",
+        "   C-n/C-p  next/prev chat",
         "   j/k      move · scroll",
-        "   Enter    open chat",
+        "   Enter    step into chat",
         "   Esc/h    back to list",
         "   Tab      switch pane",
         "   n        next unread",

@@ -5,6 +5,7 @@
 
 mod api;
 mod app;
+mod fuzzy;
 mod model;
 mod sse;
 mod ui;
@@ -153,7 +154,9 @@ async fn run(
 fn handle(app: &mut App, ev: Ev) {
     match ev {
         Ev::Key(k) => on_key(app, k),
-        Ev::Tick => {}
+        // Auto-read waits for a dwell, so it needs a nudge from the clock
+        // rather than only firing on keys and arriving messages.
+        Ev::Tick => app.maybe_mark_read(),
         Ev::ChatsSnapshot { space_id, chats } => {
             // Replace this space's chats wholesale, keeping other spaces intact.
             let keep: Vec<String> = chats.iter().map(|c| c.object_id.clone()).collect();
@@ -212,6 +215,50 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
+    // The picker owns the keyboard while it's up.
+    if app.picker.is_some() {
+        match k.code {
+            KeyCode::Esc => app.close_picker(),
+            KeyCode::Enter => app.picker_accept(),
+            KeyCode::Down => app.picker_move(1),
+            KeyCode::Up => app.picker_move(-1),
+            KeyCode::Char('n') if ctrl => app.picker_move(1),
+            KeyCode::Char('p') if ctrl => app.picker_move(-1),
+            KeyCode::Char('j') if ctrl => app.picker_move(1),
+            KeyCode::Char('k') if ctrl => app.picker_move(-1),
+            KeyCode::Char('u') if ctrl => {
+                if let Some(p) = &mut app.picker {
+                    p.query.clear();
+                }
+                app.picker_filter();
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = &mut app.picker {
+                    p.query.pop();
+                }
+                app.picker_filter();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(p) = &mut app.picker {
+                    p.query.push(c);
+                }
+                app.picker_filter();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Cycle chats in sidebar order from anywhere, including while reading.
+    if ctrl && matches!(k.code, KeyCode::Char('n')) {
+        app.select_delta(1);
+        return;
+    }
+    if ctrl && matches!(k.code, KeyCode::Char('p')) {
+        app.select_delta(-1);
+        return;
+    }
+
     if app.mode == Mode::Insert {
         match k.code {
             KeyCode::Esc => {
@@ -255,22 +302,17 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 Focus::Messages => Focus::Sidebar,
             }
         }
+        // In the list, moving the cursor previews the chat straight away;
+        // Enter is only needed to step into it.
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Sidebar => {
-                if app.sel + 1 < app.chats.len() {
-                    app.sel += 1;
-                    app.user_selected = true;
-                }
-            }
+            Focus::Sidebar => app.select_delta(1),
             Focus::Messages => app.scroll_down(1),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Sidebar => {
-                app.sel = app.sel.saturating_sub(1);
-                app.user_selected = true;
-            }
+            Focus::Sidebar => app.select_delta(-1),
             Focus::Messages => app.scroll_up(1),
         },
+        KeyCode::Char(' ') => app.open_picker(),
         KeyCode::Enter => {
             app.user_selected = true;
             app.open_selected();
