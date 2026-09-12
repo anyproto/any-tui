@@ -1,0 +1,5 @@
+# The any server build whose GET /v1/openapi.json is pinned in openapi.json.
+# Re-pin with: scripts/api-drift.sh --update [<api-url>]
+version: any v0.1.2-nightly.20260909.1 (commit ffd2147, built 2026-09-09T12:04:06Z)
+any-repo-commit: ffd2147
+pinned-at: 2026-09-12T12:17:00Z
