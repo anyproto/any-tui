@@ -1,8 +1,8 @@
 use crate::api::{Api, SearchResults};
-use crate::model::{Chat, Message, Space};
+use crate::model::{Chat, Identity, Message, Space, link_mentions, render_mentions};
 use crate::sse::{Frame, SseReader};
 use tui_input::Input;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -27,6 +27,9 @@ const SEARCH_LIMIT: usize = 100;
 pub enum Ev {
     Key(ratatui::crossterm::event::KeyEvent),
     Tick,
+    /// A fresh `GET /spaces` listing, fired whenever the space-list
+    /// subscription reports a change (a space joined or left on any device).
+    Spaces(Vec<Space>),
     ChatsSnapshot { space_id: String, chats: Vec<Chat> },
     ChatUpsert(Chat),
     ChatRemoved { object_id: String },
@@ -165,7 +168,12 @@ pub struct App {
     pub me: String,
     pub version: String,
     pub names: HashMap<String, String>,
+    /// The identities directory, kept whole for the per-space `@` roster.
+    pub identities: Vec<Identity>,
     pub spaces: Vec<Space>,
+    /// One chat-objects subscription per space, keyed by space id, so a space
+    /// that appears or disappears at runtime can be wired up or torn down.
+    chat_subs: HashMap<String, JoinHandle<()>>,
     pub chats: Vec<Chat>,
     pub sel: usize,
     /// True once the user has moved the cursor themselves.
@@ -209,6 +217,8 @@ pub struct App {
     /// each once and can abort it when the chat goes away.
     preview_subs: HashMap<String, JoinHandle<()>>,
     last_read_marked: HashMap<String, String>,
+    /// Messages whose unread reactions we've already asked to clear.
+    reactions_marked: HashSet<String>,
 }
 
 impl App {
@@ -226,7 +236,9 @@ impl App {
             me,
             version,
             names: HashMap::new(),
+            identities: Vec::new(),
             spaces: Vec::new(),
+            chat_subs: HashMap::new(),
             chats: Vec::new(),
             sel: 0,
             user_selected: false,
@@ -257,7 +269,69 @@ impl App {
             msg_task: None,
             preview_subs: HashMap::new(),
             last_read_marked: HashMap::new(),
+            reactions_marked: HashSet::new(),
         }
+    }
+
+    /// Resolves a mention identity to its current display name; `None` when
+    /// the directory doesn't know it (the renderer then keeps the snapshot).
+    fn mention_name(&self, identity: &str) -> Option<String> {
+        self.names.get(identity).filter(|n| !n.is_empty()).cloned()
+    }
+
+    /// `@`-able people for a space: named identities the directory places in
+    /// that space (or everywhere, when it doesn't say). (name, identity) pairs.
+    pub fn roster(&self, space_id: &str) -> Vec<(String, String)> {
+        self.identities
+            .iter()
+            .filter(|i| !i.name.is_empty())
+            .filter(|i| i.space_ids.is_empty() || i.space_ids.iter().any(|s| s == space_id))
+            .map(|i| (i.name.clone(), i.identity.clone()))
+            .collect()
+    }
+
+    /// Adopts a fresh space listing: subscribes to chats in spaces we haven't
+    /// seen, drops chats and subscriptions of spaces that are gone. Called at
+    /// startup and whenever the space-list subscription signals a change.
+    pub fn set_spaces(&mut self, spaces: Vec<Space>) {
+        let live: HashSet<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
+        let gone: Vec<String> = self
+            .chat_subs
+            .keys()
+            .filter(|id| !live.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some(h) = self.chat_subs.remove(&id) {
+                h.abort();
+            }
+            let chats: Vec<String> = self
+                .chats
+                .iter()
+                .filter(|c| c.space_id == id)
+                .map(|c| c.object_id.clone())
+                .collect();
+            for c in chats {
+                if self.active.as_deref() == Some(c.as_str()) {
+                    self.active = None;
+                    self.msgs.clear();
+                    if let Some(t) = self.msg_task.take() {
+                        t.abort();
+                    }
+                }
+                self.remove_chat(&c);
+            }
+        }
+        for s in &spaces {
+            if !self.chat_subs.contains_key(&s.id) {
+                let h = spawn_chats_sub(self.api.clone(), s.clone(), self.tx.clone());
+                self.chat_subs.insert(s.id.clone(), h);
+            }
+        }
+        self.spaces = spaces;
+        let keep = self.selected_chat().map(|c| c.object_id.clone());
+        self.sort_chats();
+        self.restore_selection(keep);
     }
 
     pub fn display_name(&self, identity: &str) -> String {
@@ -374,12 +448,16 @@ impl App {
 
     pub fn set_preview(&mut self, object_id: &str, msg: Option<Message>) {
         let keep = self.selected_chat().map(|c| c.object_id.clone());
+        // Mention links read as `@Name` in the sidebar too, not raw markdown.
+        let preview = msg
+            .as_ref()
+            .map(|m| render_mentions(&m.preview_text(), |id| self.mention_name(id)).0);
         if let Some(c) = self.chats.iter_mut().find(|c| c.object_id == object_id) {
             match msg {
                 // A bare "…" ping isn't worth previewing; leave the prior one.
                 Some(m) if m.is_agent_presence_marker() => {}
                 Some(m) => {
-                    c.last_text = Some(m.preview_text());
+                    c.last_text = preview;
                     c.last_creator = m.creator.clone();
                     c.last_agent = m.agent.as_ref().map(|a| a.name.clone());
                     c.last_at = m.created_at;
@@ -473,12 +551,7 @@ impl App {
                 None => self.msgs.push(m),
             }
         }
-        self.msgs.sort_by(|a, b| {
-            a.created_at
-                .partial_cmp(&b.created_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
-        });
+        self.msgs.sort_by(Message::cmp_order);
     }
 
     /// Loads the selected chat without touching focus, so moving the cursor in
@@ -543,13 +616,22 @@ impl App {
         let Some(chat) = self.active_chat().cloned() else {
             return;
         };
+        // Page by `_ver.id` range from the oldest message we hold. A record
+        // without one (older build) can't anchor a range, so history ends there.
+        let before = match self.msgs.first() {
+            Some(m) if m.ver.is_empty() => {
+                self.exhausted = true;
+                return;
+            }
+            Some(m) => Some(m.ver.clone()),
+            None => None,
+        };
         self.loading = true;
         let api = self.api.clone();
         let tx = self.tx.clone();
-        let offset = self.msgs.len();
         tokio::spawn(async move {
             match api
-                .messages(&chat.space_id, &chat.object_id, PAGE, offset)
+                .messages(&chat.space_id, &chat.object_id, PAGE, before.as_deref())
                 .await
             {
                 Ok(msgs) => {
@@ -590,25 +672,46 @@ impl App {
         let Some(chat) = self.active_chat().cloned() else {
             return;
         };
-        if chat.unread == 0 && chat.unread_reactions == 0 {
+        if chat.unread == 0 && chat.unread_mentions == 0 && chat.unread_reactions == 0 {
             return;
         }
         let Some(last) = self.msgs.last().cloned() else {
             return;
         };
-        if self.last_read_marked.get(&chat.object_id) == Some(&last.id) {
+        // `…/read` cuts at the newest message's `_ver.id`, which never covers a
+        // reaction on an older message: those need `…/reactions-read` each.
+        // Only the loaded (seen) messages, and only once per message.
+        let reacted: Vec<String> = self
+            .msgs
+            .iter()
+            .filter(|m| m.unread_reactions && !self.reactions_marked.contains(&m.id))
+            .map(|m| m.id.clone())
+            .collect();
+        let already = self.last_read_marked.get(&chat.object_id) == Some(&last.id);
+        if already && reacted.is_empty() {
             return;
         }
         self.last_read_marked
             .insert(chat.object_id.clone(), last.id.clone());
+        self.reactions_marked.extend(reacted.iter().cloned());
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = api
-                .mark_read(&chat.space_id, &chat.object_id, &last.id)
-                .await
-            {
-                let _ = tx.send(Ev::Error(format!("mark read: {e}")));
+            if !already {
+                if let Err(e) = api
+                    .mark_read(&chat.space_id, &chat.object_id, &last.id)
+                    .await
+                {
+                    let _ = tx.send(Ev::Error(format!("mark read: {e}")));
+                }
+            }
+            for id in reacted {
+                if let Err(e) = api
+                    .reactions_read(&chat.space_id, &chat.object_id, &id)
+                    .await
+                {
+                    let _ = tx.send(Ev::Error(format!("reactions read: {e}")));
+                }
             }
         });
     }
@@ -627,6 +730,9 @@ impl App {
         self.scroll = 0;
         // Jump to the bottom so you see what you just sent land.
         self.select_newest();
+        // `@Name` becomes a real mention link — the server derives `mentions`
+        // from those, and only those, so plain `@name` text pings nobody.
+        let text = link_mentions(&text, &chat.space_id, &self.roster(&chat.space_id));
         let api = self.api.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -637,6 +743,56 @@ impl App {
                 let _ = tx.send(Ev::Error(format!("send: {e}")));
             }
         });
+    }
+
+    /// Tab in the composer: completes the `@prefix` before the cursor against
+    /// the space's roster. A unique match completes to `@Name `; several
+    /// extend to their common prefix and list the candidates; none toasts.
+    pub fn complete_mention(&mut self) {
+        let Some(chat) = self.active_chat().cloned() else { return };
+        let value = self.input.value().to_string();
+        let cursor = self.input.cursor(); // char index
+        let chars: Vec<char> = value.chars().collect();
+        let head: String = chars[..cursor.min(chars.len())].iter().collect();
+        // The token starts at the last `@` that opens a word.
+        let Some(at) = head.char_indices().rev().find(|&(i, c)| {
+            c == '@' && head[..i].chars().next_back().is_none_or(|p| !(p.is_alphanumeric() || p == '_'))
+        }) else {
+            self.toast("type @ then a name to mention");
+            return;
+        };
+        let prefix = &head[at.0 + 1..];
+        if prefix.contains('\n') {
+            return;
+        }
+        let needle = prefix.to_lowercase();
+        let mut cands: Vec<String> = self
+            .roster(&chat.space_id)
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.to_lowercase().starts_with(&needle))
+            .collect();
+        cands.sort();
+        cands.dedup();
+        let completion = match cands.as_slice() {
+            [] => {
+                self.toast(format!("no member matches @{prefix}"));
+                return;
+            }
+            [one] => format!("{one} "),
+            many => {
+                let common = common_prefix_ci(many);
+                self.toast(format!("@{}", many.join("  @")));
+                if common.chars().count() <= prefix.chars().count() {
+                    return;
+                }
+                common
+            }
+        };
+        let before: String = head[..=at.0].to_string();
+        let after: String = chars[cursor.min(chars.len())..].iter().collect();
+        let new_cursor = (before.clone() + &completion).chars().count();
+        self.input = Input::new(before + &completion + &after).with_cursor(new_cursor);
     }
 
     // ---- fuzzy picker ----------------------------------------------------
@@ -989,6 +1145,21 @@ impl App {
     }
 }
 
+/// Longest case-insensitive common prefix of `names`, in the first name's case.
+fn common_prefix_ci(names: &[String]) -> String {
+    let Some(first) = names.first() else { return String::new() };
+    let mut n = first.chars().count();
+    for other in &names[1..] {
+        let m = first
+            .chars()
+            .zip(other.chars())
+            .take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+            .count();
+        n = n.min(m);
+    }
+    first.chars().take(n).collect()
+}
+
 // ---- search helpers ------------------------------------------------------
 
 /// Splits a `from:@name` (or `from:name`) token out of the query. The search
@@ -1064,7 +1235,10 @@ async fn run_search_task(
                 msg_id: m.id,
                 creator: m.creator,
                 agent: m.agent.map(|a| a.name),
-                text: m.text,
+                text: render_mentions(&m.text, |id| {
+                    names.get(id).filter(|n| !n.is_empty()).cloned()
+                })
+                .0,
                 created_at: m.created_at,
             });
         }
@@ -1245,12 +1419,62 @@ fn spawn_preview_sub(
     })
 }
 
+/// Watches the account's space list. The rows are raw tech-index records, so
+/// rather than mapping them we treat every frame as "something changed" and
+/// re-list `/spaces` for the projected shape. Reconnects with backoff.
+pub fn spawn_spaces_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = 1u64;
+        loop {
+            match api.subscribe_spaces().await {
+                Ok(mut reader) => {
+                    backoff = 1;
+                    loop {
+                        match reader.next_frame().await {
+                            Ok(Some(Frame::Snapshot(_))) | Ok(Some(Frame::Changes(_))) => {
+                                match api.spaces().await {
+                                    Ok(spaces) => {
+                                        if tx.send(Ev::Spaces(spaces)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Ev::Error(format!("list spaces: {e}")));
+                                    }
+                                }
+                            }
+                            Ok(Some(Frame::Closed(_))) | Ok(None) => break,
+                            Ok(Some(_)) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Ev::Error(format!("spaces subscribe: {e}")));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
+    })
+}
+
 /// Live view of one space's chat objects: unread counters and new chats.
+/// The chat-declaring type ids are re-resolved on every (re)connect, so a
+/// general chat installed while we were subscribed is picked up on reconnect
+/// at the latest (and usually live, via the layout leg of the filter).
 pub fn spawn_chats_sub(api: Api, space: Space, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
-            match api.subscribe_chat_objects(&space.id).await {
+            let chat_types = match api.chat_type_ids(&space.id).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = tx.send(Ev::Error(format!("chat types: {e}")));
+                    Vec::new()
+                }
+            };
+            match api.subscribe_chat_objects(&space.id, &chat_types).await {
                 Ok(mut reader) => {
                     backoff = 1;
                     loop {
@@ -1258,7 +1482,9 @@ pub fn spawn_chats_sub(api: Api, space: Space, tx: UnboundedSender<Ev>) -> JoinH
                             Ok(Some(Frame::Snapshot(recs))) => {
                                 let chats: Vec<Chat> = recs
                                     .iter()
-                                    .filter_map(|r| Chat::from_record(r, &space.id, &space.name))
+                                    .filter_map(|r| {
+                                        Chat::from_record(r, &space.id, &space.name, &chat_types)
+                                    })
                                     .collect();
                                 if tx
                                     .send(Ev::ChatsSnapshot {
@@ -1273,9 +1499,12 @@ pub fn spawn_chats_sub(api: Api, space: Space, tx: UnboundedSender<Ev>) -> JoinH
                             Ok(Some(Frame::Changes(changes))) => {
                                 for ch in changes {
                                     for rec in ch.added.iter().chain(ch.updated.iter()) {
-                                        if let Some(c) =
-                                            Chat::from_record(rec, &space.id, &space.name)
-                                        {
+                                        if let Some(c) = Chat::from_record(
+                                            rec,
+                                            &space.id,
+                                            &space.name,
+                                            &chat_types,
+                                        ) {
                                             if tx.send(Ev::ChatUpsert(c)).is_err() {
                                                 return;
                                             }

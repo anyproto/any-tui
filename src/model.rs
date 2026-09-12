@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Space {
@@ -15,6 +16,116 @@ pub struct Identity {
     pub identity: String,
     #[serde(default)]
     pub name: String,
+    /// Spaces this identity is a member of, when the directory knows. Used to
+    /// scope `@` completion to the current space; empty means "unknown".
+    #[serde(default, rename = "spaceIds")]
+    pub space_ids: Vec<String>,
+}
+
+/// Reads a server timestamp as unix seconds. The wire shape is an instant,
+/// `{"$date": "<RFC 3339>"}`; peers on older builds still materialize the same
+/// field as a bare unix-seconds number, and rows written before an upgrade read
+/// that way until the SDK re-indexes them, so both forms must parse.
+pub fn parse_instant(v: Option<&Value>) -> Option<f64> {
+    let v = v?;
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    let s = v.get("$date").and_then(|d| d.as_str()).or_else(|| v.as_str())?;
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    Some(dt.timestamp_millis() as f64 / 1000.0)
+}
+
+/// Prefix of a mention link destination (docs/19-links.md § `m`):
+/// `any://m/<spaceId>/<identity>`.
+const MENTION_URI_PREFIX: &str = "any://m/";
+
+/// Builds the markdown a mention is written as: the link text is the display
+/// name at time of writing, the destination the canonical mention URI.
+pub fn mention_markdown(name: &str, space_id: &str, identity: &str) -> String {
+    format!("[{name}]({MENTION_URI_PREFIX}{space_id}/{identity})")
+}
+
+/// Rewrites every `[Name](any://m/<space>/<identity>)` link in `text` to an
+/// `@Name` chip, resolving the current display name through `name_of` and
+/// falling back to the link text (the name snapshot taken when it was written).
+/// Non-mention links are left untouched. Returns the rewritten text plus the
+/// chip labels it produced, so a renderer can highlight them.
+pub fn render_mentions(text: &str, name_of: impl Fn(&str) -> Option<String>) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(text.len());
+    let mut chips = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        // Try to parse `[label](dest)` starting at `open`.
+        let after = &rest[open..];
+        let parsed = after.find("](").and_then(|close| {
+            let label = &after[1..close];
+            let dest_start = close + 2;
+            let dest_end = after[dest_start..].find(')')? + dest_start;
+            let dest = &after[dest_start..dest_end];
+            let target = dest.strip_prefix(MENTION_URI_PREFIX)?;
+            // `<spaceId>/<identity>`; the identity is the last segment.
+            let identity = target.rsplit('/').next().filter(|s| !s.is_empty())?;
+            Some((label, identity, dest_end + 1))
+        });
+        match parsed {
+            Some((label, identity, consumed)) if !label.contains('\n') => {
+                let name = name_of(identity)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| label.to_string());
+                out.push_str(&rest[..open]);
+                out.push('@');
+                out.push_str(&name);
+                chips.push(format!("@{name}"));
+                rest = &rest[open + consumed..];
+            }
+            _ => {
+                out.push_str(&rest[..=open]);
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, chips)
+}
+
+/// Turns typed `@Name` tokens into mention links for every (name, identity)
+/// pair in `roster`, longest name first so "Anna Lee" wins over "Anna". A token
+/// must end at a word boundary — `@anna` never rewrites inside `@annabelle`.
+/// Names are matched case-insensitively; the link text keeps the roster's form.
+pub fn link_mentions(text: &str, space_id: &str, roster: &[(String, String)]) -> String {
+    let mut names: Vec<&(String, String)> = roster.iter().filter(|(n, _)| !n.is_empty()).collect();
+    names.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()).then(a.0.cmp(&b.0)));
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    'outer: while i < text.len() {
+        if bytes[i] == b'@' && (i == 0 || !is_word_char(text[..i].chars().next_back())) {
+            let tail = &text[i + 1..];
+            for (name, identity) in names.iter() {
+                let Some(candidate) = tail.get(..name.len()) else { continue };
+                if !candidate.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let next = tail[name.len()..].chars().next();
+                if is_word_char(next) {
+                    continue;
+                }
+                out.push_str(&mention_markdown(name, space_id, identity));
+                i += 1 + name.len();
+                continue 'outer;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_word_char(c: Option<char>) -> bool {
+    matches!(c, Some(c) if c.is_alphanumeric() || c == '_')
 }
 
 /// A chat object inside a space. `unread` drives the sidebar badges and the
@@ -26,6 +137,9 @@ pub struct Chat {
     pub object_id: String,
     pub name: String,
     pub unread: u64,
+    /// Unread messages that mention you (`chat.unreadMentions`) — a subset of
+    /// `unread`, badged separately because a ping outranks ordinary traffic.
+    pub unread_mentions: u64,
     pub unread_reactions: u64,
     pub pos: String,
     /// Preview of the newest message. Spaces routinely hold several chats all
@@ -39,28 +153,32 @@ pub struct Chat {
 }
 
 impl Chat {
-    /// Chat objects carry `any.types: ["chat", ...]`; the `chat` sub-document
-    /// holds the unread counters. Returns None for records that aren't chats.
-    pub fn from_record(v: &Value, space_id: &str, space_name: &str) -> Option<Chat> {
+    /// A record is a chat when one of its `any.types` is a chat-declaring type
+    /// (`chat_types`, the `chat_messages` owners), or the legacy literal
+    /// `"chat"`, or when the record is itself a type whose layout is `chat` —
+    /// the general-chat root is a bundle root that is its own type, so it
+    /// matches this way even before its owner id has been resolved. The `chat`
+    /// sub-document holds the unread counters. Returns None for non-chats.
+    pub fn from_record(
+        v: &Value,
+        space_id: &str,
+        space_name: &str,
+        chat_types: &[String],
+    ) -> Option<Chat> {
         let id = v.get("id")?.as_str()?.to_string();
-        let any = v.get("any");
-        let is_chat = any
-            .and_then(|a| a.get("types"))
-            .and_then(|t| t.as_array())
-            .map(|ts| ts.iter().any(|t| t.as_str() == Some("chat")))
-            .unwrap_or(false);
-        if !is_chat {
+        if !Self::is_chat_record(v, chat_types) {
             return None;
         }
+        let any = v.get("any");
         let name = any
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_string();
-        let pos = v
-            .get("nav")
-            .and_then(|n| n.get("pos"))
-            .and_then(|p| p.as_str())
+        // Sidebar order: `miniapp.pos` on the parts model, `nav.pos` before it.
+        let pos = ["miniapp", "nav"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(|n| n.get("pos")).and_then(|p| p.as_str()))
             .unwrap_or("")
             .to_string();
         let chat = v.get("chat");
@@ -71,6 +189,10 @@ impl Chat {
             name,
             unread: chat
                 .and_then(|c| c.get("unreadCount"))
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0),
+            unread_mentions: chat
+                .and_then(|c| c.get("unreadMentions"))
                 .and_then(|c| c.as_u64())
                 .unwrap_or(0),
             unread_reactions: chat
@@ -85,8 +207,28 @@ impl Chat {
         })
     }
 
-    /// Label for the sidebar. The unnamed, nav-less chat object is the
-    /// space-level chat; named ones are ordinary chats in the nav tree.
+    fn is_chat_record(v: &Value, chat_types: &[String]) -> bool {
+        let typed = v
+            .get("any")
+            .and_then(|a| a.get("types"))
+            .and_then(|t| t.as_array())
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "chat" || chat_types.iter().any(|c| c == t))
+            })
+            .unwrap_or(false);
+        typed
+            || v.get("type")
+                .and_then(|t| t.get("layout"))
+                .and_then(|l| l.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("chat")
+    }
+
+    /// Label for the sidebar. The general chat is named ("General"); an
+    /// unnamed chat object (pre-parts daemons' space-level chat) shows as
+    /// `space chat`.
     pub fn label(&self) -> &str {
         if !self.name.is_empty() {
             &self.name
@@ -113,6 +255,10 @@ pub struct Agent {
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: String,
+    /// `_ver.id` — the record's position in the space DAG, stamped at creation
+    /// and never bumped by edits. Chats are ordered and paged by it (it's
+    /// lex-monotonic); `createdAt` is only for display. Empty when absent.
+    pub ver: String,
     pub text: String,
     pub creator: String,
     /// Set when an agent authored this message; see [`Agent`].
@@ -120,6 +266,15 @@ pub struct Message {
     pub created_at: f64,
     pub modified_at: f64,
     pub reply_to: Option<String>,
+    /// Identities this message pings — server-derived from `any://m/` links in
+    /// the text plus the replied-to author. Never written by clients.
+    pub mentions: Vec<String>,
+    /// Device-local read flags the SDK materializes on each record. Absent
+    /// (false) once read; `unread_reactions` only ever sets on your own
+    /// messages. (`unreadMention` also exists; the chat-level counter is what
+    /// we badge, so it isn't kept here.)
+    pub unread: bool,
+    pub unread_reactions: bool,
     /// (emoji, count) pairs, sorted for stable rendering.
     pub reactions: Vec<(String, usize)>,
     /// Attachment kinds ("image", "file", …), one per attached file. Sending
@@ -130,11 +285,19 @@ pub struct Message {
 impl Message {
     pub fn from_record(v: &Value) -> Option<Message> {
         let id = v.get("id")?.as_str()?.to_string();
-        let created_at = v.get("createdAt").and_then(|c| c.as_f64()).unwrap_or(0.0);
-        let modified_at = v
-            .get("modifiedAt")
-            .and_then(|c| c.as_f64())
-            .unwrap_or(created_at);
+        let created_at = parse_instant(v.get("createdAt")).unwrap_or(0.0);
+        let modified_at = parse_instant(v.get("modifiedAt")).unwrap_or(created_at);
+        let ver = v
+            .pointer("/_ver/id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+        let mentions: Vec<String> = v
+            .get("mentions")
+            .and_then(|m| m.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
         let mut reactions: Vec<(String, usize)> = v
             .get("reactions")
             .and_then(|r| r.as_object())
@@ -168,6 +331,10 @@ impl Message {
 
         Some(Message {
             id,
+            ver,
+            mentions,
+            unread: flag("unread"),
+            unread_reactions: flag("unreadReactions"),
             text: v
                 .get("text")
                 .and_then(|t| t.as_str())
@@ -201,6 +368,22 @@ impl Message {
 
     pub fn edited(&self) -> bool {
         self.modified_at > self.created_at + 1.0
+    }
+
+    /// Display order: DAG order (`_ver.id`) when both records carry it — the
+    /// order the server sorts and pages by — else creation time, then id.
+    pub fn cmp_order(a: &Message, b: &Message) -> Ordering {
+        let by_ver = if !a.ver.is_empty() && !b.ver.is_empty() {
+            a.ver.cmp(&b.ver)
+        } else {
+            a.created_at.total_cmp(&b.created_at)
+        };
+        by_ver.then_with(|| a.id.cmp(&b.id))
+    }
+
+    /// True when this message pings `me` (a text mention or a reply to me).
+    pub fn mentions_me(&self, me: &str) -> bool {
+        !me.is_empty() && self.mentions.iter().any(|m| m == me)
     }
 
     /// Old agent run-start pings post a bare "…" placeholder; it carries no
@@ -251,6 +434,57 @@ impl Message {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The general-chat root as the parts-model daemon sends it (2026-09):
+    /// a bundle root that is its own type, no `"chat"` literal anywhere.
+    fn general_chat_record() -> Value {
+        json!({
+            "id": "bafyroot",
+            "any": {"types": ["__type__", "bafyroot", "miniapp"], "name": "General"},
+            "type": {"xkey": "general_chat", "hidden": true, "layout": {"type": "chat"}},
+            "miniapp": {"bundle": "system:general-chat/v1", "pos": "a1"},
+            "chat": {"unreadCount": 3, "unreadMentions": 1},
+        })
+    }
+
+    #[test]
+    fn chat_record_matches_on_owner_type_id() {
+        let owners = vec!["bafyroot".to_string()];
+        let mut rec = general_chat_record();
+        rec["type"]["layout"] = json!({"type": "page"}); // owner id alone must do
+        let c = Chat::from_record(&rec, "s", "sp", &owners).unwrap();
+        assert_eq!(c.name, "General");
+        assert_eq!(c.label(), "General");
+        assert_eq!(c.pos, "a1");
+        assert_eq!((c.unread, c.unread_mentions, c.unread_reactions), (3, 1, 0));
+    }
+
+    #[test]
+    fn chat_record_matches_on_chat_layout_without_owners() {
+        let c = Chat::from_record(&general_chat_record(), "s", "sp", &[]).unwrap();
+        assert_eq!(c.object_id, "bafyroot");
+    }
+
+    #[test]
+    fn chat_record_legacy_literal_type_and_nav_pos() {
+        let rec = json!({"id": "c1", "any": {"types": ["chat"]}, "nav": {"pos": "b2"}});
+        let c = Chat::from_record(&rec, "s", "sp", &[]).unwrap();
+        assert_eq!(c.label(), "space chat");
+        assert_eq!(c.pos, "b2");
+    }
+
+    #[test]
+    fn non_chat_type_records_are_skipped() {
+        let owners = vec!["bafyroot".to_string()];
+        let rec = json!({
+            "id": "t1",
+            "any": {"types": ["__type__", "t1"]},
+            "type": {"xkey": "agent_log", "hidden": true},
+        });
+        assert!(Chat::from_record(&rec, "s", "sp", &owners).is_none());
+        let page = json!({"id": "p1", "any": {"types": ["page"]}, "nav": {"pos": "a0"}});
+        assert!(Chat::from_record(&page, "s", "sp", &owners).is_none());
+    }
 
     /// The shape the server actually sends, taken from a live response.
     fn record_with_attachments(text: &str, kinds: &[&str]) -> Value {
@@ -304,5 +538,79 @@ mod tests {
         // Otherwise an image-only message shows a blank row in the sidebar.
         let m = Message::from_record(&record_with_attachments("", &["image"])).unwrap();
         assert_eq!(m.preview_text(), "📎 1 image");
+    }
+
+    #[test]
+    fn parses_instant_and_legacy_number() {
+        // The wire shape since 2026-08: an instant object.
+        let t = parse_instant(Some(&json!({"$date": "2026-08-31T08:52:40.000Z"}))).unwrap();
+        assert_eq!(t, 1788166360.0);
+        // Rows from older peers/builds: bare unix seconds.
+        assert_eq!(parse_instant(Some(&json!(1784141327.0))), Some(1784141327.0));
+        assert_eq!(parse_instant(Some(&json!(1784141327))), Some(1784141327.0));
+        assert_eq!(parse_instant(None), None);
+        assert_eq!(parse_instant(Some(&json!({"$date": "garbage"}))), None);
+    }
+
+    #[test]
+    fn message_reads_ver_flags_and_mentions() {
+        let m = Message::from_record(&json!({
+            "id": "m1", "text": "hi", "creator": "A1",
+            "_ver": {"id": "!!.+", "text": "!!.+"},
+            "createdAt": {"$date": "2026-08-31T08:52:40.000Z"},
+            "modifiedAt": {"$date": "2026-08-31T08:52:40.000Z"},
+            "mentions": ["A2", "A3"],
+            "unread": true, "unreadMention": true,
+        }))
+        .unwrap();
+        assert_eq!(m.ver, "!!.+");
+        assert_eq!(m.created_at, 1788166360.0);
+        assert!(!m.edited());
+        assert_eq!(m.mentions, vec!["A2", "A3"]);
+        assert!(m.unread && !m.unread_reactions);
+        assert!(m.mentions_me("A2") && !m.mentions_me("A1") && !m.mentions_me(""));
+    }
+
+    #[test]
+    fn orders_by_ver_then_falls_back_to_time() {
+        let mk = |id: &str, ver: &str, t: f64| {
+            Message::from_record(&json!({"id": id, "_ver": {"id": ver}, "createdAt": t})).unwrap()
+        };
+        // `_ver.id` is lex-monotonic DAG order; it wins over wall-clock time.
+        let a = mk("a", "!!(Y", 200.0);
+        let b = mk("b", "!!)c", 100.0);
+        assert_eq!(Message::cmp_order(&a, &b), Ordering::Less);
+        // A record without `_ver` (older build) falls back to time.
+        let c = mk("c", "", 50.0);
+        assert_eq!(Message::cmp_order(&c, &a), Ordering::Less);
+    }
+
+    #[test]
+    fn renders_mention_links_as_chips() {
+        let names = |id: &str| (id == "A2").then(|| "Zarko".to_string());
+        let (out, chips) = render_mentions(
+            "Hey [Old Name](any://m/sp1/A2), see [docs](https://x.y) and [Bob](any://m/sp1/A9)",
+            names,
+        );
+        // Resolved to the current name; unknown identity keeps the snapshot;
+        // ordinary links are untouched.
+        assert_eq!(out, "Hey @Zarko, see [docs](https://x.y) and @Bob");
+        assert_eq!(chips, vec!["@Zarko", "@Bob"]);
+        // Unbalanced brackets pass through.
+        assert_eq!(render_mentions("a [b (c", |_| None).0, "a [b (c");
+    }
+
+    #[test]
+    fn links_typed_mentions_longest_first() {
+        let roster = vec![
+            ("Anna".to_string(), "A1".to_string()),
+            ("Anna Lee".to_string(), "A2".to_string()),
+            ("".to_string(), "A3".to_string()),
+        ];
+        assert_eq!(
+            link_mentions("hi @anna lee and @Anna, @annabelle, me@anna", "sp", &roster),
+            "hi [Anna Lee](any://m/sp/A2) and [Anna](any://m/sp/A1), @annabelle, me@anna"
+        );
+        assert_eq!(link_mentions("no mentions", "sp", &roster), "no mentions");
     }
 }

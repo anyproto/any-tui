@@ -1,4 +1,5 @@
 use crate::app::{App, Focus, Mode, SearchScope};
+use crate::model::render_mentions;
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
@@ -140,7 +141,9 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         };
         let selected = i == p.sel;
 
-        let badge = if chat.unread > 0 {
+        let badge = if chat.unread_mentions > 0 {
+            format!("@ {} ", chat.unread)
+        } else if chat.unread > 0 {
             format!("● {} ", chat.unread)
         } else if chat.unread_reactions > 0 {
             format!("♥ {} ", chat.unread_reactions)
@@ -248,7 +251,14 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         let selected = i == app.sel;
         let has_unread = chat.unread > 0;
 
-        let marker = if has_unread { "●" } else { "○" };
+        // `@` when something unread pings you, `●` for plain unread.
+        let marker = if chat.unread_mentions > 0 {
+            "@"
+        } else if has_unread {
+            "●"
+        } else {
+            "○"
+        };
         let badge = if chat.unread > 0 {
             format!(" {}", chat.unread)
         } else {
@@ -601,13 +611,18 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         )));
     }
 
-    // The chat's unreadCount tells us how many trailing messages are new.
+    // Each record carries its own `unread` flag, so the divider sits exactly
+    // above the first unread message — which may be mid-history, since a peer's
+    // offline message can slot between ones you've read. Rows from older builds
+    // carry no flag; then the chat's unreadCount approximates a trailing run.
     let unread = app.active_chat().map(|c| c.unread as usize).unwrap_or(0);
-    let first_unread = if unread > 0 && unread <= app.msgs.len() {
-        Some(app.msgs.len() - unread)
-    } else {
-        None
-    };
+    let first_unread = app.msgs.iter().position(|m| m.unread).or({
+        if unread > 0 && unread <= app.msgs.len() {
+            Some(app.msgs.len() - unread)
+        } else {
+            None
+        }
+    });
 
     let text_w = width.saturating_sub(2).max(10);
     let mut prev_speaker = String::new();
@@ -628,11 +643,15 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 lines.push(Line::from(""));
             }
             let (label, color) = author_label(app, m);
-            lines.push(Line::from(vec![
+            let mut head = vec![
                 Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled(fmt_time(m.created_at), Style::default().fg(DIM)),
-            ]));
+            ];
+            if m.mentions_me(&app.me) {
+                head.push(Span::styled("  @you", Style::default().fg(UNREAD).bold()));
+            }
+            lines.push(Line::from(head));
         }
 
         let start_line = lines.len();
@@ -642,11 +661,8 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 .iter()
                 .find(|x| &x.id == rid)
                 .map(|x| {
-                    format!(
-                        "{}: {}",
-                        app.display_name(&x.creator),
-                        one_line(&x.text, 40)
-                    )
+                    let (text, _) = render_mentions(&x.text, |id| mention_name(app, id));
+                    format!("{}: {}", app.display_name(&x.creator), one_line(&text, 40))
                 })
                 .unwrap_or_else(|| "…".to_string());
             // Truncate against the real pane width, otherwise a narrow pane
@@ -658,8 +674,12 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         }
 
         if !m.text.is_empty() {
-            for (n, l) in wrap(&m.text, text_w).into_iter().enumerate() {
-                let mut spans = vec![Span::raw("  "), Span::raw(l)];
+            // Mention links render as `@Name` chips (current name, falling
+            // back to the snapshot in the link text), highlighted in the body.
+            let (text, chips) = render_mentions(&m.text, |id| mention_name(app, id));
+            for (n, l) in wrap(&text, text_w).into_iter().enumerate() {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(chip_spans(&l, &chips));
                 if n == 0 && m.edited() {
                     spans.push(Span::styled(" (edited)", Style::default().fg(DIM)));
                 }
@@ -728,6 +748,46 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         prev_time = m.created_at;
     }
     (lines, ranges)
+}
+
+/// Current display name for a mention identity, if the directory knows one.
+fn mention_name(app: &App, identity: &str) -> Option<String> {
+    app.names.get(identity).filter(|n| !n.is_empty()).cloned()
+}
+
+/// Splits one wrapped body line into spans, styling every occurrence of a
+/// mention chip (`@Name`) so it stands out from the surrounding text. Chips are
+/// matched longest-first so `@Anna Lee` isn't eaten by `@Anna`.
+fn chip_spans(line: &str, chips: &[String]) -> Vec<Span<'static>> {
+    if chips.is_empty() {
+        return vec![Span::raw(line.to_string())];
+    }
+    let mut chips: Vec<&String> = chips.iter().collect();
+    chips.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    chips.dedup();
+    let style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let hit = chips
+            .iter()
+            .filter_map(|c| rest.find(c.as_str()).map(|i| (i, c.len())))
+            .min_by_key(|&(i, len)| (i, std::cmp::Reverse(len)));
+        match hit {
+            Some((i, len)) => {
+                if i > 0 {
+                    spans.push(Span::raw(rest[..i].to_string()));
+                }
+                spans.push(Span::styled(rest[i..i + len].to_string(), style));
+                rest = &rest[i + len..];
+            }
+            None => {
+                spans.push(Span::raw(rest.to_string()));
+                break;
+            }
+        }
+    }
+    spans
 }
 
 fn unread_separator(width: usize) -> Line<'static> {
@@ -939,7 +999,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 c.qualified()
             };
-            let e = format!("●{} {}  ", name, c.unread);
+            let mark = if c.unread_mentions > 0 { "@" } else { "●" };
+            let e = format!("{mark}{} {}  ", name, c.unread);
             // Leave room for a "+N" overflow marker.
             if used + e.width() + reserve + 4 > total {
                 break;

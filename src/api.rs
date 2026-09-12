@@ -9,6 +9,17 @@ use serde_json::{Value, json};
 /// The dataset holding a chat object's messages.
 const DATASET_CHAT_MESSAGES: &str = "chat_messages";
 
+/// Chat order is DAG order: `_ver.id` is stamped at creation and never moves
+/// (edits bump `modifiedAt`, not this), and it's what the server pages by. A
+/// descending window holds the *newest* N messages so arrivals enter it.
+const SORT_NEWEST_FIRST: &str = "-_ver.id";
+
+/// The `context.view` we stamp on outgoing messages: the sender's screen at
+/// send time, which for this client is always the chat itself.
+const CONTEXT_VIEW_CHAT: &str = "chat";
+/// `any.types` entry pre-2026-09 daemons stamp on chat objects.
+const LEGACY_CHAT_TYPE: &str = "chat";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Health {
     #[serde(default)]
@@ -104,26 +115,28 @@ impl Api {
             .collect())
     }
 
-    /// One page of messages, returned oldest-first for display.
-    /// `offset` pages backwards through history (newest-first under the hood).
+    /// One page of messages, returned oldest-first for display. `before` pages
+    /// backwards through history: pass the oldest `_ver.id` you hold and the
+    /// page ends just before it (a range filter, so a message arriving
+    /// meanwhile can't shift the page the way `offset` would).
     pub async fn messages(
         &self,
         space_id: &str,
         object_id: &str,
         limit: usize,
-        offset: usize,
+        before: Option<&str>,
     ) -> Result<Vec<Message>> {
+        let mut body = json!({
+            "objectId": object_id,
+            "dataset": DATASET_CHAT_MESSAGES,
+            "sort": [SORT_NEWEST_FIRST],
+            "limit": limit,
+        });
+        if let Some(b) = before {
+            body["filter"] = json!({ "_ver.id": { "$lt": b } });
+        }
         let v = self
-            .post_json(
-                &format!("/spaces/{space_id}/query"),
-                json!({
-                    "objectId": object_id,
-                    "dataset": DATASET_CHAT_MESSAGES,
-                    "sort": ["-createdAt"],
-                    "limit": limit,
-                    "offset": offset,
-                }),
-            )
+            .post_json(&format!("/spaces/{space_id}/query"), body)
             .await?;
         let recs = v
             .get("records")
@@ -131,12 +144,7 @@ impl Api {
             .cloned()
             .unwrap_or_default();
         let mut msgs: Vec<Message> = recs.iter().filter_map(Message::from_record).collect();
-        msgs.sort_by(|a, b| {
-            a.created_at
-                .partial_cmp(&b.created_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
-        });
+        msgs.sort_by(Message::cmp_order);
         Ok(msgs)
     }
 
@@ -161,16 +169,28 @@ impl Api {
                 }),
             )
             .await?;
+        // Long records are indexed as several chunks, each its own hit with the
+        // same (objectId, recordId) — a message must count once, so dedupe on
+        // the record (keeping the best-ranked chunk's position).
+        let mut seen = std::collections::HashSet::new();
         let hits = v
             .get("hits")
             .and_then(|h| h.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|h| {
-                        Some(SearchHit {
+                        // Hits from other datasets can't be chat messages.
+                        if let Some(ds) = h.get("dataset").and_then(|d| d.as_str()) {
+                            if ds != DATASET_CHAT_MESSAGES {
+                                return None;
+                            }
+                        }
+                        let hit = SearchHit {
                             object_id: h.get("objectId")?.as_str()?.to_string(),
                             record_id: h.get("recordId")?.as_str()?.to_string(),
-                        })
+                        };
+                        seen.insert((hit.object_id.clone(), hit.record_id.clone()))
+                            .then_some(hit)
                     })
                     .collect()
             })
@@ -208,7 +228,7 @@ impl Api {
                     "objectId": object_id,
                     "dataset": DATASET_CHAT_MESSAGES,
                     "filter": { "id": { "$in": ids } },
-                    "sort": ["-createdAt"],
+                    "sort": [SORT_NEWEST_FIRST],
                     "limit": ids.len(),
                 }),
             )
@@ -228,7 +248,16 @@ impl Api {
         text: &str,
         reply_to: Option<&str>,
     ) -> Result<()> {
-        let mut body = json!({ "text": text });
+        // `context` is the sender's view at send time; agents reading the chat
+        // resolve "here" from it. For a chat client "here" is the chat.
+        let mut body = json!({
+            "text": text,
+            "context": {
+                "spaceId": space_id,
+                "objectId": object_id,
+                "view": CONTEXT_VIEW_CHAT,
+            },
+        });
         if let Some(r) = reply_to {
             body["replyToMessageId"] = json!(r);
         }
@@ -252,6 +281,21 @@ impl Api {
         Ok(())
     }
 
+    /// Clears the unread reaction(s) on one message. A reaction is ordered
+    /// after its target, so `mark_read` (which cuts at the message's own
+    /// `_ver.id`) can never cover it. 204, idempotent, no-op without unread.
+    pub async fn reactions_read(&self, space_id: &str, object_id: &str, msg_id: &str) -> Result<()> {
+        let path =
+            format!("/spaces/{space_id}/objects/{object_id}/chat/messages/{msg_id}/reactions-read");
+        let resp = self.http.post(self.url(&path)).send().await?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("reactions_read {code}: {}", first_line(&body));
+        }
+        Ok(())
+    }
+
     /// Live window over a chat's messages, newest-first, `limit` records wide.
     pub async fn subscribe_messages(
         &self,
@@ -263,19 +307,60 @@ impl Api {
         let body = json!({
             "objectId": object_id,
             "dataset": DATASET_CHAT_MESSAGES,
-            "sort": ["-createdAt"],
+            "sort": [SORT_NEWEST_FIRST],
             "limit": limit,
         });
         self.subscribe(&path, body).await
     }
 
+    /// Live view of the account's space list (the tech-space `spaces` rows).
+    /// Rows are raw tech-index records, not `SpaceInfo`, so this is used only
+    /// as a change signal: any frame means "re-list `/spaces`".
+    pub async fn subscribe_spaces(&self) -> Result<SseReader> {
+        self.subscribe("/spaces/query/subscribe", json!({ "limit": 0 })).await
+    }
+
+    /// The type ids that declare the chat module in this space — the `owners`
+    /// of the `chat_messages` dataset. Since 2026-09 the general chat is a
+    /// bundle root that is its own type, so a chat object's `any.types` holds
+    /// that root's id rather than the literal `"chat"`; these ids are what to
+    /// match on. Empty when the space has no general chat installed yet (or on
+    /// a pre-parts daemon, which has no such dataset entry).
+    pub async fn chat_type_ids(&self, space_id: &str) -> Result<Vec<String>> {
+        let v = self
+            .get_json(&format!("/spaces/{space_id}/datasets"))
+            .await?;
+        Ok(v.get("datasets")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|d| d.get("name").and_then(|n| n.as_str()) == Some("chat_messages"))
+            .filter_map(|d| d.get("owners").and_then(|o| o.as_array()))
+            .flatten()
+            .filter_map(|o| o.as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Live view of a space's chat objects — drives unread badges and picks up
-    /// chats created while we're running.
-    pub async fn subscribe_chat_objects(&self, space_id: &str) -> Result<SseReader> {
+    /// chats created while we're running. `chat_types` comes from
+    /// [`Api::chat_type_ids`]; the filter also takes the legacy literal
+    /// `"chat"` type and any type whose layout is `chat` (the general-chat
+    /// root carries its own type definition), so a chat installed after the
+    /// owners were resolved still shows up live.
+    pub async fn subscribe_chat_objects(
+        &self,
+        space_id: &str,
+        chat_types: &[String],
+    ) -> Result<SseReader> {
         let path = format!("/spaces/{space_id}/objects/query/subscribe");
+        let mut types: Vec<&str> = vec![LEGACY_CHAT_TYPE];
+        types.extend(chat_types.iter().map(String::as_str));
         let body = json!({
-            "filter": {"any.types": "chat"},
-            "sort": ["nav.pos"],
+            "filter": {"$or": [
+                {"any.types": {"$in": types}},
+                {"type.layout.type": "chat"},
+            ]},
+            "sort": ["miniapp.pos"],
             "limit": 200,
         });
         self.subscribe(&path, body).await

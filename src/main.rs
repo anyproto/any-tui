@@ -12,7 +12,7 @@ mod sse;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, Ev, Focus, Mode, spawn_chats_sub};
+use app::{App, Ev, Focus, Mode, spawn_spaces_sub};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
@@ -61,6 +61,15 @@ async fn main() -> Result<()> {
             args.api
         )
     })?;
+    // Until an account is authorized every route but /health answers
+    // 401 auth.required; say so up front instead of failing on /spaces.
+    if health.account.is_empty() {
+        anyhow::bail!(
+            "the any daemon at {} has no account authorized — POST /v1/auth (or `any run` \
+             with a data dir that holds one) first",
+            args.api
+        );
+    }
     let spaces = api.spaces().await.context("list spaces")?;
     let identities = api.identities().await.unwrap_or_default();
 
@@ -73,15 +82,15 @@ async fn main() -> Result<()> {
         !args.no_auto_read,
         args.layout.into(),
     );
-    for id in identities {
-        app.names.insert(id.identity, id.name);
+    for id in &identities {
+        app.names.insert(id.identity.clone(), id.name.clone());
     }
-    app.spaces = spaces.clone();
+    app.identities = identities;
 
-    // One live subscription per space keeps unread counts and the chat list fresh.
-    for space in spaces {
-        spawn_chats_sub(api.clone(), space, tx.clone());
-    }
+    // One live subscription per space keeps unread counts and the chat list
+    // fresh; the space-list subscription adds/removes those as spaces come and go.
+    app.set_spaces(spaces);
+    spawn_spaces_sub(api.clone(), tx.clone());
 
     // Terminal input runs on its own blocking thread.
     {
@@ -158,6 +167,7 @@ fn handle(app: &mut App, ev: Ev) {
         // Auto-read waits for a dwell, so it needs a nudge from the clock
         // rather than only firing on keys and arriving messages.
         Ev::Tick => app.maybe_mark_read(),
+        Ev::Spaces(spaces) => app.set_spaces(spaces),
         Ev::ChatsSnapshot { space_id, chats } => {
             // Replace this space's chats wholesale, keeping other spaces intact.
             let keep: Vec<String> = chats.iter().map(|c| c.object_id.clone()).collect();
@@ -326,6 +336,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.input.handle(tui_input::InputRequest::InsertChar('\n'));
             }
             KeyCode::Enter => app.send_input(),
+            // `@name<Tab>` completes a mention from the space's roster.
+            KeyCode::Tab => app.complete_mention(),
             // Full readline editing: cursor movement, word jumps, kill keys.
             _ => {
                 edit::apply_edit_key(&mut app.input, &k, true);
