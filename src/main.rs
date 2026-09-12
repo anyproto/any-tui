@@ -357,7 +357,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
     match k.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
-        KeyCode::Char('z') => app.toggle_layout(),
+        KeyCode::Char('z') => app.toggle_sidebar(),
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
             if app.show_help {
                 app.show_help = false;

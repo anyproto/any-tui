@@ -139,18 +139,20 @@ list ──Enter──▶ chat
 | --- | --- |
 | open the chat under the cursor | `Enter` |
 | get back to the chat list | `Esc` (or `h`, `←`, `Backspace`) |
-| force two panes anyway | `z` |
-| force one pane on a wide screen | `z` |
+| hide the chat list / bring it back | `z` |
 
-`z` flips between one and two panes relative to what's on screen and **pins**
-your choice, so auto stops overriding it. The open chat's title doubles as a
-breadcrumb and reminds you of the way out:
+`z` shows and hides the chat list, at any width — hidden, the open chat gets
+the full screen. Since the list is then not on screen to be focused, hiding it
+moves you to the messages, and `Esc` brings it back just as it does on a narrow
+screen. The open chat's title doubles as a breadcrumb and reminds you of the
+way out:
 
 ```
 ╭ ‹ Esc  sync team/general ────────────────────────╮
 ```
 
-To pick a layout up front, skipping auto entirely:
+`--layout` decides how the two panes share the screen when the list *is*
+shown, skipping the width check entirely:
 
 ```sh
 any-tui --layout single   # always one pane

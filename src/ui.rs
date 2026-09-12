@@ -61,11 +61,14 @@ fn speaker_key(m: &crate::model::Message) -> String {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
-    app.single_now = app.layout.is_single(f.area().width);
-    if app.single_now {
-        // One pane at a time: whichever has focus. The status bar still carries
-        // unread for every other chat, which is the only cue left when the
-        // sidebar is hidden.
+    // Either the user hid the list with `z`, or the terminal is too narrow to
+    // hold both panes. Both end up showing one pane; the status bar still
+    // carries unread for every other chat, which is the only cue left then.
+    app.single_now = app.sidebar_hidden || app.layout.is_single(f.area().width);
+    if app.sidebar_hidden {
+        draw_chat(f, app, root[0]);
+    } else if app.single_now {
+        // One pane at a time: whichever has focus.
         match app.focus {
             Focus::Sidebar => draw_sidebar(f, app, root[0]),
             Focus::Messages => draw_chat(f, app, root[0]),
@@ -1052,9 +1055,9 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    Ctrl-r          jump there and reply",
         "    from:@name      filter by sender",
         "",
-        "  Layout",
-        "    z               one pane ⇄ two panes",
-        "                    (one pane is automatic under 80 cols)",
+        "  Chat list",
+        "    z               show / hide the chat list",
+        "                    (it hides itself anyway under 80 cols)",
         "",
         "  Messages",
         "    i               compose",
@@ -1113,8 +1116,8 @@ fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
         "   g/G      oldest/newest",
         "   C-d/C-u  jump 5 msgs",
         "",
-        "  Layout",
-        "   z        1 ⇄ 2 panes",
+        "  Chat list",
+        "   z        show/hide",
         "",
         "  Message",
         "   i        compose",

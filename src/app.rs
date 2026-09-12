@@ -188,6 +188,10 @@ pub struct App {
     pub focus: Focus,
     pub mode: Mode,
     pub layout: Layout,
+    /// `z` hides the chat list outright, giving the messages the full width.
+    /// Independent of `layout`, which only decides how the two panes share the
+    /// screen when the list *is* shown.
+    pub sidebar_hidden: bool,
     /// Whether the last frame actually rendered as a single pane; `z` flips
     /// relative to what's on screen, which Auto only knows at draw time.
     pub single_now: bool,
@@ -249,6 +253,7 @@ impl App {
             focus: Focus::Sidebar,
             mode: Mode::Normal,
             layout,
+            sidebar_hidden: false,
             single_now: false,
             input: Input::default(),
             scroll: 0,
@@ -374,23 +379,23 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
-    /// Flips between one pane and two, relative to what's currently on screen,
-    /// and pins the choice so Auto stops overriding it.
-    pub fn toggle_layout(&mut self) {
-        self.layout = if self.single_now {
-            Layout::Split
+    /// Shows or hides the chat list. Hiding it leaves the messages as the only
+    /// pane, so focus has to move there — there is nothing else left to focus.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        if self.sidebar_hidden {
+            self.focus = Focus::Messages;
+            self.toast("chats hidden (z to show)");
         } else {
-            Layout::Single
-        };
-        self.toast(match self.layout {
-            Layout::Split => "two panes (z to go back)",
-            _ => "one pane (z to go back)",
-        });
+            self.toast("chats shown (z to hide)");
+        }
     }
 
     /// Back out of the message pane to the chat list. On a narrow screen this
-    /// is what actually swaps the visible pane.
+    /// is what actually swaps the visible pane; with the list hidden it brings
+    /// it back, so Esc always means "return to the chats".
     pub fn back_to_list(&mut self) {
+        self.sidebar_hidden = false;
         self.focus = Focus::Sidebar;
     }
 

@@ -193,8 +193,10 @@ layout), `main.rs` (CLI, terminal, keymap, loop).
   (`miniapp.pos`, or `nav.pos` on older daemons).
 - The message cursor drives the viewport (scroll follows it at render time);
   `r` replies to the message under the cursor, not "the newest".
-- Layout auto-collapses to one pane below `NARROW_COLS = 80`; `z` toggles and
-  pins.
+- Layout auto-collapses to one pane below `NARROW_COLS = 80`. `z` is a separate
+  axis — `App::sidebar_hidden`, "show/hide the chat list", honoured at any
+  width; hiding forces `Focus::Messages` (nothing else is left to focus) and
+  `back_to_list` (Esc) un-hides, so Esc always means "back to the chats".
 
 ## Conventions
 
