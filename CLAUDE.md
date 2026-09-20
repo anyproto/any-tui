@@ -163,6 +163,19 @@ strictly-bound request schemas, which the generated file cannot.
   all mean "open a fresh POST" (we reconnect with backoff). `mailboxCapacity`
   (default 256) and `driftBudgetPercent` (default 30) on the request body tune
   the last two.
+- **Bao presence is an event-bus subscription, not a dataset.** `GET
+  /events/subscribe?scope=account&type=bao.status` (any `docs/21-events.md`)
+  is SSE with `ready` → `event`* → `closed`, **no snapshot and no replay**:
+  a subscriber sees only beats published after it connects, so the bar is
+  blank until the first one. The serving `anyrt` beats every 10s and within
+  1s of any change (anybao ADR-025): `data: {identity, state: boot|idle|
+  working|shutdown, role: active|standby, winner?, run?: {id, title,
+  startedAt, cells, cell?}, line?, lineAt?}`. Fold per `identity`, measure
+  staleness on our receipt clock (offline after 30s), and never read
+  liveness as "online" — a standby device beats too; only `role` says who
+  answers. `model::derive_bao_presence` is that fold; the bar shows
+  `line`, else `run.cell` (the newest tool call's ≤48-char code preview),
+  else `run.title`. Verified on the wire 2026-09-21.
 - **Sending attachments is unsupported** (`ChatSendRequest` is text/reply/agent/
   attachments and the CRDT handler rejects unknown keys). Incoming attachments
   are shown as `📎 N images`; that's the whole feature for now.
@@ -173,7 +186,10 @@ strictly-bound request schemas, which the generated file cannot.
 Terminal input runs on a blocking thread; a 1s tick expires toasts and drives the
 auto-read dwell. All network work happens in spawned tasks that send `Ev`s back.
 
-**Three kinds of subscription run at once — know which signal is which:**
+**Four subscriptions run at once — know which signal is which** (the fourth,
+`spawn_bao_sub`, is the account event bus filtered to `bao.status`; it feeds
+only the status bar's bao segment and reconnects silently, since an account
+without a serve simply never beats):
 
 1. **Per space** (`spawn_chats_sub`) → chat list + unread counts. Fires **only
    when unread/reaction counters change**. It is an *unread* signal, not a

@@ -58,6 +58,18 @@ deduped on `(objectId, recordId)`.
 Before an account is authorized every route but `/health` answers
 `401 auth.required`; the client refuses to start with a hint.
 
+**Bao presence** comes off the account **event bus**
+(`GET /events/subscribe?scope=account&type=bao.status`, any doc 21) — an
+ephemeral, at-most-once channel with no snapshot and no replay, framed
+`ready` → `event`* → `closed`. The serving `anyrt` publishes a full-state
+`bao.status` beat every 10s and within a second of any change (anybao
+ADR-025): `{identity, state, role, winner?, run?: {id, title, startedAt,
+cells, cell?}, line?}`. The client keeps the latest beat per publisher, marks
+one stale 30s after receipt, and folds them the way any-ui does: a working
+beat wins, its label is bao's `line`, else the newest cell's code preview,
+else the run title; an idle beat with `role: active` is "bao", all-standby is
+"no active bao", none fresh is "offline", none ever is nothing.
+
 **API drift.** `api/openapi.json` pins the daemon's served `GET /v1/openapi.json`
 (build recorded in `api/OPENAPI_PIN`); `scripts/api-drift.sh [url]` diffs a running
 daemon against it, `--file <swagger.json>` diffs the any repo's generated spec,

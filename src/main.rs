@@ -12,7 +12,7 @@ mod sse;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, Ev, Focus, Mode, spawn_spaces_sub};
+use app::{App, Ev, Focus, Mode, spawn_bao_sub, spawn_spaces_sub};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
     // fresh; the space-list subscription adds/removes those as spaces come and go.
     app.set_spaces(spaces);
     spawn_spaces_sub(api.clone(), tx.clone());
+    // Bao's presence beats, for the status bar.
+    spawn_bao_sub(api.clone(), tx.clone());
 
     // Terminal input runs on its own blocking thread.
     {
@@ -167,7 +169,11 @@ fn handle(app: &mut App, ev: Ev) {
         Ev::Key(k) => on_key(app, k),
         // Auto-read waits for a dwell, so it needs a nudge from the clock
         // rather than only firing on keys and arriving messages.
-        Ev::Tick => app.maybe_mark_read(),
+        Ev::Tick => {
+            app.ticks += 1;
+            app.maybe_mark_read()
+        }
+        Ev::BaoBeat(b) => app.apply_bao_beat(b),
         Ev::Spaces(spaces) => app.set_spaces(spaces),
         Ev::ChatsSnapshot { space_id, chats } => {
             // Replace this space's chats wholesale, keeping other spaces intact.

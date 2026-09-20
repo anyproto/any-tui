@@ -86,6 +86,37 @@ If the key is missing, bao posts a credential-request bubble into the chat;
 the TUI shows it as `📎 1 credential_request` and cannot fill it in, so put the
 key in `.connectors.env` and restart `serve`.
 
+### Watching bao work
+
+While a run is live the bottom bar shows what bao is doing, fed by the
+runtime's presence beats on the any event bus — the same `bao.status` beats
+any-ui's status bar reads: bao's own status line when it has set one, else
+the code of the cell it is running right now, else the run title, with the
+tool-call count in brackets:
+
+```
+ NORMAL   ✦ rows = c.query_objects("tui-test", filter={"any.… (3)   no unread elsewhere
+```
+
+`✦ bao` alone means idle, `✦ bao offline` that no serve has beaten for 30s,
+`✦ no active bao` that only standby devices are up. Nothing shows until the
+first beat (≤10s after `serve` starts). The cell preview updates on every
+tool call, on every device of the account — the beats ride any-sync, so a
+serve on another machine shows up the same way.
+
+To see the whole flow — every effect, HTTP call and model turn, as it
+happens — follow the run from a second terminal:
+
+```sh
+anyrt trace follow --program toolcaller        # newest chat run, live; exits when it completes
+anyrt trace ls --program toolcaller            # past runs: status, duration, turns
+anyrt trace show run_<id>                      # one run in full;  --stats for tokens and cost
+```
+
+All three take `--addr` (default `http://127.0.0.1:7001`) and `--space`
+(default `bao`). Runs are in the any local store, so they follow the account
+across devices like everything else.
+
 ## Keys
 
 Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.

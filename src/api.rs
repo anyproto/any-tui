@@ -363,6 +363,29 @@ impl Api {
         self.subscribe(&path, body).await
     }
 
+    /// The account event bus (any doc 21): ephemeral, at-most-once, no replay
+    /// — `ready` on connect, then one `event` frame per envelope whose `type`
+    /// is in `types` (exact, or a `prefix.*`). We listen for the serving
+    /// anyrt's `bao.status` presence beats (anybao ADR-025), which any-ui's
+    /// status bar reads the same way.
+    pub async fn subscribe_events(&self, types: &[&str]) -> Result<SseReader> {
+        let path = "/events/subscribe";
+        // Types are dotted `[a-z0-9_.*]` slugs by the bus grammar, so the
+        // query string needs no escaping.
+        let mut url = format!("{}?scope=account", self.url(path));
+        for t in types {
+            url.push_str("&type=");
+            url.push_str(t);
+        }
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("subscribe {path}"))?;
+        open_stream(resp, path).await
+    }
+
     async fn subscribe(&self, path: &str, body: Value) -> Result<SseReader> {
         let resp = self
             .http
@@ -371,15 +394,19 @@ impl Api {
             .send()
             .await
             .with_context(|| format!("subscribe {path}"))?;
-        // Failures before the stream opens are a normal JSON error envelope;
-        // after 200 everything arrives as frames.
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("subscribe {path} failed {code}: {}", first_line(&text));
-        }
-        Ok(SseReader::new(resp))
+        open_stream(resp, path).await
     }
+}
+
+/// Failures before a stream opens are a normal JSON error envelope; after 200
+/// everything arrives as frames.
+async fn open_stream(resp: reqwest::Response, path: &str) -> Result<SseReader> {
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("subscribe {path} failed {code}: {}", first_line(&text));
+    }
+    Ok(SseReader::new(resp))
 }
 
 async fn json_or_err(resp: reqwest::Response, path: &str) -> Result<Value> {

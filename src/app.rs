@@ -1,5 +1,8 @@
 use crate::api::{Api, SearchResults};
-use crate::model::{Chat, Identity, Message, Space, link_mentions, render_mentions};
+use crate::model::{
+    BaoBeat, BaoPresence, Chat, Identity, Message, Space, derive_bao_presence, link_mentions,
+    render_mentions,
+};
 use crate::sse::{Frame, SseReader};
 use tui_input::Input;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +26,9 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// whole result set; we re-sort it by time client-side.
 const SEARCH_LIMIT: usize = 100;
 
+/// A bao publisher is offline after three missed 10s beats (ADR-025 §2).
+const BAO_OFFLINE_AFTER: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub enum Ev {
     Key(ratatui::crossterm::event::KeyEvent),
@@ -41,6 +47,8 @@ pub enum Ev {
     /// Enriched, time-sorted search results for the query identified by `seq`.
     SearchResults { seq: u64, hits: Vec<SearchHit>, note: String },
     SearchFailed { seq: u64, msg: String },
+    /// A `bao.status` presence beat off the account event bus.
+    BaoBeat(BaoBeat),
     Toast(String),
     Error(String),
 }
@@ -223,6 +231,12 @@ pub struct App {
     last_read_marked: HashMap<String, String>,
     /// Messages whose unread reactions we've already asked to clear.
     reactions_marked: HashSet<String>,
+    /// The latest `bao.status` beat per publisher, with when we received it
+    /// (the staleness clock — the beats' own timestamps are another
+    /// machine's).
+    bao: HashMap<String, (BaoBeat, Instant)>,
+    /// Counts 1s ticks; drives the status bar's ellipsis while bao works.
+    pub ticks: u64,
 }
 
 impl App {
@@ -275,7 +289,26 @@ impl App {
             preview_subs: HashMap::new(),
             last_read_marked: HashMap::new(),
             reactions_marked: HashSet::new(),
+            bao: HashMap::new(),
+            ticks: 0,
         }
+    }
+
+    /// Folds a beat in — last write per publisher wins.
+    pub fn apply_bao_beat(&mut self, beat: BaoBeat) {
+        self.bao
+            .insert(beat.identity.clone(), (beat, Instant::now()));
+    }
+
+    /// Bao's presence as of now, for the status bar.
+    pub fn bao_presence(&self) -> BaoPresence {
+        let now = Instant::now();
+        let beats: Vec<(&BaoBeat, bool)> = self
+            .bao
+            .values()
+            .map(|(b, at)| (b, now.duration_since(*at) <= BAO_OFFLINE_AFTER))
+            .collect();
+        derive_bao_presence(&beats)
     }
 
     /// Resolves a mention identity to its current display name; `None` when
@@ -1427,6 +1460,36 @@ fn spawn_preview_sub(
 /// Watches the account's space list. The rows are raw tech-index records, so
 /// rather than mapping them we treat every frame as "something changed" and
 /// re-list `/spaces` for the projected shape. Reconnects with backoff.
+/// The account event bus, filtered to `bao.status`: the serving anyrt's
+/// presence beats feed the status bar. Optional by nature — a daemon without
+/// the bus, or an account without a serve, simply never produces a beat, so
+/// failures here reconnect quietly and never toast.
+pub fn spawn_bao_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = 1u64;
+        loop {
+            if let Ok(mut reader) = api.subscribe_events(&["bao.status"]).await {
+                backoff = 1;
+                loop {
+                    match reader.next_frame().await {
+                        Ok(Some(Frame::Event(v))) => {
+                            if let Some(beat) = BaoBeat::from_envelope(&v) {
+                                if tx.send(Ev::BaoBeat(beat)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(Some(Frame::Closed(_))) | Ok(None) | Err(_) => break,
+                        Ok(Some(_)) => {}
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
+    })
+}
+
 pub fn spawn_spaces_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = 1u64;

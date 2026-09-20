@@ -7,6 +7,9 @@
 //!   event: closed   data: {"reason":"..."}                                 <- terminal
 //!   : keepalive                                                            <- comment, every 25s
 //!
+//! The event bus (`GET /events/subscribe`, any doc 21) shares the framing but
+//! has no snapshot: `ready`, then `event` frames carrying one envelope each.
+//!
 //! There is no unsubscribe: dropping the response ends the subscription.
 
 use anyhow::{Context, Result};
@@ -21,6 +24,8 @@ pub enum Frame {
     Snapshot(Vec<Value>),
     Changes(Vec<Change>),
     Closed(String),
+    /// One event-bus envelope, verbatim (`{type, scope, target?, data, sender}`).
+    Event(Value),
     /// Unknown event names are passed through rather than treated as errors:
     /// the frame set is documented as additive.
     Other(#[allow(dead_code)] String),
@@ -130,6 +135,10 @@ fn parse_block(block: &str) -> Result<Option<Frame>> {
             let v: Value = serde_json::from_str(&data).context("changes json")?;
             let arr = v.as_array().cloned().unwrap_or_default();
             Frame::Changes(arr.iter().map(parse_change).collect())
+        }
+        "event" => {
+            let v: Value = serde_json::from_str(&data).context("event json")?;
+            Frame::Event(v)
         }
         "closed" => {
             let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);

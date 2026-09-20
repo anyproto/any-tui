@@ -1,5 +1,5 @@
 use crate::app::{App, Focus, Mode, SearchScope};
-use crate::model::render_mentions;
+use crate::model::{BaoPresence, render_mentions};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
@@ -976,6 +976,41 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         _ => String::new(),
     };
     let reserve = scroll_txt.width();
+
+    // Bao's presence (anybao ADR-025), the way any-ui's status bar shows it:
+    // nothing until the first beat, then what the agent is doing — its own
+    // status line, else the code of the cell it is running, else the run
+    // title — with a ticking ellipsis and the tool-call count while a run
+    // is live. `✦ bao` alone is idle.
+    let (bao_txt, bao_style) = match app.bao_presence() {
+        BaoPresence::Unknown => (String::new(), Style::default()),
+        BaoPresence::Offline => ("  ✦ bao offline".to_string(), Style::default().fg(DIM)),
+        BaoPresence::NoResponder => ("  ✦ no active bao".to_string(), Style::default().fg(DIM)),
+        BaoPresence::Idle => ("  ✦ bao".to_string(), Style::default().fg(DIM)),
+        BaoPresence::Working { doing, cells } => {
+            let dots = ".".repeat((app.ticks % 3) as usize + 1);
+            let calls = if cells > 0 {
+                format!(" ({cells})")
+            } else {
+                String::new()
+            };
+            (
+                format!("  ✦ {}{dots}{calls}", truncate(&doing, 48)),
+                Style::default().fg(AGENT),
+            )
+        }
+    };
+    if !bao_txt.is_empty() {
+        // Budgeted like everything else here; on a phone-width bar the
+        // doing-text is cut to what fits rather than dropped, and the unread
+        // list keeps at least a short head.
+        let avail = total.saturating_sub(used + reserve + 14);
+        let shown = truncate(&bao_txt, avail);
+        if shown.width() > 4 {
+            used += shown.width();
+            spans.push(Span::styled(shown, bao_style));
+        }
+    }
 
     let others = app.other_unread();
     if others.is_empty() {

@@ -426,10 +426,210 @@ impl Message {
     }
 }
 
+/// One `bao.status` beat off the account event bus (anybao ADR-025): the
+/// serving anyrt's presence, published every 10s and again within a second of
+/// any change — a run starting or ending, a new tool call, a status line set.
+/// A beat is a full-state envelope, so the latest one per `identity` is the
+/// truth and staleness is measured on our own receipt clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaoBeat {
+    /// The serving peer id — one entry per device that runs a serve.
+    pub identity: String,
+    /// `boot` | `idle` | `working` | `shutdown`.
+    pub state: String,
+    /// Whether this publisher answers chat. A standby device beats too, at
+    /// the same cadence, so liveness alone never means "bao is online".
+    /// Absent `role` (a serve from before 2026-09-13) reads as active.
+    pub active: bool,
+    /// The freshest live run — present iff `working`.
+    pub run: Option<BaoRun>,
+    /// Bao's own status line, when it set one and it has not decayed.
+    pub line: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaoRun {
+    pub id: String,
+    /// The user's message preview on chat runs, else the program spec.
+    pub title: String,
+    /// Tool calls so far; the beat republishes on every new one.
+    pub cells: u64,
+    /// The newest cell's collapsed code preview (≤48 chars), absent before
+    /// the first call.
+    pub cell: Option<String>,
+}
+
+impl BaoBeat {
+    /// Parses a bus envelope; `None` for any other event type or a beat
+    /// without an identity.
+    pub fn from_envelope(v: &Value) -> Option<BaoBeat> {
+        if v.get("type").and_then(Value::as_str) != Some("bao.status") {
+            return None;
+        }
+        let d = v.get("data")?;
+        let identity = d.get("identity").and_then(Value::as_str)?.to_string();
+        let state = d
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("idle")
+            .to_string();
+        let active = d.get("role").and_then(Value::as_str) != Some("standby");
+        let run = d.get("run").and_then(|r| {
+            Some(BaoRun {
+                id: r.get("id")?.as_str()?.to_string(),
+                title: r
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                cells: r.get("cells").and_then(Value::as_u64).unwrap_or(0),
+                cell: r
+                    .get("cell")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            })
+        });
+        let line = d
+            .get("line")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Some(BaoBeat {
+            identity,
+            state,
+            active,
+            run,
+            line,
+        })
+    }
+}
+
+/// What the status bar says about bao — the fold any-ui's status bar does
+/// over the same beats (ADR-025 §6).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BaoPresence {
+    /// No beat ever seen: render nothing (a serve beats within 10s of start,
+    /// and the bus has no replay, so this is also the pre-serve state).
+    Unknown,
+    /// Beats were seen, but every publisher is stale or shut down.
+    Offline,
+    /// Somebody beats fresh, but only standby devices: nothing answers chat.
+    NoResponder,
+    Idle,
+    /// A run is live on some device. `doing` is bao's status line, else the
+    /// newest cell's code preview, else the run title.
+    Working { doing: String, cells: u64 },
+}
+
+/// Folds the beats — each paired with whether it is fresh (received within
+/// the offline cutoff) — into the presence fact. A working beat wins over an
+/// idle one so two serves in pre-election overlap don't flicker the bar.
+pub fn derive_bao_presence(beats: &[(&BaoBeat, bool)]) -> BaoPresence {
+    if beats.is_empty() {
+        return BaoPresence::Unknown;
+    }
+    let fresh: Vec<&BaoBeat> = beats
+        .iter()
+        .filter(|(b, fresh)| *fresh && b.state != "shutdown")
+        .map(|(b, _)| *b)
+        .collect();
+    if fresh.is_empty() {
+        return BaoPresence::Offline;
+    }
+    if let Some(w) = fresh.iter().find(|b| b.state == "working") {
+        let run = w.run.as_ref();
+        let doing = w
+            .line
+            .clone()
+            .or_else(|| run.and_then(|r| r.cell.clone()))
+            .or_else(|| run.map(|r| r.title.clone()).filter(|t| !t.is_empty()))
+            .unwrap_or_else(|| "working".to_string());
+        return BaoPresence::Working {
+            doing,
+            cells: run.map(|r| r.cells).unwrap_or(0),
+        };
+    }
+    if fresh.iter().any(|b| b.active) {
+        BaoPresence::Idle
+    } else {
+        BaoPresence::NoResponder
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A working beat as the bus delivered it on 2026-09-21 (envelope verbatim
+    /// minus the peer ids).
+    fn working_beat() -> Value {
+        json!({
+            "type": "bao.status", "scope": "account", "target": "peer1",
+            "data": {
+                "identity": "peer1", "role": "active", "state": "working", "winner": "peer1",
+                "run": {"id": "run_1", "startedAt": 1789944008.9, "cells": 3,
+                        "title": "list the objects in this space, then tell me how many t",
+                        "cell": "rows = c.query_objects(\"tui-test\", filter={\"any."}
+            },
+            "sender": {"identity": "A9fB", "self": true}
+        })
+    }
+
+    #[test]
+    fn beat_parses_and_prefers_line_then_cell_then_title() {
+        let b = BaoBeat::from_envelope(&working_beat()).unwrap();
+        assert!(b.active && b.state == "working" && b.line.is_none());
+        let run = b.run.as_ref().unwrap();
+        assert_eq!((run.cells, run.id.as_str()), (3, "run_1"));
+        match derive_bao_presence(&[(&b, true)]) {
+            BaoPresence::Working { doing, cells } => {
+                assert!(doing.starts_with("rows = c.query_objects"));
+                assert_eq!(cells, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Before the first tool call there is no cell: the run title stands in.
+        let mut v = working_beat();
+        v["data"]["run"].as_object_mut().unwrap().remove("cell");
+        v["data"]["run"]["cells"] = json!(0);
+        let b = BaoBeat::from_envelope(&v).unwrap();
+        assert!(matches!(derive_bao_presence(&[(&b, true)]),
+            BaoPresence::Working { doing, cells: 0 } if doing.starts_with("list the objects")));
+        // Bao's own line beats both.
+        v["data"]["line"] = json!("counting objects");
+        let b = BaoBeat::from_envelope(&v).unwrap();
+        assert!(matches!(derive_bao_presence(&[(&b, true)]),
+            BaoPresence::Working { doing, .. } if doing == "counting objects"));
+    }
+
+    #[test]
+    fn presence_folds_freshness_role_and_shutdown() {
+        let idle = BaoBeat::from_envelope(&json!({"type": "bao.status",
+            "data": {"identity": "p1", "state": "idle", "role": "active"}})).unwrap();
+        let standby = BaoBeat::from_envelope(&json!({"type": "bao.status",
+            "data": {"identity": "p2", "state": "idle", "role": "standby"}})).unwrap();
+        let down = BaoBeat::from_envelope(&json!({"type": "bao.status",
+            "data": {"identity": "p1", "state": "shutdown"}})).unwrap();
+        let working = BaoBeat::from_envelope(&working_beat()).unwrap();
+        assert_eq!(derive_bao_presence(&[]), BaoPresence::Unknown);
+        assert_eq!(derive_bao_presence(&[(&idle, true)]), BaoPresence::Idle);
+        assert_eq!(derive_bao_presence(&[(&idle, false)]), BaoPresence::Offline);
+        assert_eq!(derive_bao_presence(&[(&down, true)]), BaoPresence::Offline);
+        assert_eq!(derive_bao_presence(&[(&standby, true)]), BaoPresence::NoResponder);
+        // A working device wins over an idle one, whatever the order.
+        assert!(matches!(derive_bao_presence(&[(&idle, true), (&working, true)]),
+            BaoPresence::Working { .. }));
+        // Other event types are not beats; a pre-role beat is active.
+        assert!(BaoBeat::from_envelope(&json!({"type": "ui.open_space", "data": {"identity": "x"}})).is_none());
+        let old = BaoBeat::from_envelope(&json!({"type": "bao.status",
+            "data": {"identity": "p3", "state": "idle"}})).unwrap();
+        assert!(old.active);
+    }
 
     /// The general-chat root as the one-type-per-object daemon sends it
     /// (late 2026-09, taken from a live row): a bundle root that is its own
