@@ -168,3 +168,7 @@ another client should keep its badges.
 - `scripts/api-drift.sh [url]` — diffs a running server's OpenAPI spec against
   the one pinned in `api/openapi.json`; `--update` re-pins.
 - `cargo test` — unit tests for record parsing and the fuzzy matcher.
+
+## License
+
+[MIT](LICENSE).
