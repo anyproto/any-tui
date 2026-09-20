@@ -65,8 +65,9 @@ async fn main() -> Result<()> {
     // 401 auth.required; say so up front instead of failing on /spaces.
     if health.account.is_empty() {
         anyhow::bail!(
-            "the any daemon at {} has no account authorized — POST /v1/auth (or `any run` \
-             with a data dir that holds one) first",
+            "the any daemon at {} has no account authorized — see README § Quick start \
+             (curl -X POST {}/auth -d '{{}}' generates one; pass a mnemonic to restore)",
+            args.api,
             args.api
         );
     }

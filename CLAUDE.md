@@ -4,8 +4,10 @@ A terminal chat reader for [any](https://github.com/anyproto/any) spaces, in Rus
 Talks **only** to the local any REST API (`http://127.0.0.1:7001/v1` by default):
 REST for reads/writes, SSE for live updates. No SDK, no direct store access.
 
-`README.md` is the user-facing manual (keymap, layouts, full API notes) — keep it
-current when behaviour changes. This file is for working on the code.
+`README.md` is the brief user-facing manual (quick start incl. curl auth, the
+anybao agent setup, keymap, flags); `docs/api-notes.md` holds the full API
+mapping and the code layout. Keep both current when behaviour changes. This
+file is for working on the code.
 
 ## Build / run / test
 
@@ -19,12 +21,15 @@ Flags: `--api <url>`, `--no-auto-read`, `--layout auto|split|single`.
 
 ## Testing against the live daemon
 
-The any daemon runs locally and is **already authorized** — `GET /v1/health`
-returns an `account`. **Which account that is has changed over time** — as of
-2026-09 `:7001` is the `repo-prod2` agent-repo account (`A5uT24vq…`, spaces
-`_agentrepo`, `_connectorsrepo`, `bao`, `ta`), not tolya's user account, and the
-`foo` space below is not on it; check `/health` and `/spaces` before assuming.
-Whatever it is, it is a real account with real chats, so testing needs care:
+The any daemon runs locally and must be **authorized** — `GET /v1/health`
+returns an `account`; if it is `""`, authorize with curl (README § Quick
+start — `POST /v1/auth` with `{}` generates, with a `mnemonic` restores). **Which account `:7001` is has changed over time** —
+since 2026-09-21 it is the throwaway `any-prod-test-2` account (`A9fBcRQu…`,
+data dir `~/any/any-prod-test-2`, mnemonic in its `ACCOUNT.txt` and in
+`~/.any-accounts/`), one space `tui-test` with nobody else in it; before that
+it was the `repo-prod2` agent-repo account. Check `/health` and `/spaces`
+before assuming. On the throwaway account send/delete freely; on anything
+else it is a real account with real chats, so testing needs care:
 
 - **Drive the TUI with tmux**, not by hand. Pattern: launch in a detached
   session with a trailing `sleep`, `sleep` to let it connect, `tmux send-keys`,
@@ -63,15 +68,24 @@ strictly-bound request schemas, which the generated file cannot.
 
 - **No "list chats" endpoint, and no `"chat"` type any more.** Since the
   2026-09 nightlies (SYN-216/233) a space has **one chat**, the general chat:
-  a bundle root that is **its own type** — `any.types: ["__type__", <its own
-  id>, "miniapp"]`, `type.xkey: "general_chat"`, `type.layout: {"type":
-  "chat"}`, `any.name: "General"`, no `nav` (sidebar order is `miniapp.pos`).
-  The documented recipe is: the chat-declaring type ids are the `owners` of
-  `chat_messages` in `GET /spaces/{id}/datasets`; match `any.types` with
-  `$in` on those (`Api::chat_type_ids`). We OR that with `type.layout.type ==
-  "chat"` (catches a chat installed after the owners were read) and with the
-  legacy literal `"chat"` (pre-parts daemons). Filtering on `"any.types":
-  "chat"` alone lists ZERO chats on a current daemon — silently. It is
+  a bundle root that is **its own type**. Since one-type-per-object (any
+  81e7456, 2026-09-18, in every build from b5be51c on) an object has a scalar
+  `any.type` and an `any.collections` array, and the chat's row is
+  `any.type: "__type__"`, `any.collections: ["miniapp"]`, `type.xkey:
+  "general_chat"`, `type.layout: {"type": "chat"}`, `any.name: "General"`,
+  `miniapp.bundle: "system:general-chat/v1"` (sidebar order is
+  `miniapp.pos`, absent until set). The recipe: the chat-declaring type ids
+  are the `owners` of `chat_messages` in `GET /spaces/{id}/datasets`, and
+  because a declaring root **hosts itself** the chat object IS that id — its
+  own id appears nowhere on its row but `id`. So match `id` with `$in` on the
+  owners (`Api::chat_type_ids`); `any.type == <owner>` matches NOTHING (the
+  type slot holds the marker, and no other object may carry the chat type:
+  `type.reserved_carrier`). We OR that with `type.layout.type == "chat"`
+  (catches a chat installed after the owners were read). Builds before
+  b5be51c (the `any.types` array, the literal `"chat"` type, `nav.pos`) are
+  deliberately not supported — every account is new. Verified 2026-09-21 on
+  0a1eaf4 and b5be51c. Filtering on an absent path is not an error — a wrong
+  leg lists ZERO chats silently. It is
   installed by `POST /catalog/general-chat/setup` (a write, we never call
   it); a space without it has no chat. `chat.unreadCount` /
   `chat.unreadMentions` / `chat.unreadReactionsCount` on the row drive the
@@ -190,7 +204,7 @@ layout), `main.rs` (CLI, terminal, keymap, loop).
 - **Picker items are keyed by `object_id`, not list index.** The chat list
   re-sorts by recency on every new message; a stale index opens the wrong chat.
 - Chats sort by space order, then most-recent-activity, then sidebar pos
-  (`miniapp.pos`, or `nav.pos` on older daemons).
+  (`miniapp.pos`).
 - The message cursor drives the viewport (scroll follows it at render time);
   `r` replies to the message under the cursor, not "the newest".
 - Layout auto-collapses to one pane below `NARROW_COLS = 80`. `z` is a separate

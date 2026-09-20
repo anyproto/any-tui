@@ -1,0 +1,101 @@
+# any-tui — API notes and code layout
+
+How the client maps onto the any REST/SSE API, and how the code is organized.
+The user-facing manual is the [README](../README.md); the working notes for
+changing the code are in [CLAUDE.md](../CLAUDE.md).
+
+## How it maps onto the API
+
+Worth writing down — little of this is obvious from the swagger.
+
+**Discovering chats.** There is no "list chats" endpoint, and (since the
+2026-09 server) no `"chat"` type either. A space has one chat, the general
+chat, and its object is a bundle root that is its own type: `any.type` is the
+`__type__` marker, `any.collections` holds `miniapp`, `type.layout` is
+`{"type": "chat"}`, and it is named `General`. The chat-declaring type ids are
+the `owners` of the `chat_messages` dataset in `GET /spaces/{id}/datasets`,
+and since a declaring root hosts itself the chat object *is* that id — the
+client matches `id` against the owners with `$in`, OR-ed with
+`type.layout.type == "chat"` (catches a chat installed after the owners were
+read). Filtering on `any.type == <owner>` finds nothing: the root's type slot
+holds the marker, and no other object may carry the chat type. Daemons from
+before one-type-per-object (2026-09-18) are not supported. Each record's `chat.unreadCount`
+/ `chat.unreadMentions` / `chat.unreadReactionsCount` drive the badges, so the
+objects subscription doubles as the unread feed. Sidebar order is
+`miniapp.pos`.
+
+**Messages** live in the per-object `chat_messages` dataset, read via
+`POST /spaces/{id}/query` with `{objectId, dataset, sort, limit}`. Order is
+**DAG order** — `sort: ["-_ver.id"]`, the id stamped at creation and never moved
+by edits — and history pages with a range filter on it
+(`{"_ver.id": {"$lt": <oldest you hold>}}`) rather than `offset`, so a message
+landing mid-page can't shift the window. `createdAt` / `modifiedAt` are instants
+(`{"$date": "<RFC 3339>"}`); the client also accepts the bare unix-seconds
+number older peers/builds still produce.
+
+**Mentions** are markdown links, `[Name](any://m/<spaceId>/<identity>)`. The
+server derives `mentions: [identity…]` on each message from those links plus the
+replied-to author, and materializes `unreadMention` per message and
+`chat.unreadMentions` per chat — plain `@name` text pings nobody. So the composer
+turns `@Name` into the link form on send (Tab completes names from
+`GET /identities`, scoped by `spaceIds`), and the renderer shows links back as
+`@Name` chips using the current display name.
+
+**Read state** per message is the SDK-materialized `unread` / `unreadReactions`
+flag on each record; `…/read` covers a message and everything before it, while
+a reaction on an older message needs `…/{msgId}/reactions-read` (it's ordered
+after its target, so the read cut never reaches it). The "new" divider sits above
+the first `unread: true` record — which can be mid-history.
+
+**Sending** stamps `context: {spaceId, objectId, view: "chat"}` — the sender's
+view at send time, which agents reading the chat use to resolve "here".
+
+**Search** hits are per *chunk* (long records index as several), so results are
+deduped on `(objectId, recordId)`.
+
+**Spaces** joined or left at runtime arrive over `POST /spaces/query/subscribe`
+(rows are raw tech-index records, so each frame just triggers a `GET /spaces`).
+Before an account is authorized every route but `/health` answers
+`401 auth.required`; the client refuses to start with a hint.
+
+**API drift.** `api/openapi.json` pins the daemon's served `GET /v1/openapi.json`
+(build recorded in `api/OPENAPI_PIN`); `scripts/api-drift.sh [url]` diffs a running
+daemon against it, `--file <swagger.json>` diffs the any repo's generated spec,
+and `--update` re-pins.
+
+**Live updates** use SSE (`…/query/subscribe`, `…/objects/query/subscribe`).
+Contract, verified against the server source:
+
+- Events are exactly `ready` → `snapshot` → `changes`* → `closed`.
+- `changes` data is a JSON **array** of `{versionId, added[], updated[], removed[]}`.
+- `removed` entries are `{id, reason}`. Only `reason == "deleted"` means the
+  message is gone; `displaced` / `filtered-out` just mean it left the live
+  window, so this client keeps those rows.
+- `: keepalive` comment frames arrive every 25s and must be skipped.
+- **`limit > 0` requires `sort`**, otherwise the request fails with HTTP 500.
+- `offset` applies to the initial snapshot only, never the live window — so
+  history paging uses plain queries, not the subscription.
+- There is no unsubscribe and no subscription id: dropping the connection ends
+  it. Switching chats aborts the task; `closed` triggers reconnect with backoff.
+
+## Layout of the code
+
+| file | role |
+| --- | --- |
+| `api.rs` | REST calls + subscription setup |
+| `sse.rs` | SSE frame parser (`ready`/`snapshot`/`changes`/`closed`) |
+| `model.rs` | `Space`, `Chat`, `Message` and record parsing |
+| `fuzzy.rs` | scored subsequence matcher behind the `Space` picker |
+| `app.rs` | state, event enum, picker, subscription tasks |
+| `ui.rs` | rendering, wrapping, scroll geometry, pane layout |
+| `main.rs` | CLI, terminal lifecycle, keymap, event loop |
+
+Three kinds of subscription run concurrently:
+
+- **one per space** — chat list and unread counts. This fires only when unread
+  or reaction counts change, so it is an *unread* signal, not a *message* one.
+- **one per chat**, a window of a single message — keeps the sidebar preview
+  live. Needed because a message that doesn't move unread (one you send
+  yourself from another device) produces no event on the per-space stream.
+- **one for the open chat**, a full window — the message list; aborted when you
+  switch chats.

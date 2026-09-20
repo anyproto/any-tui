@@ -17,8 +17,6 @@ const SORT_NEWEST_FIRST: &str = "-_ver.id";
 /// The `context.view` we stamp on outgoing messages: the sender's screen at
 /// send time, which for this client is always the chat itself.
 const CONTEXT_VIEW_CHAT: &str = "chat";
-/// `any.types` entry pre-2026-09 daemons stamp on chat objects.
-const LEGACY_CHAT_TYPE: &str = "chat";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Health {
@@ -322,10 +320,11 @@ impl Api {
 
     /// The type ids that declare the chat module in this space — the `owners`
     /// of the `chat_messages` dataset. Since 2026-09 the general chat is a
-    /// bundle root that is its own type, so a chat object's `any.types` holds
-    /// that root's id rather than the literal `"chat"`; these ids are what to
-    /// match on. Empty when the space has no general chat installed yet (or on
-    /// a pre-parts daemon, which has no such dataset entry).
+    /// bundle root that is its own type, and a declaring root hosts itself: the
+    /// chat object *is* the owner id (its row carries the `__type__` marker in
+    /// `any.type`, never the owner id). So these ids are matched against `id`.
+    /// Empty when the space has no general chat installed yet (or on a
+    /// pre-parts daemon, which has no such dataset entry).
     pub async fn chat_type_ids(&self, space_id: &str) -> Result<Vec<String>> {
         let v = self
             .get_json(&format!("/spaces/{space_id}/datasets"))
@@ -343,9 +342,9 @@ impl Api {
 
     /// Live view of a space's chat objects — drives unread badges and picks up
     /// chats created while we're running. `chat_types` comes from
-    /// [`Api::chat_type_ids`]; the filter also takes the legacy literal
-    /// `"chat"` type and any type whose layout is `chat` (the general-chat
-    /// root carries its own type definition), so a chat installed after the
+    /// [`Api::chat_type_ids`] and is matched against `id` (the general-chat
+    /// root is its own type and hosts itself). The filter is OR-ed with any
+    /// object whose type layout is `chat`, so a chat installed after the
     /// owners were resolved still shows up live.
     pub async fn subscribe_chat_objects(
         &self,
@@ -353,11 +352,9 @@ impl Api {
         chat_types: &[String],
     ) -> Result<SseReader> {
         let path = format!("/spaces/{space_id}/objects/query/subscribe");
-        let mut types: Vec<&str> = vec![LEGACY_CHAT_TYPE];
-        types.extend(chat_types.iter().map(String::as_str));
         let body = json!({
             "filter": {"$or": [
-                {"any.types": {"$in": types}},
+                {"id": {"$in": chat_types}},
                 {"type.layout.type": "chat"},
             ]},
             "sort": ["miniapp.pos"],

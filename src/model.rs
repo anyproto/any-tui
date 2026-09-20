@@ -153,12 +153,12 @@ pub struct Chat {
 }
 
 impl Chat {
-    /// A record is a chat when one of its `any.types` is a chat-declaring type
-    /// (`chat_types`, the `chat_messages` owners), or the legacy literal
-    /// `"chat"`, or when the record is itself a type whose layout is `chat` —
-    /// the general-chat root is a bundle root that is its own type, so it
-    /// matches this way even before its owner id has been resolved. The `chat`
-    /// sub-document holds the unread counters. Returns None for non-chats.
+    /// A record is a chat when its `id` is a chat-declaring type (`chat_types`,
+    /// the `chat_messages` owners — the general-chat root is a bundle root
+    /// that is its own type and hosts itself), or when it is a type whose
+    /// layout is `chat` (matches even before its owner id has been resolved).
+    /// The `chat` sub-document holds the unread counters. Returns None for
+    /// non-chats.
     pub fn from_record(
         v: &Value,
         space_id: &str,
@@ -175,10 +175,11 @@ impl Chat {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_string();
-        // Sidebar order: `miniapp.pos` on the parts model, `nav.pos` before it.
-        let pos = ["miniapp", "nav"]
-            .iter()
-            .find_map(|k| v.get(k).and_then(|n| n.get("pos")).and_then(|p| p.as_str()))
+        // Sidebar order: `miniapp.pos` (absent until the user reorders).
+        let pos = v
+            .get("miniapp")
+            .and_then(|n| n.get("pos"))
+            .and_then(|p| p.as_str())
             .unwrap_or("")
             .to_string();
         let chat = v.get("chat");
@@ -208,17 +209,12 @@ impl Chat {
     }
 
     fn is_chat_record(v: &Value, chat_types: &[String]) -> bool {
-        let typed = v
-            .get("any")
-            .and_then(|a| a.get("types"))
-            .and_then(|t| t.as_array())
-            .map(|ts| {
-                ts.iter()
-                    .filter_map(Value::as_str)
-                    .any(|t| t == "chat" || chat_types.iter().any(|c| c == t))
-            })
+        let is_owner = v
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| chat_types.iter().any(|c| c == id))
             .unwrap_or(false);
-        typed
+        is_owner
             || v.get("type")
                 .and_then(|t| t.get("layout"))
                 .and_then(|l| l.get("type"))
@@ -435,12 +431,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The general-chat root as the parts-model daemon sends it (2026-09):
-    /// a bundle root that is its own type, no `"chat"` literal anywhere.
+    /// The general-chat root as the one-type-per-object daemon sends it
+    /// (late 2026-09, taken from a live row): a bundle root that is its own
+    /// type, so `any.type` is the `__type__` marker — the root's own id
+    /// appears nowhere on the row but `id`. No `"chat"` literal anywhere.
     fn general_chat_record() -> Value {
         json!({
             "id": "bafyroot",
-            "any": {"types": ["__type__", "bafyroot", "miniapp"], "name": "General"},
+            "any": {"type": "__type__", "collections": ["miniapp"], "name": "General"},
             "type": {"xkey": "general_chat", "hidden": true, "layout": {"type": "chat"}},
             "miniapp": {"bundle": "system:general-chat/v1", "pos": "a1"},
             "chat": {"unreadCount": 3, "unreadMentions": 1},
@@ -448,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_record_matches_on_owner_type_id() {
+    fn chat_record_matches_on_owner_id() {
         let owners = vec!["bafyroot".to_string()];
         let mut rec = general_chat_record();
         rec["type"]["layout"] = json!({"type": "page"}); // owner id alone must do
@@ -465,12 +463,15 @@ mod tests {
         assert_eq!(c.object_id, "bafyroot");
     }
 
+    /// The live row has no `miniapp.pos` until the user reorders the sidebar;
+    /// an unnamed chat falls back to a generic label.
     #[test]
-    fn chat_record_legacy_literal_type_and_nav_pos() {
-        let rec = json!({"id": "c1", "any": {"types": ["chat"]}, "nav": {"pos": "b2"}});
-        let c = Chat::from_record(&rec, "s", "sp", &[]).unwrap();
+    fn chat_record_without_pos_or_name() {
+        let owners = vec!["c1".to_string()];
+        let rec = json!({"id": "c1", "any": {"type": "__type__"}, "type": {"layout": {"type": "chat"}}});
+        let c = Chat::from_record(&rec, "s", "sp", &owners).unwrap();
         assert_eq!(c.label(), "space chat");
-        assert_eq!(c.pos, "b2");
+        assert_eq!(c.pos, "");
     }
 
     #[test]
@@ -478,11 +479,14 @@ mod tests {
         let owners = vec!["bafyroot".to_string()];
         let rec = json!({
             "id": "t1",
-            "any": {"types": ["__type__", "t1"]},
+            "any": {"type": "__type__"},
             "type": {"xkey": "agent_log", "hidden": true},
         });
         assert!(Chat::from_record(&rec, "s", "sp", &owners).is_none());
-        let page = json!({"id": "p1", "any": {"types": ["page"]}, "nav": {"pos": "a0"}});
+        // A type marker row whose id is not an owner is not a chat either.
+        let other = json!({"id": "x1", "any": {"type": "__type__"}, "type": {"xkey": "notes"}});
+        assert!(Chat::from_record(&other, "s", "sp", &owners).is_none());
+        let page = json!({"id": "p1", "any": {"type": "page", "collections": ["miniapp"]}, "miniapp": {"pos": "a0"}});
         assert!(Chat::from_record(&page, "s", "sp", &owners).is_none());
     }
 
