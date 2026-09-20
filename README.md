@@ -86,6 +86,32 @@ If the key is missing, bao posts a credential-request bubble into the chat;
 the TUI shows it as `📎 1 credential_request` and cannot fill it in, so put the
 key in `.connectors.env` and restart `serve`.
 
+### Running bao on OpenRouter (GLM 5.3, Qwen 3.8 Max)
+
+No Anthropic key needed: one OpenRouter key and three `llm.tier.*` rows.
+The committed `anybao.toml` is the prod default, so keep your copy in the
+gitignored `configs/` dir and put the key beside it — `anyrt` reads the
+`.connectors.env` next to whichever config file it loads:
+
+```sh
+mkdir -p configs && cp anybao.toml configs/anybao.toml
+echo 'llm.key.openrouter=sk-or-…' > configs/.connectors.env
+cat >> configs/anybao.toml <<'TOML'
+
+[config]   # hard seeds: written into the bao space on every serve start
+"llm.tier.codegen"  = { provider = "openai-compat", model = "qwen/qwen3.8-max", base_url = "https://openrouter.ai/api/v1", api_key_ref = "llm.key.openrouter" }
+"llm.tier.classify" = { provider = "openai-compat", model = "qwen/qwen3.8-max", base_url = "https://openrouter.ai/api/v1", api_key_ref = "llm.key.openrouter" }
+"llm.tier.vision"   = { provider = "openai-compat", model = "qwen/qwen3.8-max", base_url = "https://openrouter.ai/api/v1", api_key_ref = "llm.key.openrouter" }
+TOML
+./runtime/target/release/anyrt serve --config-file configs/anybao.toml
+```
+
+For GLM 5.3 use `z-ai/glm-5.3` in `codegen` and `classify`, and
+`z-ai/glm-5v-turbo` in `vision` (GLM 5.3 itself is text-only). Any-ui's
+Settings ▸ Model writes the same rows, but the `[config]` table wins on every
+restart, so drop it if you want to switch models from the UI. The `.connectors.env`
+sibling file must sit in the same directory as the config file passed with `--config-file`.
+
 ### Watching bao work
 
 While a run is live the bottom bar shows what bao is doing, fed by the
