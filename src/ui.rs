@@ -1,5 +1,5 @@
 use crate::app::{App, Focus, Mode, SearchScope};
-use crate::model::{BaoPresence, render_mentions};
+use crate::model::{BaoPresence, action_body, highlight_hits, md_unescape, render_mentions};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
@@ -22,7 +22,6 @@ const UNREAD: Color = Color::Yellow;
 const SEL: Color = Color::White;
 const SEL_UNREAD: Color = Color::LightYellow;
 const ME: Color = Color::Green;
-const PEER: Color = Color::Magenta;
 /// Agent-authored messages get their own hue and a `✦` marker, since they're
 /// signed by the human account and would otherwise read as that person.
 const AGENT: Color = Color::LightBlue;
@@ -32,11 +31,40 @@ const AGENT: Color = Color::LightBlue;
 fn author_label(app: &App, m: &crate::model::Message) -> (String, Color) {
     match &m.agent {
         Some(a) => (format!("✦ {}", a.name), AGENT),
-        None => (
-            app.display_name(&m.creator),
-            if m.creator == app.me { ME } else { PEER },
-        ),
+        None => person_label(app, &m.creator),
     }
+}
+
+/// A human's name and colour: green for you, otherwise a colour hashed from
+/// the identity, IRC-client style, so the same person keeps the same colour
+/// across chats and restarts.
+fn person_label(app: &App, identity: &str) -> (String, Color) {
+    let name = app.display_name(identity);
+    let color = if identity == app.me { ME } else { nick_color(identity) };
+    (name, color)
+}
+
+/// 256-colour picks that read on dark and light terminals and stay clear of
+/// the colours that already mean something (you, agents, accent, unread).
+const NICKS: [Color; 10] = [
+    Color::Indexed(168),
+    Color::Indexed(173),
+    Color::Indexed(179),
+    Color::Indexed(107),
+    Color::Indexed(73),
+    Color::Indexed(110),
+    Color::Indexed(140),
+    Color::Indexed(175),
+    Color::Indexed(209),
+    Color::Indexed(147),
+];
+
+fn nick_color(identity: &str) -> Color {
+    // FNV-1a: tiny, stable across runs (unlike std's randomized hasher).
+    let h = identity
+        .bytes()
+        .fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193));
+    NICKS[h as usize % NICKS.len()]
 }
 
 /// Sender label for a chat's last-message preview: the agent name (with the
@@ -45,6 +73,14 @@ fn preview_sender(app: &App, chat: &crate::model::Chat) -> String {
     match &chat.last_agent {
         Some(name) => format!("✦ {}", short_name(name)),
         None => short_name(&app.display_name(&chat.last_creator)),
+    }
+}
+
+/// `Name: text`, or `* Name waves` for a `/me` action.
+fn preview_line(sender: &str, text: &str, width: usize) -> String {
+    match action_body(text) {
+        Some(body) => format!("* {sender} {}", one_line(body, width)),
+        None => format!("{sender}: {}", one_line(text, width)),
     }
 }
 
@@ -192,11 +228,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 
         let preview = match &chat.last_text {
             Some(t) if t.is_empty() => "no messages".to_string(),
-            Some(t) => format!(
-                "{}: {}",
-                preview_sender(app, chat),
-                one_line(t, width)
-            ),
+            Some(t) => preview_line(&preview_sender(app, chat), t, width),
             None => "…".to_string(),
         };
         lines.push(Line::from(Span::styled(
@@ -254,9 +286,12 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         let selected = i == app.sel;
         let has_unread = chat.unread > 0;
 
-        // `@` when something unread pings you, `●` for plain unread.
+        // `@` when something unread pings you, `★` for a `/hl` word, `●`
+        // for plain unread.
         let marker = if chat.unread_mentions > 0 {
             "@"
+        } else if chat.hl && has_unread {
+            "★"
         } else if has_unread {
             "●"
         } else {
@@ -298,11 +333,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         // this is what actually distinguishes them.
         let preview = match &chat.last_text {
             Some(t) if t.is_empty() => "no messages".to_string(),
-            Some(t) => format!(
-                "{}: {}",
-                preview_sender(app, chat),
-                one_line(t, width)
-            ),
+            Some(t) => preview_line(&preview_sender(app, chat), t, width),
             None => "…".to_string(),
         };
         lines.push(Line::from(Span::styled(
@@ -498,10 +529,7 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
         }
         let (label, color) = match &hit.agent {
             Some(name) => (format!("✦ {name}"), AGENT),
-            None => (
-                app.display_name(&hit.creator),
-                if hit.creator == app.me { ME } else { PEER },
-            ),
+            None => person_label(app, &hit.creator),
         };
         let mut head = vec![
             Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
@@ -528,8 +556,12 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
         }
 
         let start_line = lines.len();
+        let text = match action_body(&hit.text) {
+            Some(body) => format!("* {} {body}", head[0].content),
+            None => hit.text.clone(),
+        };
         lines.push(Line::from(head));
-        for l in wrap(&hit.text, text_w) {
+        for l in wrap(&text, text_w) {
             lines.push(Line::from(vec![Span::raw("  "), Span::raw(l)]));
         }
         let end_line = lines.len();
@@ -641,18 +673,49 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         // and human turns never group together (see speaker_key).
         let speaker = speaker_key(m);
         let grouped = speaker == prev_speaker && (m.created_at - prev_time).abs() < 300.0;
-        if !grouped {
+        let compact = app.prefs.compact;
+        let (label, color) = author_label(app, m);
+        let name_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        // Mention links render as `@Name` chips (current name, falling back
+        // to the snapshot in the link text); `/hl` words in other people's
+        // messages light up like a mention.
+        let (text, chips) = render_mentions(&m.text, |id| mention_name(app, id));
+        let text = md_unescape(&text);
+        // Agents sign as you too, so "yours" means human-authored by you.
+        let hl = if m.creator == app.me && m.agent.is_none() {
+            Vec::new()
+        } else {
+            highlight_hits(&text, &app.prefs.highlights)
+        };
+        let mut marks: Vec<(String, Style)> = chips
+            .into_iter()
+            .map(|c| (c, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
+            .collect();
+        marks.extend(hl.iter().map(|h| (h.clone(), Style::default().fg(UNREAD).add_modifier(Modifier::BOLD))));
+        let action = action_body(&text).map(str::to_string);
+
+        // Compact mode has no headers: every line carries its own time
+        // (clock only, so the columns line up) and name, and a divider marks
+        // each new day, like an IRC log's "day changed".
+        if compact && fmt_day(m.created_at) != fmt_day(prev_time) {
+            lines.push(Line::from(Span::styled(
+                format!("  ── {} ──", fmt_day(m.created_at)),
+                Style::default().fg(DIM),
+            )));
+        }
+        if !compact && !grouped {
             if i > 0 {
                 lines.push(Line::from(""));
             }
-            let (label, color) = author_label(app, m);
             let mut head = vec![
-                Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(label.clone(), name_style),
                 Span::raw("  "),
                 Span::styled(fmt_time(m.created_at), Style::default().fg(DIM)),
             ];
             if m.mentions_me(&app.me) {
                 head.push(Span::styled("  @you", Style::default().fg(UNREAD).bold()));
+            } else if !hl.is_empty() {
+                head.push(Span::styled("  ★", Style::default().fg(UNREAD).bold()));
             }
             lines.push(Line::from(head));
         }
@@ -665,7 +728,7 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 .find(|x| &x.id == rid)
                 .map(|x| {
                     let (text, _) = render_mentions(&x.text, |id| mention_name(app, id));
-                    format!("{}: {}", app.display_name(&x.creator), one_line(&text, 40))
+                    preview_line(&app.display_name(&x.creator), &md_unescape(&text), 40)
                 })
                 .unwrap_or_else(|| "…".to_string());
             // Truncate against the real pane width, otherwise a narrow pane
@@ -677,12 +740,42 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         }
 
         if !m.text.is_empty() {
-            // Mention links render as `@Name` chips (current name, falling
-            // back to the snapshot in the link text), highlighted in the body.
-            let (text, chips) = render_mentions(&m.text, |id| mention_name(app, id));
-            for (n, l) in wrap(&text, text_w).into_iter().enumerate() {
+            // What leads the first line: `* Name` for a `/me` action, and in
+            // compact mode the time and name every line carries.
+            let time = (fmt_clock(m.created_at), Style::default().fg(DIM));
+            let lead: Vec<(String, Style)> = match (compact, &action) {
+                (false, None) => vec![],
+                (false, Some(_)) => vec![(format!("* {label}"), name_style)],
+                (true, None) => vec![time, (label.clone(), name_style)],
+                (true, Some(_)) => vec![time, (format!("* {label}"), name_style)],
+            };
+            let body = action.as_deref().unwrap_or(&text);
+            let lead_text: String = lead.iter().map(|(t, _)| format!("{t} ")).collect();
+            // Compact continuation lines hang under the name, past the time.
+            let hang = if compact { 6 } else { 0 };
+            let full = format!("{lead_text}{body}");
+            for (n, l) in wrap(&full, text_w.saturating_sub(hang)).into_iter().enumerate() {
                 let mut spans = vec![Span::raw("  ")];
-                spans.extend(chip_spans(&l, &chips));
+                if n > 0 && hang > 0 {
+                    spans.push(Span::raw(" ".repeat(hang)));
+                }
+                let mut rest = l.as_str();
+                if n == 0 {
+                    // A name too long for the pane wraps; then the rest is
+                    // plain text rather than a half-styled name.
+                    for (t, st) in &lead {
+                        let Some(r) = rest.strip_prefix(t.as_str()) else { break };
+                        spans.push(Span::styled(t.clone(), *st));
+                        spans.push(Span::raw(" "));
+                        rest = r.strip_prefix(' ').unwrap_or(r);
+                    }
+                }
+                spans.extend(mark_spans(rest, &marks));
+                if action.is_some() {
+                    for sp in spans.iter_mut() {
+                        sp.style = sp.style.add_modifier(Modifier::ITALIC);
+                    }
+                }
                 if n == 0 && m.edited() {
                     spans.push(Span::styled(" (edited)", Style::default().fg(DIM)));
                 }
@@ -692,11 +785,24 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
 
         // Attachments can't be opened yet, but you should be able to see that
         // a message carries them.
-        if !m.attachments.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  📎 {}", m.attachment_summary()),
+        // One line per attachment — the file's name and size once its
+        // metadata lands, a live percentage while `o`/`s` fetches it, and a
+        // key hint on the message under the cursor.
+        for (n, a) in m.attachments.iter().enumerate() {
+            let (label, file_id) = attachment_label(app, a);
+            let mut spans = vec![Span::styled(
+                format!("  {}", truncate(&label, text_w.saturating_sub(18))),
                 Style::default().fg(Color::Blue),
-            )));
+            )];
+            if let Some((_, got, total)) = file_id.and_then(|id| app.downloads.get(&id)) {
+                spans.push(Span::styled(
+                    format!("  ⤓ {}", progress_text(*got, *total)),
+                    Style::default().fg(UNREAD),
+                ));
+            } else if n == 0 && m.id == sel_id && app.focus == Focus::Messages {
+                spans.push(Span::styled("  o open · s save", Style::default().fg(DIM)));
+            }
+            lines.push(Line::from(spans));
         }
 
         if !m.reactions.is_empty() {
@@ -753,35 +859,64 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
     (lines, ranges)
 }
 
+/// `📎 name · size` for a file (the sender's kind until its metadata
+/// lands), `🔗 url` for a web link. Also the file id, to find its download.
+fn attachment_label(app: &App, a: &crate::model::Attachment) -> (String, Option<String>) {
+    use crate::model::AttachmentTarget;
+    match a.target() {
+        AttachmentTarget::File { file_id, .. } => {
+            let label = match app.file_infos.get(&file_id) {
+                Some(i) if !i.name.is_empty() => {
+                    format!("📎 {} · {}", i.name, crate::files::human_size(i.size))
+                }
+                _ => format!("📎 {}", a.kind),
+            };
+            (label, Some(file_id))
+        }
+        AttachmentTarget::Url(u) => (format!("🔗 {u}"), None),
+        AttachmentTarget::Object => ("🔗 linked object".to_string(), None),
+        AttachmentTarget::Unknown => (format!("📎 {}", a.kind), None),
+    }
+}
+
+/// "45%", or bytes so far when the size is unknown.
+fn progress_text(got: u64, total: u64) -> String {
+    if total > 0 {
+        format!("{}%", got * 100 / total)
+    } else {
+        crate::files::human_size(got)
+    }
+}
+
 /// Current display name for a mention identity, if the directory knows one.
 fn mention_name(app: &App, identity: &str) -> Option<String> {
     app.names.get(identity).filter(|n| !n.is_empty()).cloned()
 }
 
 /// Splits one wrapped body line into spans, styling every occurrence of a
-/// mention chip (`@Name`) so it stands out from the surrounding text. Chips are
-/// matched longest-first so `@Anna Lee` isn't eaten by `@Anna`.
-fn chip_spans(line: &str, chips: &[String]) -> Vec<Span<'static>> {
-    if chips.is_empty() {
+/// mark — a mention chip (`@Name`) or a `/hl` word — so it stands out from
+/// the surrounding text. Marks match longest-first so `@Anna Lee` isn't
+/// eaten by `@Anna`.
+fn mark_spans(line: &str, marks: &[(String, Style)]) -> Vec<Span<'static>> {
+    if marks.is_empty() {
         return vec![Span::raw(line.to_string())];
     }
-    let mut chips: Vec<&String> = chips.iter().collect();
-    chips.sort_by_key(|c| std::cmp::Reverse(c.len()));
-    chips.dedup();
-    let style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let mut marks: Vec<&(String, Style)> = marks.iter().filter(|(m, _)| !m.is_empty()).collect();
+    marks.sort_by_key(|(m, _)| std::cmp::Reverse(m.len()));
+    marks.dedup_by(|a, b| a.0 == b.0);
     let mut spans = Vec::new();
     let mut rest = line;
     while !rest.is_empty() {
-        let hit = chips
+        let hit = marks
             .iter()
-            .filter_map(|c| rest.find(c.as_str()).map(|i| (i, c.len())))
-            .min_by_key(|&(i, len)| (i, std::cmp::Reverse(len)));
+            .filter_map(|(m, st)| rest.find(m.as_str()).map(|i| (i, m.len(), *st)))
+            .min_by_key(|&(i, len, _)| (i, std::cmp::Reverse(len)));
         match hit {
-            Some((i, len)) => {
+            Some((i, len, st)) => {
                 if i > 0 {
                     spans.push(Span::raw(rest[..i].to_string()));
                 }
-                spans.push(Span::styled(rest[i..i + len].to_string(), style));
+                spans.push(Span::styled(rest[i..i + len].to_string(), st));
                 rest = &rest[i + len..];
             }
             None => {
@@ -938,7 +1073,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 " SEARCH ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(PEER)
+                    .bg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {scope}"), Style::default().fg(ACCENT).bold()),
@@ -968,6 +1103,21 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     // pane this bar is the only unread cue, so it must never wrap away.
     let total = area.width as usize;
     let mut used = label.width();
+    if let Some(mark) = &app.prefs.away {
+        let t = format!(" {mark} away");
+        used += t.width();
+        spans.push(Span::styled(t, Style::default().fg(DIM)));
+    }
+    // Downloads in flight: one by name, then how many more.
+    if let Some((name, got, total)) = app.downloads.values().next() {
+        let more = match app.downloads.len() {
+            1 => String::new(),
+            n => format!(" +{}", n - 1),
+        };
+        let t = format!(" ⤓ {} {}{more}", truncate(name, 24), progress_text(*got, *total));
+        used += t.width();
+        spans.push(Span::styled(t, Style::default().fg(UNREAD)));
+    }
     let narrow = total < 60;
 
     // Position of the message cursor, shown only when you're off the bottom.
@@ -1037,7 +1187,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 c.qualified()
             };
-            let mark = if c.unread_mentions > 0 { "@" } else { "●" };
+            let mark = if c.unread_mentions > 0 {
+                "@"
+            } else if c.hl {
+                "★"
+            } else {
+                "●"
+            };
             let e = format!("{mark}{} {}  ", name, c.unread);
             // Leave room for a "+N" overflow marker.
             if used + e.width() + reserve + 4 > total {
@@ -1099,6 +1255,22 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "                    Enter sends · Alt-Enter newline",
         "    r               reply to the message under ▌",
         "    R               mark chat read now",
+        "    D               DM the author under ▌",
+        "    o / s           open / save its attachments",
+        "    ↑ / ↓           (composing) recall sent lines",
+        "",
+        "  Commands (type in the composer)",
+        "    /me <action>    * Name waves",
+        "    /shrug /tableflip /unflip   [text] + a face",
+        "    s/old/new/[g]   edit your last message",
+        "    /dm @name|id    open a DM (/dm alone: author under ▌)",
+        "    /msg @name txt  send to a DM without leaving here",
+        "    /accept [name]  accept an incoming DM request",
+        "    /join <chat>    open the best fuzzy match",
+        "    /hl [word]      list / add highlight words; /unhl",
+        "    /away [emoji]   mark yourself away; /back",
+        "    /compact        one line per message",
+        "    //text          send a literal leading slash",
         "",
         "  Other",
         "    ?               toggle this help",
@@ -1159,6 +1331,14 @@ fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
         "   A-Enter  newline",
         "   r        reply to ▌",
         "   R        mark read",
+        "   D        DM author",
+        "   o / s    open/save file",
+        "",
+        "  Commands",
+        "   /me /shrug s/a/b/",
+        "   /dm /msg /accept",
+        "   /join /hl /away",
+        "   /compact  //literal",
         "",
         "   ?  help      q  quit",
     ];
@@ -1371,6 +1551,22 @@ fn one_line(s: &str, width: usize) -> String {
 /// First name only — sidebar previews have no room for "Konstantin Ivanov".
 fn short_name(s: &str) -> String {
     s.split_whitespace().next().unwrap_or(s).to_string()
+}
+
+fn local(ts: f64) -> Option<DateTime<Local>> {
+    match Local.timestamp_opt(ts as i64, 0) {
+        chrono::LocalResult::Single(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// `HH:MM`, for compact lines (the day goes in a divider).
+fn fmt_clock(ts: f64) -> String {
+    local(ts).map(|t| t.format("%H:%M").to_string()).unwrap_or_default()
+}
+
+fn fmt_day(ts: f64) -> String {
+    local(ts).map(|t| t.format("%a %d %b %Y").to_string()).unwrap_or_default()
 }
 
 fn fmt_time(ts: f64) -> String {

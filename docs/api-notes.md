@@ -70,6 +70,22 @@ beat wins, its label is bao's `line`, else the newest cell's code preview,
 else the run title; an idle beat with `role: active` is "bao", all-standby is
 "no active bao", none fresh is "offline", none ever is nothing.
 
+**Commands and DMs.** Composer commands are parsed client-side
+(`commands.rs`). The only new wire calls are: `PATCH
+/spaces/{sp}/objects/{chat}/chat/messages/{id} {text}` for `s/a/b/`; `POST
+/spaces/one-to-one {otherIdentity}` → the 1-1 space (idempotent, both peers
+derive one id) and `POST /catalog/general-chat/setup {spaceId}` →
+`bundles[0].bundle.rootId`, its chat, for `/dm` and `/msg`; `GET
+/spaces?status=one_to_one_pending` and `POST /spaces/{id}/one-to-one/accept`
+for incoming requests. Settings (`/hl`, `/away`, `/compact`) and the ↑ history
+are two documents in the account-scoped local collection `any_tui`
+(`PUT /local/collections`, `POST /local/get`, `POST /local/upsert`).
+
+**Attachments.** `GET /spaces/{sp}/files/{fileId}` gives the unsealed name
+and size; `GET …/files/{fileId}/content` streams the plaintext (on-demand block
+fetch, `409 file.not_available` when unservable). Only `any://f/…` links are
+downloadable; web links go to the browser, object links are just labelled.
+
 **API drift.** `api/openapi.json` pins the daemon's served `GET /v1/openapi.json`
 (build recorded in `api/OPENAPI_PIN`); `scripts/api-drift.sh [url]` diffs a running
 daemon against it, `--file <swagger.json>` diffs the any repo's generated spec,
@@ -98,6 +114,9 @@ Contract, verified against the server source:
 | `sse.rs` | SSE frame parser (`ready`/`snapshot`/`changes`/`closed`) |
 | `model.rs` | `Space`, `Chat`, `Message` and record parsing |
 | `fuzzy.rs` | scored subsequence matcher behind the `Space` picker |
+| `commands.rs` | IRC-style composer commands (`/me`, `/dm`, `s///`, …) |
+| `prefs.rs` | settings + composer history in the device-local store (`/v1/local`) |
+| `files.rs` | attachment download, open (`xdg-open`/`open`) and reveal-in-file-manager |
 | `app.rs` | state, event enum, picker, subscription tasks |
 | `ui.rs` | rendering, wrapping, scroll geometry, pane layout |
 | `main.rs` | CLI, terminal lifecycle, keymap, event loop |

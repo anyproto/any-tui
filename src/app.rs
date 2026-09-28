@@ -1,8 +1,12 @@
-use crate::api::{Api, SearchResults};
+use crate::api::{Api, FileInfo, SearchResults};
+use crate::files;
+use crate::commands::{self, Command};
 use crate::model::{
-    BaoBeat, BaoPresence, Chat, Identity, Message, Space, derive_bao_presence, link_mentions,
-    render_mentions,
+    AttachmentTarget, BaoBeat, BaoPresence, Chat, Identity, Message, Space, derive_bao_presence,
+    highlight_hits,
+    link_mentions, md_unescape, render_mentions,
 };
+use crate::prefs::{self, HISTORY_MAX, Prefs};
 use crate::sse::{Frame, SseReader};
 use tui_input::Input;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +53,16 @@ pub enum Ev {
     SearchFailed { seq: u64, msg: String },
     /// A `bao.status` presence beat off the account event bus.
     BaoBeat(BaoBeat),
+    /// Open this chat object once it shows up (a DM we just set up arrives
+    /// through the space-list subscription a moment later).
+    OpenChat(String),
+    /// The current incoming DM requests.
+    PendingDms(Vec<Space>),
+    /// Name/mime/size of an attached file, for the 📎 line.
+    FileInfo { file_id: String, info: FileInfo },
+    /// Bytes so far of a running download (`total` 0 = unknown).
+    Download { file_id: String, name: String, got: u64, total: u64 },
+    DownloadDone { file_id: String },
     Toast(String),
     Error(String),
 }
@@ -237,6 +251,26 @@ pub struct App {
     bao: HashMap<String, (BaoBeat, Instant)>,
     /// Counts 1s ticks; drives the status bar's ellipsis while bao works.
     pub ticks: u64,
+    /// Settings kept in the daemon's local store (`prefs.rs`).
+    pub prefs: Prefs,
+    /// False when the local store was unreachable: nothing persists.
+    pub prefs_ok: bool,
+    /// Sent composer lines, oldest first, for ↑/↓ recall.
+    history: Vec<String>,
+    /// Where ↑/↓ is in `history`; `None` = editing a fresh line (`hist_draft`).
+    hist_pos: Option<usize>,
+    hist_draft: String,
+    /// A chat to open as soon as it appears in the list (see `Ev::OpenChat`).
+    pending_open: Option<String>,
+    /// Incoming DM requests, as last fetched.
+    pub pending_dms: Vec<Space>,
+    /// Attached files' metadata by file id, fetched once per file as
+    /// messages carrying them load.
+    pub file_infos: HashMap<String, FileInfo>,
+    files_requested: HashSet<String>,
+    /// Running downloads by file id: (name, bytes so far, total). Drives the
+    /// status bar and the attachment line's percentage.
+    pub downloads: HashMap<String, (String, u64, u64)>,
 }
 
 impl App {
@@ -291,7 +325,36 @@ impl App {
             reactions_marked: HashSet::new(),
             bao: HashMap::new(),
             ticks: 0,
+            prefs: Prefs::default(),
+            prefs_ok: false,
+            history: Vec::new(),
+            hist_pos: None,
+            hist_draft: String::new(),
+            pending_open: None,
+            pending_dms: Vec::new(),
+            file_infos: HashMap::new(),
+            files_requested: HashSet::new(),
+            downloads: HashMap::new(),
         }
+    }
+
+    /// Adopts what `prefs::load` read at startup.
+    pub fn set_loaded(&mut self, l: prefs::Loaded) {
+        self.prefs = l.prefs;
+        self.history = l.history;
+        self.prefs_ok = l.ok;
+    }
+
+    fn save_prefs(&self) {
+        if !self.prefs_ok {
+            return;
+        }
+        let (api, tx, p) = (self.api.clone(), self.tx.clone(), self.prefs.clone());
+        tokio::spawn(async move {
+            if let Err(e) = prefs::save_prefs(&api, &p).await {
+                let _ = tx.send(Ev::Error(format!("save prefs: {e}")));
+            }
+        });
     }
 
     /// Folds a beat in — last write per publisher wins.
@@ -449,6 +512,7 @@ impl App {
                 chat.last_creator = existing.last_creator.clone();
                 chat.last_agent = existing.last_agent.clone();
                 chat.last_at = existing.last_at;
+                chat.hl = existing.hl && chat.unread > 0;
                 *existing = chat.clone();
             }
             None => self.chats.push(chat.clone()),
@@ -456,6 +520,23 @@ impl App {
         self.sort_chats();
         self.restore_selection(keep);
         self.ensure_preview_sub(&chat);
+        if self.pending_open.as_deref() == Some(chat.object_id.as_str()) {
+            self.pending_open = None;
+            self.open_chat_id(&chat.object_id);
+        }
+    }
+
+    /// Selects and enters the chat `object_id`, or — if it isn't listed yet —
+    /// opens it the moment it arrives.
+    pub fn open_chat_id(&mut self, object_id: &str) {
+        match self.chats.iter().position(|c| c.object_id == object_id) {
+            Some(i) => {
+                self.sel = i;
+                self.user_selected = true;
+                self.open_selected();
+            }
+            None => self.pending_open = Some(object_id.to_string()),
+        }
     }
 
     /// Keeps each chat's sidebar preview live with its own tiny (window-of-1)
@@ -489,12 +570,21 @@ impl App {
         // Mention links read as `@Name` in the sidebar too, not raw markdown.
         let preview = msg
             .as_ref()
-            .map(|m| render_mentions(&m.preview_text(), |id| self.mention_name(id)).0);
+            .map(|m| md_unescape(&render_mentions(&m.preview_text(), |id| self.mention_name(id)).0));
+        let hl = msg.as_ref().is_some_and(|m| {
+            (m.creator != self.me || m.agent.is_some())
+                && !highlight_hits(&m.text, &self.prefs.highlights).is_empty()
+        });
         if let Some(c) = self.chats.iter_mut().find(|c| c.object_id == object_id) {
             match msg {
                 // A bare "…" ping isn't worth previewing; leave the prior one.
                 Some(m) if m.is_agent_presence_marker() => {}
                 Some(m) => {
+                    // Only an unread arrival lights the chat up; your own
+                    // view of it (or reading it) never does.
+                    if hl && c.unread > 0 && m.unread {
+                        c.hl = true;
+                    }
                     c.last_text = preview;
                     c.last_creator = m.creator.clone();
                     c.last_agent = m.agent.as_ref().map(|a| a.name.clone());
@@ -584,12 +674,94 @@ impl App {
             if m.is_agent_presence_marker() {
                 continue;
             }
+            self.fetch_file_infos(&m);
             match self.msgs.iter_mut().find(|x| x.id == m.id) {
                 Some(existing) => *existing = m,
                 None => self.msgs.push(m),
             }
         }
         self.msgs.sort_by(Message::cmp_order);
+    }
+
+    /// Looks up name/size for each file attached to `m`, once per file.
+    fn fetch_file_infos(&mut self, m: &Message) {
+        for a in &m.attachments {
+            let AttachmentTarget::File { space_id, file_id } = a.target() else { continue };
+            if !self.files_requested.insert(file_id.clone()) {
+                continue;
+            }
+            let (api, tx) = (self.api.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                // A failure just leaves the generic "📎 image" label.
+                if let Ok(info) = api.file_info(&space_id, &file_id).await {
+                    let _ = tx.send(Ev::FileInfo { file_id, info });
+                }
+            });
+        }
+    }
+
+    /// `o` / `s` on the message under the cursor: every attachment it
+    /// carries is opened with the desktop's default app, or saved to the
+    /// Downloads folder. Web links open in the browser either way (this
+    /// client speaks plain HTTP to the daemon only, so it can't fetch them).
+    pub fn attachment_action(&mut self, open: bool) {
+        let Some(m) = self.selected_message().cloned() else {
+            return self.toast("no message selected");
+        };
+        if m.attachments.is_empty() {
+            return self.toast("no attachments on this message");
+        }
+        let mut wanted = Vec::new();
+        for a in &m.attachments {
+            match a.target() {
+                AttachmentTarget::File { space_id, file_id } => {
+                    let info = self.file_infos.get(&file_id).cloned();
+                    wanted.push((space_id, file_id, info));
+                }
+                AttachmentTarget::Url(url) => {
+                    if let Err(e) = files::open_external(&url) {
+                        self.toast(format!("open: {e}"));
+                    } else {
+                        self.toast(format!("opened {url} in the browser"));
+                    }
+                }
+                AttachmentTarget::Object => self.toast("that attachment links an object, not a file"),
+                AttachmentTarget::Unknown => self.toast(format!("can't handle {}", a.link)),
+            }
+        }
+        if !wanted.is_empty() {
+            self.fetch_files(wanted, open);
+        }
+    }
+
+    /// Downloads one after another (the status bar shows the running one),
+    /// then opens each, or reveals all the saved ones in a single
+    /// file-manager window.
+    fn fetch_files(&self, wanted: Vec<(String, String, Option<FileInfo>)>, open: bool) {
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let toast = |m: String| {
+                let _ = tx.send(Ev::Toast(m));
+            };
+            let mut saved = Vec::new();
+            for (space_id, file_id, info) in wanted {
+                if let Some(dest) = fetch_file(&api, &tx, &space_id, &file_id, info, open).await {
+                    saved.push(dest);
+                }
+            }
+            if open || saved.is_empty() {
+                return;
+            }
+            toast(match saved.as_slice() {
+                [one] => format!("saved {}", one.display()),
+                many => format!("saved {} files to {}", many.len(), files::download_dir().display()),
+            });
+            // Point at them in the file manager; blocking, so off the runtime.
+            let paths = saved.clone();
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || files::reveal(&paths)).await {
+                toast(format!("saved to {} (couldn't show it: {e})", files::download_dir().display()));
+            }
+        });
     }
 
     /// Loads the selected chat without touching focus, so moving the cursor in
@@ -755,15 +927,91 @@ impl App {
     }
 
     pub fn send_input(&mut self) {
-        let text = self.input.value().trim().to_string();
-        if text.is_empty() {
+        let raw = self.input.value().trim().to_string();
+        if raw.is_empty() {
             return;
         }
-        let Some(chat) = self.active_chat().cloned() else {
+        // IRC-style commands; a refused one keeps the input for fixing.
+        let cmd = match commands::parse(&raw) {
+            Ok(c) => c,
+            Err(msg) => {
+                self.toast(msg);
+                return;
+            }
+        };
+        // Only posting and editing need an open chat; the rest work anywhere.
+        let chat = self.active_chat().cloned();
+        if chat.is_none() && matches!(cmd, Command::Send(_) | Command::Edit { .. }) {
             self.toast("no chat open");
             return;
-        };
+        }
         self.input.reset();
+        self.remember(raw);
+        match cmd {
+            Command::Send(text) => self.send_text(&chat.expect("checked above"), text),
+            Command::Edit { from, to, all } => {
+                self.edit_last(&chat.expect("checked above"), &from, &to, all)
+            }
+            Command::Away(mark) => {
+                self.toast(format!("away {mark} (this device only for now) — /back to clear"));
+                self.prefs.away = Some(mark);
+                self.save_prefs();
+            }
+            Command::Back => {
+                self.prefs.away = None;
+                self.toast("welcome back");
+                self.save_prefs();
+            }
+            Command::Highlight(None) => {
+                let t = if self.prefs.highlights.is_empty() {
+                    "no highlight words — /hl <word> adds one".to_string()
+                } else {
+                    format!("highlights: {}", self.prefs.highlights.join(", "))
+                };
+                self.toast(t);
+            }
+            Command::Highlight(Some(w)) => {
+                if !self.prefs.highlights.iter().any(|h| h.eq_ignore_ascii_case(&w)) {
+                    self.prefs.highlights.push(w.clone());
+                    self.save_prefs();
+                }
+                self.toast(format!("highlighting \"{w}\""));
+            }
+            Command::Unhighlight(w) => {
+                let before = self.prefs.highlights.len();
+                self.prefs.highlights.retain(|h| !h.eq_ignore_ascii_case(&w));
+                if self.prefs.highlights.len() == before {
+                    self.toast(format!("\"{w}\" wasn't highlighted"));
+                } else {
+                    self.save_prefs();
+                    self.toast(format!("stopped highlighting \"{w}\""));
+                }
+            }
+            Command::Join(q) => self.join(&q),
+            Command::Compact => {
+                self.prefs.compact = !self.prefs.compact;
+                self.save_prefs();
+                self.toast(if self.prefs.compact { "compact layout" } else { "grouped layout" });
+            }
+            Command::Dm(target) => self.dm(&target, None),
+            Command::Msg(rest) => match commands::resolve_person(&rest, &self.people()) {
+                Some((_, "")) => self.toast("usage: /msg @name <text>"),
+                Some((id, text)) => {
+                    let text = text.to_string();
+                    self.dm(&id, Some(text));
+                }
+                None => self.toast(format!("no one called {rest}")),
+            },
+            Command::Accept(who) => self.accept_dm(&who),
+            Command::Help => {
+                self.mode = Mode::Normal;
+                self.show_help = true;
+                self.toast(commands::HELP);
+            }
+        }
+    }
+
+    fn send_text(&mut self, chat: &Chat, text: String) {
         let reply = self.reply_to.take();
         self.scroll = 0;
         // Jump to the bottom so you see what you just sent land.
@@ -771,8 +1019,7 @@ impl App {
         // `@Name` becomes a real mention link — the server derives `mentions`
         // from those, and only those, so plain `@name` text pings nobody.
         let text = link_mentions(&text, &chat.space_id, &self.roster(&chat.space_id));
-        let api = self.api.clone();
-        let tx = self.tx.clone();
+        let (api, tx, chat) = (self.api.clone(), self.tx.clone(), chat.clone());
         tokio::spawn(async move {
             if let Err(e) = api
                 .send(&chat.space_id, &chat.object_id, &text, reply.as_deref())
@@ -780,6 +1027,200 @@ impl App {
             {
                 let _ = tx.send(Ev::Error(format!("send: {e}")));
             }
+        });
+    }
+
+    /// `s/from/to/[g]` on your newest (human, not agent) message here. The
+    /// match runs on the stored text, mention links included.
+    fn edit_last(&mut self, chat: &Chat, from: &str, to: &str, all: bool) {
+        let Some(m) = self
+            .msgs
+            .iter()
+            .rev()
+            .find(|m| m.creator == self.me && m.agent.is_none())
+            .cloned()
+        else {
+            self.toast("nothing of yours to edit here");
+            return;
+        };
+        if !m.text.contains(from) {
+            self.toast(format!("\"{from}\" isn't in your last message"));
+            return;
+        }
+        let text = if all { m.text.replace(from, to) } else { m.text.replacen(from, to, 1) };
+        let (api, tx, chat) = (self.api.clone(), self.tx.clone(), chat.clone());
+        tokio::spawn(async move {
+            if let Err(e) = api.edit_message(&chat.space_id, &chat.object_id, &m.id, &text).await {
+                let _ = tx.send(Ev::Error(format!("edit: {e}")));
+            }
+        });
+    }
+
+    /// Keeps a sent line for ↑ recall (skipping an immediate repeat) and
+    /// persists the tail.
+    fn remember(&mut self, line: String) {
+        self.hist_pos = None;
+        self.hist_draft.clear();
+        if self.history.last() == Some(&line) {
+            return;
+        }
+        self.history.push(line);
+        let over = self.history.len().saturating_sub(HISTORY_MAX);
+        self.history.drain(..over);
+        if self.prefs_ok {
+            let (api, lines) = (self.api.clone(), self.history.clone());
+            tokio::spawn(async move {
+                let _ = prefs::save_history(&api, &lines).await;
+            });
+        }
+    }
+
+    /// ↑ / ↓ in the composer: walk sent lines; stepping past the newest
+    /// restores what you were typing.
+    pub fn history_step(&mut self, older: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (self.hist_pos, older) {
+            (None, true) => {
+                self.hist_draft = self.input.value().to_string();
+                Some(self.history.len() - 1)
+            }
+            (None, false) => return,
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) if i + 1 < self.history.len() => Some(i + 1),
+            (Some(_), false) => None,
+        };
+        self.hist_pos = next;
+        let value = match next {
+            Some(i) => self.history[i].clone(),
+            None => std::mem::take(&mut self.hist_draft),
+        };
+        self.input = Input::new(value);
+    }
+
+    /// Everyone the directory can name, for `/dm` and `/msg` — not just this
+    /// space's members: a DM is exactly how you reach someone elsewhere.
+    fn people(&self) -> Vec<(String, String)> {
+        self.identities
+            .iter()
+            .filter(|i| !i.name.is_empty() && i.identity != self.me)
+            .map(|i| (i.name.clone(), i.identity.clone()))
+            .collect()
+    }
+
+    /// `/join <query>`: open the best fuzzy match, as the picker would rank it.
+    fn join(&mut self, query: &str) {
+        let best = self
+            .chats
+            .iter()
+            .filter_map(|c| crate::fuzzy::fuzzy_match(&self.pick_label(c), query).map(|(s, _)| (s, c)))
+            .max_by_key(|(s, _)| *s)
+            .map(|(_, c)| c.object_id.clone());
+        match best {
+            Some(id) => self.open_chat_id(&id),
+            None => self.toast(format!("no chat matches \"{query}\"")),
+        }
+    }
+
+    /// Opens the DM with `target` — `@name`, an identity, or (empty) the
+    /// author of the message under the cursor — and switches to it; with
+    /// `text` (`/msg`), posts that instead and stays where you are.
+    pub fn dm(&mut self, target: &str, text: Option<String>) {
+        let identity = if target.trim().is_empty() {
+            match self.selected_message() {
+                Some(m) if m.creator != self.me => m.creator.clone(),
+                Some(_) => return self.toast("that's you — /dm @name, or put ▌ on someone else"),
+                None => return self.toast("usage: /dm @name | identity"),
+            }
+        } else {
+            match commands::resolve_person(target, &self.people()) {
+                Some((id, "")) => id,
+                Some(_) | None => return self.toast(format!("no one called {target}")),
+            }
+        };
+        if identity == self.me {
+            return self.toast("can't DM yourself");
+        }
+        let who = self.display_name(&identity);
+        self.toast(format!("opening DM with {who}…"));
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = async {
+                let space = api.one_to_one(&identity).await?;
+                let chat = api.general_chat(&space).await?;
+                if let Some(t) = &text {
+                    api.send(&space, &chat, t, None).await?;
+                }
+                anyhow::Ok(chat)
+            }
+            .await;
+            match (res, text) {
+                (Ok(_), Some(_)) => {
+                    let _ = tx.send(Ev::Toast(format!("→ {who}: sent")));
+                }
+                (Ok(chat), None) => {
+                    let _ = tx.send(Ev::OpenChat(chat));
+                }
+                (Err(e), _) => {
+                    let _ = tx.send(Ev::Error(format!("dm {who}: {e}")));
+                }
+            }
+        });
+    }
+
+    /// Re-reads incoming DM requests; says so when a new one shows up.
+    pub fn check_pending_dms(&self) {
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            if let Ok(p) = api.pending_dms().await {
+                let _ = tx.send(Ev::PendingDms(p));
+            }
+        });
+    }
+
+    pub fn set_pending_dms(&mut self, pending: Vec<Space>) {
+        let new: Vec<&Space> = pending
+            .iter()
+            .filter(|p| !self.pending_dms.iter().any(|o| o.id == p.id))
+            .collect();
+        if let Some(p) = new.first() {
+            let name = if p.name.is_empty() { "someone" } else { p.name.as_str() };
+            self.toast(format!("DM request from {name} — /accept to open it"));
+        }
+        self.pending_dms = pending;
+    }
+
+    /// `/accept [name]`: approve an incoming DM request (the only one, or the
+    /// one whose name matches) and open its chat.
+    fn accept_dm(&mut self, who: &str) {
+        let who_l = who.trim().trim_start_matches('@').to_lowercase();
+        let matches: Vec<&Space> = self
+            .pending_dms
+            .iter()
+            .filter(|p| who_l.is_empty() || p.name.to_lowercase().contains(&who_l))
+            .collect();
+        let space = match matches.as_slice() {
+            [] if self.pending_dms.is_empty() => return self.toast("no DM requests"),
+            [] => return self.toast(format!("no DM request from {who}")),
+            [one] => (*one).clone(),
+            many => {
+                let names: Vec<&str> = many.iter().map(|p| p.name.as_str()).collect();
+                return self.toast(format!("which one? /accept {}", names.join(" | ")));
+            }
+        };
+        self.pending_dms.retain(|p| p.id != space.id);
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = async {
+                api.accept_dm(&space.id).await?;
+                api.general_chat(&space.id).await
+            }
+            .await;
+            let _ = tx.send(match res {
+                Ok(chat) => Ev::OpenChat(chat),
+                Err(e) => Ev::Error(format!("accept {}: {e}", space.name)),
+            });
         });
     }
 
@@ -1273,10 +1714,12 @@ async fn run_search_task(
                 msg_id: m.id,
                 creator: m.creator,
                 agent: m.agent.map(|a| a.name),
-                text: render_mentions(&m.text, |id| {
-                    names.get(id).filter(|n| !n.is_empty()).cloned()
-                })
-                .0,
+                text: md_unescape(
+                    &render_mentions(&m.text, |id| {
+                        names.get(id).filter(|n| !n.is_empty()).cloned()
+                    })
+                    .0,
+                ),
                 created_at: m.created_at,
             });
         }
@@ -1601,4 +2044,79 @@ pub fn spawn_chats_sub(api: Api, space: Space, tx: UnboundedSender<Ev>) -> JoinH
             backoff = (backoff * 2).min(30);
         }
     })
+}
+
+/// Fetches one attached file into the cache (`open`: then opens it, reusing a
+/// complete cached copy) or into the Downloads folder under a name that
+/// doesn't overwrite anything. Returns where it landed; failures are toasted.
+async fn fetch_file(
+    api: &Api,
+    tx: &UnboundedSender<Ev>,
+    space_id: &str,
+    file_id: &str,
+    info: Option<FileInfo>,
+    open: bool,
+) -> Option<std::path::PathBuf> {
+    let toast = |m: String| {
+        let _ = tx.send(Ev::Toast(m));
+    };
+    // The name is needed for the path (and the opener picks the app by
+    // extension), so fetch it if the 📎 lookup hasn't landed.
+    let info = match info {
+        Some(i) => i,
+        None => match api.file_info(space_id, file_id).await {
+            Ok(i) => i,
+            Err(e) => {
+                toast(format!("file {file_id}: {e}"));
+                return None;
+            }
+        },
+    };
+    let name = files::safe_name(&info.name, file_id);
+    let dest = if open {
+        files::cache_dir().join(file_id).join(&name)
+    } else {
+        files::unique_path(&files::download_dir(), &name)
+    };
+    let cached =
+        open && std::fs::metadata(&dest).is_ok_and(|md| info.size == 0 || md.len() == info.size);
+    if !cached {
+        let progress = |got, total| {
+            let _ = tx.send(Ev::Download {
+                file_id: file_id.to_string(),
+                name: name.clone(),
+                got,
+                total,
+            });
+        };
+        progress(0, info.size);
+        // One event per whole percent (or per ~256 KB when the size is
+        // unknown), not per chunk.
+        let mut last = 0u64;
+        let res = files::download(api, space_id, file_id, &dest, |got, total| {
+            let step = if total > 0 { got * 100 / total } else { got >> 18 };
+            if step != last {
+                last = step;
+                progress(got, total);
+            }
+        })
+        .await;
+        let _ = tx.send(Ev::DownloadDone { file_id: file_id.to_string() });
+        if let Err(e) = res {
+            let msg = e.to_string();
+            toast(if msg.contains("file.not_available") {
+                format!("{name}: not available yet — no peer has it and it isn't backed up")
+            } else {
+                format!("{name}: {msg}")
+            });
+            return None;
+        }
+    }
+    if open {
+        match files::open_external(&dest.to_string_lossy()) {
+            Ok(()) => toast(format!("opened {name}")),
+            Err(e) => toast(format!("{name}: {e} (it's at {})", dest.display())),
+        }
+    }
+    Some(dest)
 }

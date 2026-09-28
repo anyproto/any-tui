@@ -47,6 +47,15 @@ pub struct SearchResults {
     pub vector_status: String,
 }
 
+/// The unsealed member view of a files-v2 file (`GET …/files/{fileId}`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -267,6 +276,111 @@ impl Api {
         Ok(())
     }
 
+    /// Rewrites one of your messages (`s/old/new/`). Edits bump `modifiedAt`,
+    /// never `_ver.id`, so the message keeps its place.
+    pub async fn edit_message(&self, space_id: &str, object_id: &str, msg_id: &str, text: &str) -> Result<()> {
+        let path = format!("/spaces/{space_id}/objects/{object_id}/chat/messages/{msg_id}");
+        let resp = self
+            .http
+            .patch(self.url(&path))
+            .json(&json!({ "text": text }))
+            .send()
+            .await
+            .with_context(|| format!("PATCH {path}"))?;
+        json_or_err(resp, &path).await?;
+        Ok(())
+    }
+
+    /// Opens (derives + activates) the 1-1 space with `identity`; idempotent,
+    /// and both peers land on the same space id. Returns it.
+    pub async fn one_to_one(&self, identity: &str) -> Result<String> {
+        let v = self
+            .post_json("/spaces/one-to-one", json!({ "otherIdentity": identity }))
+            .await?;
+        str_field(&v, "id")
+    }
+
+    /// Incoming DM requests: 1-1 rows this device hasn't approved yet.
+    pub async fn pending_dms(&self) -> Result<Vec<Space>> {
+        let v = self.get_json("/spaces?status=one_to_one_pending").await?;
+        let arr = v.get("spaces").cloned().unwrap_or(Value::Array(vec![]));
+        Ok(serde_json::from_value(arr)?)
+    }
+
+    pub async fn accept_dm(&self, space_id: &str) -> Result<()> {
+        self.post_json(&format!("/spaces/{space_id}/one-to-one/accept"), json!({}))
+            .await?;
+        Ok(())
+    }
+
+    /// The space's general chat, installing it if missing (adopt-or-install,
+    /// idempotent; a derived root, so both sides of a 1-1 meet on one object).
+    /// We only call this for DMs we open — never on an ordinary space.
+    pub async fn general_chat(&self, space_id: &str) -> Result<String> {
+        let v = self
+            .post_json("/catalog/general-chat/setup", json!({ "spaceId": space_id }))
+            .await?;
+        v.pointer("/bundles/0/bundle/rootId")
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+            .context("general-chat setup: no rootId")
+    }
+
+    /// Creates the account-scoped local (device-only, never synced)
+    /// collection `name`; idempotent. See any docs/26-local-store.md.
+    pub async fn local_ensure(&self, name: &str) -> Result<()> {
+        let resp = self
+            .http
+            .put(self.url("/local/collections"))
+            .json(&json!({ "scope": "account", "name": name }))
+            .send()
+            .await
+            .context("PUT /local/collections")?;
+        json_or_err(resp, "/local/collections").await?;
+        Ok(())
+    }
+
+    /// One local document by id; `None` when it doesn't exist yet.
+    pub async fn local_get(&self, coll: &str, id: &str) -> Result<Option<Value>> {
+        let body = json!({ "coll": { "scope": "account", "name": coll }, "id": id });
+        match self.post_json("/local/get", body).await {
+            Ok(v) => Ok(v.get("record").cloned()),
+            Err(e) if e.to_string().contains("local.doc_not_found") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Writes one local document (it must carry `id`), replacing any old one.
+    pub async fn local_put(&self, coll: &str, doc: Value) -> Result<()> {
+        let body = json!({ "coll": { "scope": "account", "name": coll }, "docs": [doc] });
+        self.post_json("/local/upsert", body).await?;
+        Ok(())
+    }
+
+    pub async fn file_info(&self, space_id: &str, file_id: &str) -> Result<FileInfo> {
+        let v = self.get_json(&format!("/spaces/{space_id}/files/{file_id}")).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// The file's plaintext as a streaming response. Bytes not yet local are
+    /// fetched on demand (from a LAN peer or the network's read base);
+    /// `409 file.not_available` when neither can serve them yet.
+    pub async fn file_content(&self, space_id: &str, file_id: &str) -> Result<reqwest::Response> {
+        let path = format!("/spaces/{space_id}/files/{file_id}/content");
+        let resp = self
+            .http
+            .get(self.url(&path))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        if !resp.status().is_success() {
+            // Reuse the error-envelope formatting; it always bails here.
+            json_or_err(resp, &path).await?;
+            bail!("{path}: unexpected status");
+        }
+        Ok(resp)
+    }
+
     /// Marks `msg_id` and everything before it read. Returns 204 (no body).
     pub async fn mark_read(&self, space_id: &str, object_id: &str, msg_id: &str) -> Result<()> {
         let path = format!("/spaces/{space_id}/objects/{object_id}/chat/messages/{msg_id}/read");
@@ -433,6 +547,13 @@ async fn json_or_err(resp: reqwest::Response, path: &str) -> Result<Value> {
         return Ok(Value::Null);
     }
     serde_json::from_str(&text).with_context(|| format!("{path}: bad json"))
+}
+
+fn str_field(v: &Value, key: &str) -> Result<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("response has no `{key}`"))
 }
 
 fn first_line(s: &str) -> String {

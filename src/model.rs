@@ -36,6 +36,64 @@ pub fn parse_instant(v: Option<&Value>) -> Option<f64> {
     Some(dt.timestamp_millis() as f64 / 1000.0)
 }
 
+/// The body of an IRC-style action (`/me waves` → `waves`), or `None` when
+/// `text` isn't one. The wire form is the literal `/me …` text: the server has
+/// no action flag, and a client that doesn't know the convention still shows
+/// something readable.
+pub fn action_body(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("/me")?;
+    let body = rest.strip_prefix([' ', '\t'])?.trim_start();
+    (!body.is_empty()).then_some(body)
+}
+
+/// Drops CommonMark backslash escapes (`\_` → `_`) outside code spans, so
+/// text written for markdown renderers (any-ui) reads the same here.
+pub fn md_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                in_code = !in_code;
+                out.push(c);
+            }
+            '\\' if !in_code && chars.peek().is_some_and(|n| n.is_ascii_punctuation()) => {
+                out.push(chars.next().unwrap());
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The highlight words (`/hl`) that occur in `text` as whole words, case-
+/// insensitively, each as the exact substring found — so a renderer can style
+/// it where it stands.
+pub fn highlight_hits(text: &str, words: &[String]) -> Vec<String> {
+    let lower = text.to_lowercase();
+    // Lowercasing must not shift byte offsets for the slice back into `text`.
+    if lower.len() != text.len() {
+        return Vec::new();
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut hits = Vec::new();
+    for w in words.iter().filter(|w| !w.is_empty()) {
+        let w = w.to_lowercase();
+        let mut from = 0;
+        while let Some(i) = lower[from..].find(&w).map(|i| i + from) {
+            let end = i + w.len();
+            let before = lower[..i].chars().next_back().is_none_or(|c| !is_word(c));
+            let after = lower[end..].chars().next().is_none_or(|c| !is_word(c));
+            if before && after {
+                hits.push(text[i..end].to_string());
+            }
+            from = end;
+        }
+    }
+    hits
+}
+
 /// Prefix of a mention link destination (docs/19-links.md § `m`):
 /// `any://m/<spaceId>/<identity>`.
 const MENTION_URI_PREFIX: &str = "any://m/";
@@ -150,6 +208,9 @@ pub struct Chat {
     /// shows this instead of the human account that signed it.
     pub last_agent: Option<String>,
     pub last_at: f64,
+    /// A `/hl` word showed up in an unread message here (client-side, from
+    /// the preview stream; cleared once the chat is read).
+    pub hl: bool,
 }
 
 impl Chat {
@@ -205,6 +266,7 @@ impl Chat {
             last_creator: String::new(),
             last_agent: None,
             last_at: 0.0,
+            hl: false,
         })
     }
 
@@ -273,9 +335,61 @@ pub struct Message {
     pub unread_reactions: bool,
     /// (emoji, count) pairs, sorted for stable rendering.
     pub reactions: Vec<(String, usize)>,
-    /// Attachment kinds ("image", "file", …), one per attached file. Sending
-    /// attachments isn't supported yet; this is only to show they exist.
-    pub attachments: Vec<String>,
+    /// Attached files and links, in key order. Sending attachments isn't
+    /// supported; `o` / `s` open or save the ones a message carries.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One entry of a message's `attachments` map: `{type, link}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    /// "image", "file", "link", … — the sender's label, not a mime.
+    pub kind: String,
+    pub link: String,
+}
+
+/// What an attachment's `link` points at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttachmentTarget {
+    /// A files-v2 file: `any://f/<spaceId>/<fileId>` (docs/19-links.md), or
+    /// the older `any://<spaceId>/files/<fileId>`.
+    File { space_id: String, file_id: String },
+    /// An object reference (`any://o/…`) — nothing to download.
+    Object,
+    /// An ordinary web link.
+    Url(String),
+    Unknown,
+}
+
+impl Attachment {
+    pub fn target(&self) -> AttachmentTarget {
+        let link = self.link.split(['?', '#']).next().unwrap_or("");
+        let file = |sp: &str, id: &str| AttachmentTarget::File {
+            space_id: sp.to_string(),
+            file_id: id.to_string(),
+        };
+        if let Some(rest) = link.strip_prefix("any://f/") {
+            if let Some((sp, id)) = rest.split_once('/') {
+                if !sp.is_empty() && !id.is_empty() && !id.contains('/') {
+                    return file(sp, id);
+                }
+            }
+            return AttachmentTarget::Unknown;
+        }
+        if link.starts_with("any://o/") {
+            return AttachmentTarget::Object;
+        }
+        if let Some(rest) = link.strip_prefix("any://") {
+            if let [sp, "files", id] = rest.split('/').collect::<Vec<_>>().as_slice() {
+                return file(sp, id);
+            }
+            return AttachmentTarget::Unknown;
+        }
+        if link.starts_with("https://") || link.starts_with("http://") {
+            return AttachmentTarget::Url(self.link.clone());
+        }
+        AttachmentTarget::Unknown
+    }
 }
 
 impl Message {
@@ -309,17 +423,18 @@ impl Message {
             .unwrap_or_default();
         reactions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-        // {"f0": {"type": "image", "link": "any://<space>/files/<id>"}, …}
-        let attachments: Vec<String> = v
+        // {"a01": {"type": "image", "link": "any://f/<space>/<fileId>"}, …}
+        let attachments: Vec<Attachment> = v
             .get("attachments")
             .and_then(|a| a.as_object())
             .map(|obj| {
                 obj.values()
                     .map(|a| {
-                        a.get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("file")
-                            .to_string()
+                        let s = |k: &str| a.get(k).and_then(|t| t.as_str()).map(str::to_string);
+                        Attachment {
+                            kind: s("type").unwrap_or_else(|| "file".to_string()),
+                            link: s("link").unwrap_or_default(),
+                        }
                     })
                     .collect()
             })
@@ -395,9 +510,9 @@ impl Message {
         }
         let mut kinds: Vec<(String, usize)> = Vec::new();
         for a in &self.attachments {
-            match kinds.iter_mut().find(|(k, _)| k == a) {
+            match kinds.iter_mut().find(|(k, _)| *k == a.kind) {
                 Some((_, n)) => *n += 1,
-                None => kinds.push((a.clone(), 1)),
+                None => kinds.push((a.kind.clone(), 1)),
             }
         }
         kinds
@@ -565,6 +680,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn action_body_parses_me() {
+        assert_eq!(action_body("/me waves"), Some("waves"));
+        assert_eq!(action_body("/me   waves  hi"), Some("waves  hi"));
+        assert_eq!(action_body("/me"), None);
+        assert_eq!(action_body("/me "), None);
+        assert_eq!(action_body("/meow"), None);
+        assert_eq!(action_body("hi /me waves"), None);
+    }
+
+    #[test]
+    fn md_unescape_outside_code() {
+        assert_eq!(md_unescape(r"¯\\\_(ツ)\_/¯"), r"¯\_(ツ)_/¯");
+        assert_eq!(md_unescape(r"C:\Users \d"), r"C:\Users \d");
+        assert_eq!(md_unescape(r"`a\_b` c\_d"), r"`a\_b` c_d");
+    }
+
+    #[test]
+    fn highlight_whole_words_any_case() {
+        let w = vec!["rust".to_string()];
+        assert_eq!(highlight_hits("Rust and rustic, RUST.", &w), vec!["Rust", "RUST"]);
+        assert!(highlight_hits("trust", &w).is_empty());
+    }
+
     /// A working beat as the bus delivered it on 2026-09-21 (envelope verbatim
     /// minus the peer ids).
     fn working_beat() -> Value {
@@ -711,8 +850,22 @@ mod tests {
     #[test]
     fn parses_attachment_kinds() {
         let m = Message::from_record(&record_with_attachments("scr", &["image"])).unwrap();
-        assert_eq!(m.attachments, vec!["image"]);
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].kind, "image");
         assert_eq!(m.attachment_summary(), "1 image");
+    }
+
+    #[test]
+    fn attachment_targets() {
+        let t = |link: &str| Attachment { kind: "image".into(), link: link.into() }.target();
+        let file = |sp: &str, id: &str| AttachmentTarget::File { space_id: sp.into(), file_id: id.into() };
+        assert_eq!(t("any://f/sp.1/NbMAco"), file("sp.1", "NbMAco"));
+        assert_eq!(t("any://f/sp.1/NbMAco?variant=thumb"), file("sp.1", "NbMAco"));
+        assert_eq!(t("any://sp.1/files/abc"), file("sp.1", "abc"));
+        assert_eq!(t("any://o/sp.1/obj"), AttachmentTarget::Object);
+        assert_eq!(t("https://x.io/a.png"), AttachmentTarget::Url("https://x.io/a.png".into()));
+        assert_eq!(t("any://f/sp.1"), AttachmentTarget::Unknown);
+        assert_eq!(t(""), AttachmentTarget::Unknown);
     }
 
     #[test]

@@ -3,7 +3,10 @@
 A small terminal client for the chats in your [any](https://github.com/anyproto/any)
 spaces. It lists every chat in every space, streams new messages live, and lets
 you read, search, reply and talk to your [anybao](https://github.com/anyproto/anybao)
-agent from a terminal — including over ssh from a phone.
+agent from a terminal — including over ssh from a phone. It feels like an IRC
+client where it can: `/me`, `/dm` and `/msg`, `s/typo/fix/`, highlight words,
+nick colours, a compact one-line-per-message layout; and it opens or saves
+attachments on Linux and macOS.
 
 It talks only to the local `any` server's REST API (`http://127.0.0.1:7001/v1`
 by default). No SDK, no direct store access.
@@ -160,16 +163,54 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `@Name<Tab>` | complete a mention from the space's roster |
 | `/` | search messages: `Tab` cycles scope (chat → space → all), `Ctrl-t` cycles hybrid / fts / vector, `from:@name` filters by sender, `Enter` jumps to the hit |
 | `R` | mark the chat read now |
+| `D` | open a DM with the author of the message under the cursor |
+| `o` / `s` | open / save the attachments of the message under the cursor |
 | `z` | hide / show the chat list |
 | `Tab` | switch pane |
 
 The composer and the picker query support readline editing (`Ctrl-a`/`Ctrl-e`,
 `Alt-b`/`Alt-f`, `Ctrl-w`, `Ctrl-u`/`Ctrl-k`, …).
+In the composer `↑` / `↓` recall lines you sent before.
 
 Below 80 columns the app shows one pane at a time — list or chat — and the
 open chat's title becomes a `‹ Esc` breadcrumb. `--layout single|split|auto`
 overrides the width check. The bottom bar always lists unread activity in the
 chats you are *not* looking at.
+
+## Commands
+
+The composer takes IRC-style commands. An unknown `/word` is refused rather
+than sent, and `//text` sends a literal leading slash; `/usr/bin`-like text
+goes out as-is.
+
+| command | does |
+| --- | --- |
+| `/me waves` | an action, shown as `* Name waves` (sent as the literal `/me …` text, so other clients show it verbatim) |
+| `/shrug`, `/tableflip`, `/unflip` `[text]` | the text plus a face |
+| `s/old/new/` (`…/g` for all) | edit your newest message in this chat |
+| `/dm @name` or `/dm <identity>` | open (or start) a direct chat; bare `/dm` = the author under the cursor, same as `D` |
+| `/msg @name text` | send into that DM without leaving the current chat |
+| `/accept [name]` | accept an incoming DM request (the TUI announces new ones) |
+| `/join <chat>` (`/j`) | open the best fuzzy match, like `Space` |
+| `/hl [word]`, `/unhl word` | list / add / remove highlight words: others' messages containing one get the word lit up and a `★` in the list and status bar |
+| `/away [emoji]`, `/back` | show an away marker (default 💤) in your status bar |
+| `/compact` | toggle an IRC-log layout: one `HH:MM Name text` line per message, per-day dividers |
+| `/help` | the command list |
+
+Nicks get a stable colour hashed from the identity. Highlights, away,
+compact and the recall history persist in the daemon's device-local store
+(`/v1/local`, collection `any_tui`) — they don't sync to your other
+devices, and `/away` is not visible to anyone else yet.
+
+## Attachments
+
+A message's files show as `📎 name · size`, one per line. `o` downloads them
+into a cache and opens each with your default app (`xdg-open` on Linux, `open`
+on macOS); `s` saves them to your Downloads folder — never overwriting, a
+clash becomes `name (1).ext` — and shows them in the file manager (Finder, or
+whichever answers the freedesktop `FileManager1` call; else the folder opens).
+Progress shows on the attachment line and in the status bar. Web-link
+attachments open in the browser. Sending files isn't supported yet.
 
 ## Read state
 
@@ -193,7 +234,8 @@ another client should keep its badges.
   contract) and the layout of the code.
 - `scripts/api-drift.sh [url]` — diffs a running server's OpenAPI spec against
   the one pinned in `api/openapi.json`; `--update` re-pins.
-- `cargo test` — unit tests for record parsing and the fuzzy matcher.
+- `cargo test` — unit tests for record parsing, the fuzzy matcher, the
+  command parser and the attachment file handling.
 
 ## License
 

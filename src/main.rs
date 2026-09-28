@@ -5,9 +5,12 @@
 
 mod api;
 mod app;
+mod commands;
 mod edit;
+mod files;
 mod fuzzy;
 mod model;
+mod prefs;
 mod sse;
 mod ui;
 
@@ -83,6 +86,13 @@ async fn main() -> Result<()> {
         !args.no_auto_read,
         args.layout.into(),
     );
+    // Settings + composer history from the daemon's local store.
+    let loaded = prefs::load(&api).await;
+    let prefs_ok = loaded.ok;
+    app.set_loaded(loaded);
+    if !prefs_ok {
+        app.toast("local store unavailable — settings won't persist");
+    }
     for id in &identities {
         app.names.insert(id.identity.clone(), id.name.clone());
     }
@@ -94,6 +104,7 @@ async fn main() -> Result<()> {
     spawn_spaces_sub(api.clone(), tx.clone());
     // Bao's presence beats, for the status bar.
     spawn_bao_sub(api.clone(), tx.clone());
+    app.check_pending_dms();
 
     // Terminal input runs on its own blocking thread.
     {
@@ -174,7 +185,22 @@ fn handle(app: &mut App, ev: Ev) {
             app.maybe_mark_read()
         }
         Ev::BaoBeat(b) => app.apply_bao_beat(b),
-        Ev::Spaces(spaces) => app.set_spaces(spaces),
+        Ev::Spaces(spaces) => {
+            app.set_spaces(spaces);
+            // An incoming DM request lands in the spaces dataset too.
+            app.check_pending_dms();
+        }
+        Ev::OpenChat(id) => app.open_chat_id(&id),
+        Ev::PendingDms(p) => app.set_pending_dms(p),
+        Ev::FileInfo { file_id, info } => {
+            app.file_infos.insert(file_id, info);
+        }
+        Ev::Download { file_id, name, got, total } => {
+            app.downloads.insert(file_id, (name, got, total));
+        }
+        Ev::DownloadDone { file_id } => {
+            app.downloads.remove(&file_id);
+        }
         Ev::ChatsSnapshot { space_id, chats } => {
             // Replace this space's chats wholesale, keeping other spaces intact.
             let keep: Vec<String> = chats.iter().map(|c| c.object_id.clone()).collect();
@@ -345,6 +371,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Enter => app.send_input(),
             // `@name<Tab>` completes a mention from the space's roster.
             KeyCode::Tab => app.complete_mention(),
+            // Recall sent lines (commands included), shell-style.
+            KeyCode::Up => app.history_step(true),
+            KeyCode::Down => app.history_step(false),
             // Full readline editing: cursor movement, word jumps, kill keys.
             _ => {
                 edit::apply_edit_key(&mut app.input, &k, true);
@@ -431,6 +460,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
             }
         }
         KeyCode::Char('R') => app.mark_read_now(),
+        // DM the author of the message under the cursor.
+        KeyCode::Char('D') => app.dm("", None),
+        // Attachments of the message under the cursor: open / save.
+        KeyCode::Char('o') => app.attachment_action(true),
+        KeyCode::Char('s') => app.attachment_action(false),
         _ => {}
     }
 }

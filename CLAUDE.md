@@ -13,7 +13,7 @@ file is for working on the code.
 
 ```sh
 cargo build            # or --release
-cargo test             # unit tests in fuzzy.rs and model.rs
+cargo test             # unit tests in fuzzy.rs, model.rs, commands.rs
 cargo run -- --no-auto-read      # see flags below
 ```
 
@@ -86,8 +86,9 @@ strictly-bound request schemas, which the generated file cannot.
   deliberately not supported — every account is new. Verified 2026-09-21 on
   0a1eaf4 and b5be51c. Filtering on an absent path is not an error — a wrong
   leg lists ZERO chats silently. It is
-  installed by `POST /catalog/general-chat/setup` (a write, we never call
-  it); a space without it has no chat. `chat.unreadCount` /
+  installed by `POST /catalog/general-chat/setup` (a write; we call it only
+  for a DM we open or accept, never on an ordinary space); a space without
+  it has no chat. `chat.unreadCount` /
   `chat.unreadMentions` / `chat.unreadReactionsCount` on the row drive the
   badges and are absent until first materialized (treat absent as 0).
 - **Messages** live in the per-object `chat_messages` dataset
@@ -112,6 +113,30 @@ strictly-bound request schemas, which the generated file cannot.
   `@name` text pings nobody, so `send_input` rewrites `@Name` via
   `model::link_mentions` and the UI renders links back as `@Name` chips
   (`model::render_mentions`). Roster = `GET /identities` (`spaceIds`).
+- **IRC commands are client-side** (`commands.rs`, pure + tested). `/me` is a
+  convention, not a wire field: sent as the literal text `/me waves` (other
+  clients show it verbatim), rendered as `* Name waves`
+  (`model::action_body`). Unknown `/word`s are refused so a typo never goes
+  out; `//` escapes. Faces are sent markdown-escaped (any-ui renders
+  markdown: a bare `\_` eats the shrug's arm) and every display path runs
+  `model::md_unescape`. `s/a/b/` edits via `PATCH …/chat/messages/{id}`
+  `{text}`. **Test DMs only between throwaway accounts** — `/dm` on a real
+  account opens a real 1-1 on the prod network.
+- **DMs are 1-1 spaces** (`spaceType: "any.onetoone"`, named after the peer by
+  the server, already carrying a general chat). `POST /spaces/one-to-one
+  {otherIdentity}` is idempotent and returns the space (both peers derive the
+  same id); then `general-chat/setup` (idempotent, derived root) gives the
+  chat id, and `Ev::OpenChat` opens it once the space-list subscription
+  delivers it. Incoming requests are `GET /spaces?status=one_to_one_pending`
+  (re-read on every space-list change), approved by `POST
+  /spaces/{id}/one-to-one/accept`.
+- **Settings live in the local store** (`prefs.rs`; any
+  `docs/26-local-store.md`): account-scoped collection `any_tui`, docs
+  `prefs` and `history`. Device-only, never synced, not subscribe-able.
+  `PUT /local/collections` must run before any write
+  (`local.collection_not_found`); a missing doc is `404 local.doc_not_found`.
+  Load is best-effort — a daemon with `local.enabled: false` still runs the
+  client, just without persistence.
 - **Send** stamps `context: {spaceId, objectId, view}` (create-only; agents
   resolve "here" from it). A pre-2026-08 daemon would 400 on the key.
 - **`…/{msgId}/reactions-read`** clears unread reactions on one message —
@@ -176,9 +201,21 @@ strictly-bound request schemas, which the generated file cannot.
   answers. `model::derive_bao_presence` is that fold; the bar shows
   `line`, else `run.cell` (the newest tool call's ≤48-char code preview),
   else `run.title`. Verified on the wire 2026-09-21.
-- **Sending attachments is unsupported** (`ChatSendRequest` is text/reply/agent/
-  attachments and the CRDT handler rejects unknown keys). Incoming attachments
-  are shown as `📎 N images`; that's the whole feature for now.
+- **Attachments** are `{"a01": {type, link}, …}` on the record. `link` is
+  `any://f/<spaceId>/<fileId>` for a files-v2 file (older rows:
+  `any://<spaceId>/files/<fileId>`), `any://o/…` for an object, or a plain
+  `https://` URL — `model::Attachment::target` sorts them. Name/size come
+  from `GET /spaces/{sp}/files/{fileId}` (fetched once per file as messages
+  load); bytes from `…/files/{fileId}/content` (streams, `Range`, fetches
+  missing blocks on demand, `409 file.not_available` when no peer has it
+  and it isn't backed up). `files.rs` does the rest: `o` downloads into
+  `~/.cache/any-tui/files/<fileId>/` (macOS `~/Library/Caches`) and runs
+  `xdg-open` / `open`; `s` saves into the XDG download dir without
+  overwriting, then reveals the files in one window (`open -R`, or the
+  freedesktop `FileManager1.ShowItems` D-Bus call, falling back to
+  `xdg-open` on the folder). reqwest is built **without TLS** — web-link
+  attachments are handed to the browser, never fetched. **Sending**
+  attachments is still unsupported.
 
 ## Architecture
 
@@ -203,7 +240,10 @@ without a serve simply never beats):
 
 Code map: `api.rs` (REST + subscribe setup), `sse.rs` (frame parser),
 `model.rs` (`Space`/`Chat`/`Message` + record parsing, has tests), `fuzzy.rs`
-(scored subsequence matcher for the picker, has tests), `app.rs` (state, `Ev`,
+(scored subsequence matcher for the picker, has tests), `commands.rs` (composer
+command parser, has tests), `prefs.rs` (local-store settings + history),
+`files.rs` (attachment download / open / reveal, has tests),
+`app.rs` (state, `Ev`,
 picker, subscription tasks), `ui.rs` (rendering, wrapping, scroll geometry,
 layout), `main.rs` (CLI, terminal, keymap, loop).
 
