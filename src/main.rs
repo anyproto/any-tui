@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 #[derive(Parser)]
-#[command(name = "any-tui", about = "Read any chats in your terminal")]
+#[command(name = "any-tui", version, about = "Read any chats in your terminal")]
 struct Args {
     /// Base URL of the any local API.
     #[arg(long, default_value = "http://127.0.0.1:7001/v1")]
