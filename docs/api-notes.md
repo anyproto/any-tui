@@ -86,6 +86,33 @@ and size; `GET …/files/{fileId}/content` streams the plaintext (on-demand bloc
 fetch, `409 file.not_available` when unservable). Only `any://f/…` links are
 downloadable; web links go to the browser, object links are just labelled.
 
+**Search** fans `POST /spaces/{sp}/search` out over the chosen spaces
+concurrently; the "this chat" scope passes `filter: {"id": <chat>}` (matched
+against the hit's host object row) so the limit counts that chat's hits. Hits
+are enriched with one `$in` query per chat and merged by score (BM25 for fts,
+rank-based RRF for hybrid).
+
+**Chat stats, files and links.** The status bar's message count is
+`includeTotal` on a 1-row `/query`. The `F` / `L` lists come from one filtered
+query for messages with a web link (`$regex`) or an attachment (`$exists`),
+paged by `_ver.id`; web links aren't in the link index, which holds only
+`any://` references.
+
+**Whispers** are DM messages whose text opens with a link to a message in
+another chat (`any://o/<sp>/<chat>/chat_messages/<id>`). The group chat finds
+them with the account-wide `GET /v1/backlinks?target=any://o/<sp>/<chat>`
+(the per-object route only sees same-space edges), keeps edges from 1-1
+spaces, and fetches those DM messages with the usual `$in` query.
+
+**Sync status** in the status bar is `GET /spaces/{id}/sync-status` for the
+open chat's space, kept live by `GET /sync-status/subscribe` (sparse `status`
+frames, no snapshot) with a 30s re-read.
+
+**Direct peers and devices.** `GET /debug/p2p` (both p2p layers' peers, with
+`sources` marking your own devices) splits the per-space direct peers into
+other people's and your own, and gives your devices' liveness; `GET /devices`
+is the registry (names, OS, versions, the elected bao device) for `/devices`.
+
 **API drift.** `api/openapi.json` pins the daemon's served `GET /v1/openapi.json`
 (build recorded in `api/OPENAPI_PIN`); `scripts/api-drift.sh [url]` diffs a running
 daemon against it, `--file <swagger.json>` diffs the any repo's generated spec,

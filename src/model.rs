@@ -9,17 +9,524 @@ pub struct Space {
     pub name: String,
     #[serde(default)]
     pub status: String,
+    /// `any.space`, or `any.onetoone` for a DM.
+    #[serde(default, rename = "spaceType")]
+    pub space_type: String,
+    /// The space's icon, same forms as a profile's (see [`icon_glyph`]).
+    #[serde(default, rename = "iconCid", deserialize_with = "null_as_default")]
+    pub icon_cid: String,
+}
+
+impl Space {
+    pub fn is_dm(&self) -> bool {
+        self.space_type == "any.onetoone"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Identity {
     pub identity: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub name: String,
     /// Spaces this identity is a member of, when the directory knows. Used to
     /// scope `@` completion to the current space; empty means "unknown".
-    #[serde(default, rename = "spaceIds")]
+    /// The wire sends `null` for identities it knows no spaces of.
+    #[serde(default, rename = "spaceIds", deserialize_with = "null_as_default")]
     pub space_ids: Vec<String>,
+    /// The profile icon as stored: an emoji, an `icon:v2:{…}` assignment, or
+    /// a picture reference (not shown here). See [`icon_glyph`].
+    #[serde(default, rename = "iconCid", deserialize_with = "null_as_default")]
+    pub icon_cid: String,
+}
+
+/// `null` reads as the type's default, like an absent field does.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A terminal-renderable form of a stored icon, if it has one: an emoji as
+/// is, an `icon:v2:` emoji assignment's grapheme, or a pack glyph we can
+/// stand in for with a Unicode symbol. Pictures (`any://f/…`, CIDs) and
+/// unmapped glyphs give `None` — the name alone is shown then.
+pub fn icon_glyph(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(json) = raw.strip_prefix("icon:v2:") {
+        let v: Value = serde_json::from_str(json).ok()?;
+        let a = v.get("assignment")?;
+        return match a.get("kind")?.as_str()? {
+            "emoji" => a.get("grapheme")?.as_str().filter(|g| !g.is_empty()).map(str::to_string),
+            "pack" => pack_glyph(a.pointer("/ref/glyphId")?.as_str()?).map(str::to_string),
+            _ => None,
+        };
+    }
+    // A bare emoji: short and not plain ASCII (which would be a CID, a
+    // `bafy…` hash or an `any://` link — pictures, not glyphs).
+    let short = raw.chars().count() <= 8 && !raw.contains("://");
+    (short && !raw.is_ascii()).then(|| raw.to_string())
+}
+
+/// A Unicode stand-in for an icon-pack glyph id (lucide kebab-case, iconoir
+/// PascalCase). Variant words (`Solid`, `Off`, `Circle`, …) are dropped, then
+/// the id is matched exactly, then by the arrow direction or the main noun it
+/// contains. None for anything without a fair single-glyph equivalent.
+fn pack_glyph(id: &str) -> Option<&'static str> {
+    let mut key: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+    for suffix in ["solid", "filled", "outline", "fill", "off", "alt", "circle", "square", "2", "3"] {
+        if key.len() > suffix.len() + 2
+            && let Some(k) = key.strip_suffix(suffix)
+        {
+            key = k.to_string();
+        }
+    }
+    let exact = match key.as_str() {
+        "home" | "house" => "⌂",
+        "star" => "★",
+        "heart" => "♥",
+        "check" => "✓",
+        "x" | "xmark" | "cancel" => "✗",
+        "sun" => "☀",
+        "moon" | "halfmoon" => "☾",
+        "cloud" => "☁",
+        "flag" => "⚑",
+        "music" | "musicnote" => "♪",
+        "zap" | "flash" | "lightning" => "⚡",
+        "flame" | "fire" => "🔥",
+        "rocket" => "🚀",
+        "leaf" => "🍃",
+        "coffee" | "cup" => "☕",
+        "book" | "bookopen" | "openbook" => "📖",
+        "user" | "profile" => "☺",
+        "globe" | "earth" | "internet" => "🌐",
+        "code" | "codebrackets" => "⌨",
+        "terminal" => "⌘",
+        "bell" => "🔔",
+        "mail" | "envelope" => "✉",
+        "camera" => "📷",
+        "gamepad" => "🎮",
+        "anchor" => "⚓",
+        "umbrella" => "☂",
+        "snowflake" => "❄",
+        "diamond" | "gem" => "◆",
+        "triangle" => "▲",
+        "planet" => "🪐",
+        "airplane" | "plane" => "✈",
+        "inputoutput" | "repeat" | "refresh" | "sync" => "⇄",
+        "lock" => "🔒",
+        "key" => "⚷",
+        "folder" => "🗀",
+        "calendar" => "📅",
+        "clock" | "timer" => "◷",
+        "chat" | "message" | "chatbubble" => "💬",
+        "team" | "users" | "group" | "community" => "☻",
+        "sparkles" | "sparks" => "✦",
+        "lightbulb" | "bulb" => "💡",
+        "trophy" => "🏆",
+        "tree" => "🌲",
+        "flower" => "✿",
+        "car" => "🚗",
+        _ => "",
+    };
+    if !exact.is_empty() {
+        return Some(exact);
+    }
+    // Arrows by direction, diagonal first (`arrowupright` contains `arrowup`).
+    for (part, glyph) in [
+        ("upright", "↗"),
+        ("upleft", "↖"),
+        ("downright", "↘"),
+        ("downleft", "↙"),
+        ("arrowup", "↑"),
+        ("arrowdown", "↓"),
+        ("arrowleft", "←"),
+        ("arrowright", "→"),
+    ] {
+        if key.contains("arrow") && key.contains(part) {
+            return Some(glyph);
+        }
+    }
+    None
+}
+
+/// An `icon:v2` icon's colour name (`red`, `teal`, `ice`, …), when it has one.
+pub fn icon_color(raw: &str) -> Option<String> {
+    let json = raw.trim().strip_prefix("icon:v2:")?;
+    let v: Value = serde_json::from_str(json).ok()?;
+    v.get("color")?.as_str().filter(|c| !c.is_empty()).map(str::to_string)
+}
+
+/// How emoji reach the terminal (`/icons`). Terminals, tmux and mosh each
+/// keep their own character-width tables, and they disagree on emoji newer
+/// than Unicode 9 and on composed sequences (ZWJ, VS16, skin tones): the
+/// cursor drifts, text lands a column off and stale cells stay behind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EmojiMode {
+    /// Icons on; composed emoji reduced to their base, newer ones `◌`.
+    Safe,
+    /// Icons off; emoji as 2-column text stand-ins (`+1`, `<3`) or `◌`.
+    Off,
+    /// Everything as sent — for terminals that agree with each other.
+    Full,
+}
+
+impl EmojiMode {
+    pub fn parse(s: &str) -> Option<EmojiMode> {
+        match s {
+            "safe" => Some(EmojiMode::Safe),
+            "off" => Some(EmojiMode::Off),
+            "full" => Some(EmojiMode::Full),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmojiMode::Safe => "safe",
+            EmojiMode::Off => "off",
+            EmojiMode::Full => "full",
+        }
+    }
+    /// `/icons` with no argument: safe → off → full → safe.
+    pub fn next(self) -> EmojiMode {
+        match self {
+            EmojiMode::Safe => EmojiMode::Off,
+            EmojiMode::Off => EmojiMode::Full,
+            EmojiMode::Full => EmojiMode::Safe,
+        }
+    }
+}
+
+/// True for emoji added after Unicode 9 (2016) — the ones width tables
+/// disagree on. Ranges, not a per-character list: close enough, and it errs
+/// towards `◌`.
+pub fn emoji_is_new(c: char) -> bool {
+    let u = c as u32;
+    // Unicode 8/9 islands inside the supplemental block stay; the rest of
+    // it, and everything from U+1FA70, came later.
+    let old_supplemental = [
+        (0x1F910, 0x1F91E),
+        (0x1F920, 0x1F927),
+        (0x1F930, 0x1F930),
+        (0x1F933, 0x1F93E),
+        (0x1F940, 0x1F94B),
+        (0x1F950, 0x1F95E),
+        (0x1F980, 0x1F991),
+        (0x1F9C0, 0x1F9C0),
+    ];
+    match u {
+        0x1F90C..=0x1F9FF => !old_supplemental.iter().any(|&(a, b)| (a..=b).contains(&u)),
+        0x1FA70..=0x1FAFF => true,
+        0x1F6D5..=0x1F6DF | 0x1F6F7..=0x1F6FF | 0x1F7E0..=0x1F7FF => true,
+        _ => false,
+    }
+}
+
+/// A pictographic emoji, as opposed to a text symbol (`★`, `●`, `↗`).
+fn is_pictograph(c: char) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF)
+}
+
+/// Emoji the TUI itself uses as markers; `off` keeps them.
+const UI_EMOJI: [&str; 6] = ["🔒", "📎", "🔗", "✉", "💤", "✦"];
+
+/// What one screen cell's grapheme becomes under `mode`, or None to leave
+/// it. The result is never wider than the input — ratatui already laid the
+/// line out for the original width, and a narrower symbol leaves the
+/// following (blank) cell as padding.
+pub fn terminal_safe(sym: &str, mode: EmojiMode) -> Option<String> {
+    if mode == EmojiMode::Full || sym.is_ascii() {
+        return None;
+    }
+    // Composed sequences: keep the first component; drop variation
+    // selectors, skin tones, tag characters and keycap marks.
+    let base: String = sym
+        .split('\u{200D}')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|&c| {
+            !matches!(c as u32, 0xFE0E | 0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0x20E3)
+        })
+        .collect();
+    let off = mode == EmojiMode::Off && !UI_EMOJI.contains(&base.as_str());
+    let out = if let Some(t) = emoji_text(&base).filter(|_| off) {
+        t.to_string()
+    } else if (off && base.chars().any(is_pictograph)) || base.chars().any(emoji_is_new) {
+        "◌".to_string()
+    } else if base.is_empty() {
+        " ".to_string()
+    } else {
+        base
+    };
+    use unicode_width::UnicodeWidthStr;
+    (out != sym && out.width() <= sym.width().max(1)).then_some(out)
+}
+
+/// IRC-style text for the most common reaction / smiley emoji — exactly two
+/// columns, the width the emoji took.
+fn emoji_text(e: &str) -> Option<&'static str> {
+    Some(match e {
+        "👍" => "+1",
+        "👎" => "-1",
+        "❤" | "💜" | "💙" | "💚" | "🧡" | "💛" | "🖤" => "<3",
+        "😂" | "🤣" | "😆" | "😄" | "😁" | "😃" | "😀" => ":D",
+        "🙂" | "😊" | "☺" => ":)",
+        "😉" => ";)",
+        "🙁" | "☹" | "😞" | "😢" | "😭" => ":(",
+        "😮" | "😲" | "😯" => ":o",
+        "😛" | "😜" | "😝" => ":P",
+        "👀" => "oo",
+        "🙏" => "ty",
+        "🎉" => "o/",
+        "👌" => "ok",
+        "🔥" => "!!",
+        _ => return None,
+    })
+}
+
+/// How one space is syncing right now (`GET /spaces/{id}/sync-status`, and
+/// the `status` frames of `/sync-status/subscribe`). The peer counts are live
+/// connections: sync nodes, LAN peers, and internet-wide direct peers (iroh,
+/// relayed or hole-punched — any docs/30-global-p2p.md).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SyncStatus {
+    #[serde(default, rename = "spaceId")]
+    pub space_id: String,
+    /// unknown | offline | syncing | synced | error
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub synced: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default, rename = "networkPeers")]
+    pub network_peers: u64,
+    #[serde(default, rename = "localPeers")]
+    pub local_peers: u64,
+    #[serde(default, rename = "globalPeers")]
+    pub global_peers: u64,
+    /// unknown | notpossible | notconnected | connected | restricted
+    #[serde(default)]
+    pub p2p: String,
+}
+
+/// One device of your account, from the registry (`GET /devices`, any
+/// docs/23-devices.md). The registry says which devices exist, never which
+/// are online — that comes from the p2p layer ([`peer_liveness`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    pub peer_id: String,
+    pub name: String,
+    pub os: String,
+    pub version: String,
+    /// Installed app slugs (`bao`, …).
+    pub apps: Vec<String>,
+}
+
+/// The registry listing: devices, this device's peer id (`self`), and the
+/// server-computed active device per app slug (`active`).
+#[derive(Debug, Clone, Default)]
+pub struct Devices {
+    pub devices: Vec<Device>,
+    pub me: String,
+    pub active: std::collections::HashMap<String, String>,
+}
+
+impl Devices {
+    pub fn from_json(v: &Value) -> Devices {
+        let str_of = |x: &Value, k: &str| x.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let devices = v
+            .get("devices")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|d| Device {
+                        peer_id: str_of(d, "peerId"),
+                        name: str_of(d, "name"),
+                        os: str_of(d, "os"),
+                        version: str_of(d, "version"),
+                        apps: d
+                            .get("apps")
+                            .and_then(|a| a.as_object())
+                            .map(|o| o.keys().cloned().collect())
+                            .unwrap_or_default(),
+                    })
+                    .filter(|d| !d.peer_id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let active = v
+            .get("active")
+            .and_then(|a| a.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, p)| p.as_str().map(|p| (k.clone(), p.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Devices { devices, me: str_of(v, "self"), active }
+    }
+}
+
+/// How one of your own devices is reachable right now, per the p2p layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Liveness {
+    pub connected: bool,
+    /// "lan" or "p2p" — the path it's connected over (LAN preferred).
+    pub via: &'static str,
+    /// Unix seconds of the last sign of life, when the layer has one.
+    pub last_seen: Option<f64>,
+}
+
+/// Every known peer's liveness from `GET /debug/p2p`, keyed by peer id —
+/// the id the device registry uses too, so looking a registry row up here
+/// tells whether that device of yours is online. A peer in both layers is
+/// connected if either says so (LAN preferred as the path). A device not
+/// listed was never seen, or has been silent for 30 days.
+pub fn peer_liveness(v: &Value) -> std::collections::HashMap<String, Liveness> {
+    let mut out: std::collections::HashMap<String, Liveness> = std::collections::HashMap::new();
+    for (list, via) in [(v.get("peers"), "lan"), (v.pointer("/global/peers"), "p2p")] {
+        for p in list.and_then(|l| l.as_array()).into_iter().flatten() {
+            let Some(id) = p.get("peerId").and_then(|i| i.as_str()) else { continue };
+            let connected = p.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+            let seen = parse_instant(p.get("lastSeen"));
+            let l = out.entry(id.to_string()).or_insert(Liveness { connected: false, via, last_seen: None });
+            if connected && !l.connected {
+                l.connected = true;
+                l.via = via;
+            }
+            l.last_seen = match (l.last_seen, seen) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    out
+}
+
+/// Live direct peers of one space, split by whose device they are — from
+/// `GET /debug/p2p`, since the sync-status counts don't say. Your own
+/// devices find each other through the account record and sync every space,
+/// so counting them would light up every space.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DirectPeers {
+    /// Other people's devices on the local network.
+    pub lan: u64,
+    /// Other people's devices over the internet (iroh).
+    pub p2p: u64,
+    /// Your own other devices, over either.
+    pub own: u64,
+}
+
+/// Folds `/debug/p2p` into per-space [`DirectPeers`]. Both peer lists count
+/// (`peers` is the LAN layer, `global.peers` the iroh one) and a device in
+/// both counts once — as LAN when it's connected there. Only `connected`
+/// peers count; `sources` containing `account` marks your own device.
+pub fn direct_peers(v: &Value) -> std::collections::HashMap<String, DirectPeers> {
+    use std::collections::HashMap;
+    let list = |p: Option<&Value>| p.and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let connected = |p: &Value| p.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+    let id = |p: &Value| p.get("peerId").and_then(|i| i.as_str()).unwrap_or("").to_string();
+    // peerId -> (on LAN, own device, spaces)
+    let mut peers: HashMap<String, (bool, bool, Vec<String>)> = HashMap::new();
+    for (p, lan) in list(v.get("peers")).iter().map(|p| (p, true))
+        .chain(list(v.pointer("/global/peers")).iter().map(|p| (p, false)).collect::<Vec<_>>())
+    {
+        if !connected(p) || id(p).is_empty() {
+            continue;
+        }
+        let own = p
+            .get("sources")
+            .and_then(|s| s.as_array())
+            .is_some_and(|s| s.iter().any(|x| x == "account"));
+        let spaces: Vec<String> = p
+            .get("spaceIds")
+            .and_then(|s| s.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let e = peers.entry(id(p)).or_insert((false, false, Vec::new()));
+        e.0 |= lan;
+        e.1 |= own;
+        for sp in spaces {
+            if !e.2.contains(&sp) {
+                e.2.push(sp);
+            }
+        }
+    }
+    let mut out: HashMap<String, DirectPeers> = HashMap::new();
+    for (_, (lan, own, spaces)) in peers {
+        for sp in spaces {
+            let d = out.entry(sp).or_default();
+            match (own, lan) {
+                (true, _) => d.own += 1,
+                (false, true) => d.lan += 1,
+                (false, false) => d.p2p += 1,
+            }
+        }
+    }
+    out
+}
+
+impl SyncStatus {
+    /// The status-bar segment: sync state, then the paths it runs over —
+    /// `✓ 3 nodes · 1 lan · 2 p2p · 1 own`; `short` drops the words for
+    /// narrow bars. With `direct` (from `/debug/p2p`) the direct peers are
+    /// split into other people's and your own devices; without it, the
+    /// sync-status counts are shown as they are.
+    pub fn summary(&self, short: bool, direct: Option<DirectPeers>) -> String {
+        let state = match self.state.as_str() {
+            "synced" => "✓".to_string(),
+            "syncing" if self.total > 0 => format!("⟳ {}/{}", self.synced, self.total),
+            "syncing" => "⟳".to_string(),
+            "offline" => "✗ offline".to_string(),
+            "error" => "✗ sync error".to_string(),
+            _ => "?".to_string(),
+        };
+        let mut paths = Vec::new();
+        let mut path = |n: u64, long: &str, s: &str| {
+            if n > 0 {
+                paths.push(if short { format!("{s}{n}") } else { format!("{n} {long}") });
+            }
+        };
+        path(self.network_peers, "nodes", "n");
+        match direct {
+            Some(d) => {
+                path(d.lan, "lan", "l");
+                path(d.p2p, "p2p", "p");
+                path(d.own, "own", "o");
+            }
+            None => {
+                path(self.local_peers, "lan", "l");
+                path(self.global_peers, "p2p", "p");
+            }
+        }
+        // Say why direct sync can't happen, when the OS or config forbids it.
+        match self.p2p.as_str() {
+            "restricted" => paths.push("p2p blocked".into()),
+            "notpossible" if !short => paths.push("no p2p".into()),
+            _ => {}
+        }
+        if paths.is_empty() {
+            state
+        } else {
+            format!("{state} {}", paths.join(if short { " " } else { " · " }))
+        }
+    }
+}
+
+/// How many leading characters of an identity stand for it on screen.
+pub const SHORT_ID_LEN: usize = 7;
+
+/// The on-screen short form of an identity: its first [`SHORT_ID_LEN`]
+/// characters. Shown for people with no known name, and in brackets after
+/// a name so two people with the same name stay apart.
+pub fn short_id(identity: &str) -> String {
+    identity.chars().take(SHORT_ID_LEN).collect()
 }
 
 /// Reads a server timestamp as unix seconds. The wire shape is an instant,
@@ -71,6 +578,12 @@ pub fn md_unescape(text: &str) -> String {
 /// insensitively, each as the exact substring found — so a renderer can style
 /// it where it stands.
 pub fn highlight_hits(text: &str, words: &[String]) -> Vec<String> {
+    find_ci(text, words, true)
+}
+
+/// Every case-insensitive occurrence of `words` in `text`, as the exact
+/// substrings found; `whole_word` requires word boundaries on both sides.
+pub fn find_ci(text: &str, words: &[String], whole_word: bool) -> Vec<String> {
     let lower = text.to_lowercase();
     // Lowercasing must not shift byte offsets for the slice back into `text`.
     if lower.len() != text.len() {
@@ -85,13 +598,104 @@ pub fn highlight_hits(text: &str, words: &[String]) -> Vec<String> {
             let end = i + w.len();
             let before = lower[..i].chars().next_back().is_none_or(|c| !is_word(c));
             let after = lower[end..].chars().next().is_none_or(|c| !is_word(c));
-            if before && after {
+            if !whole_word || (before && after) {
                 hits.push(text[i..end].to_string());
             }
             from = end;
         }
     }
     hits
+}
+
+/// Web links (`http://…`, `https://…`) in message text, in order, as
+/// written. A URL ends at whitespace, a markdown link's `)`, `<>"'` or a
+/// closing bracket; trailing sentence punctuation and an unbalanced `)` are
+/// not part of it.
+pub fn extract_urls(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = ["https://", "http://"].iter().filter_map(|p| rest.find(p)).min() {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | ']' | '`'))
+            .unwrap_or(tail.len());
+        let mut url = &tail[..end];
+        loop {
+            let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            // A `)` belongs to the URL only when it closes one opened inside it
+            // (wikipedia-style); otherwise it closes the markdown link.
+            let trimmed = if trimmed.ends_with(')') && trimmed.matches('(').count() < trimmed.matches(')').count() {
+                &trimmed[..trimmed.len() - 1]
+            } else {
+                trimmed
+            };
+            if trimmed.len() == url.len() {
+                break;
+            }
+            url = trimmed;
+        }
+        if url.len() > "https://".len() {
+            out.push(url.to_string());
+        }
+        rest = &tail[end.max(1)..];
+    }
+    out
+}
+
+/// The canonical link to one chat message (docs/19-links.md, kind `o`).
+pub fn message_uri(space_id: &str, chat_id: &str, msg_id: &str) -> String {
+    format!("any://o/{space_id}/{chat_id}/chat_messages/{msg_id}")
+}
+
+/// A whisper: a DM message about a message in another chat. On the wire it
+/// is ordinary DM text that opens with a link to that message,
+/// `[↪ Anna: shall we…](any://o/<sp>/<chat>/chat_messages/<id>) text` —
+/// readable in any client, indexed as a link edge, and private because it
+/// lives in the 1-1 space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Whisper {
+    /// The quote in the link text (`↪ Anna: shall we…`).
+    pub label: String,
+    pub space_id: String,
+    pub chat_id: String,
+    pub msg_id: String,
+    pub body: String,
+}
+
+/// Builds a whisper's text. The label is flattened to one short line with
+/// no brackets, so it can't break the link.
+pub fn whisper_text(label: &str, space_id: &str, chat_id: &str, msg_id: &str, body: &str) -> String {
+    let flat: String = label
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !matches!(c, '[' | ']' | '\\'))
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = if flat.chars().count() > 60 {
+        format!("{}…", flat.chars().take(59).collect::<String>())
+    } else {
+        flat
+    };
+    format!("[{label}]({}) {body}", message_uri(space_id, chat_id, msg_id))
+}
+
+pub fn parse_whisper(text: &str) -> Option<Whisper> {
+    let rest = text.strip_prefix('[')?;
+    let close = rest.find("](")?;
+    let label = &rest[..close];
+    let after = &rest[close + 2..];
+    let end = after.find(')')?;
+    let uri = after[..end].strip_prefix("any://o/")?;
+    let [space_id, chat_id, "chat_messages", msg_id] = uri.split('/').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    Some(Whisper {
+        label: label.to_string(),
+        space_id: space_id.to_string(),
+        chat_id: chat_id.to_string(),
+        msg_id: msg_id.to_string(),
+        body: after[end + 1..].trim_start().to_string(),
+    })
 }
 
 /// Prefix of a mention link destination (docs/19-links.md § `m`):
@@ -531,6 +1135,9 @@ impl Message {
     /// What to show in a one-line preview. An image-only message has no text,
     /// so fall back to describing the attachments rather than showing nothing.
     pub fn preview_text(&self) -> String {
+        if let Some(w) = parse_whisper(&self.text) {
+            return format!("🔒 {}", w.body);
+        }
         if !self.text.trim().is_empty() {
             return self.text.clone();
         }
@@ -698,10 +1305,155 @@ mod tests {
     }
 
     #[test]
+    fn identities_tolerate_nulls() {
+        let id: Identity = serde_json::from_value(json!({
+            "identity": "A1", "name": "Anna", "spaceIds": null, "iconCid": null
+        }))
+        .unwrap();
+        assert_eq!((id.name.as_str(), id.space_ids.len(), id.icon_cid.as_str()), ("Anna", 0, ""));
+    }
+
+    #[test]
+    fn sync_summary() {
+        let st: SyncStatus = serde_json::from_value(json!({
+            "spaceId": "sp", "state": "synced", "synced": 5, "total": 5,
+            "networkPeers": 3, "localPeers": 0, "globalPeers": 1, "p2p": "connected"
+        }))
+        .unwrap();
+        assert_eq!(st.summary(false, None), "✓ 3 nodes · 1 p2p");
+        assert_eq!(st.summary(true, None), "✓ n3 p1");
+        let d = DirectPeers { lan: 0, p2p: 2, own: 1 };
+        assert_eq!(st.summary(false, Some(d)), "✓ 3 nodes · 2 p2p · 1 own");
+        let st = SyncStatus { state: "syncing".into(), synced: 1, total: 3, p2p: "restricted".into(), ..Default::default() };
+        assert_eq!(st.summary(false, None), "⟳ 1/3 p2p blocked");
+    }
+
+    #[test]
+    fn devices_and_liveness() {
+        let d = Devices::from_json(&json!({
+            "self": "P1",
+            "active": {"bao": "P2"},
+            "devices": [
+                {"peerId": "P1", "name": "x32", "os": "linux", "version": "v1", "apps": {"bao": {}}},
+                {"peerId": "P2", "name": "Air", "os": "darwin", "version": "v2", "apps": {"bao": {}}},
+            ]
+        }));
+        assert_eq!((d.me.as_str(), d.active["bao"].as_str(), d.devices.len()), ("P1", "P2", 2));
+        assert_eq!(d.devices[1].apps, vec!["bao"]);
+        let live = peer_liveness(&json!({
+            "peers": [{"peerId": "P2", "connected": false, "lastSeen": {"$date": "2026-09-29T00:00:00Z"}}],
+            "global": {"peers": [{"peerId": "P2", "connected": true, "sources": ["account"], "lastSeen": "2026-09-29T01:00:00Z"}]}
+        }));
+        assert!(live["P2"].connected);
+        assert_eq!(live["P2"].via, "p2p");
+        assert_eq!(live["P2"].last_seen, Some(1790643600.0));
+    }
+
+    #[test]
+    fn direct_peers_split_own_devices() {
+        // The /debug/p2p shape as `any` serves it (2026-09-29).
+        let v = json!({
+            "peers": [
+                {"peerId": "L1", "connected": true, "sources": ["lan", "global"], "spaceIds": ["s1"]},
+            ],
+            "global": { "peers": [
+                {"peerId": "ME", "connected": true, "sources": ["global", "account"], "spaceIds": ["s1", "s2"]},
+                {"peerId": "G1", "connected": true, "sources": ["global"], "spaceIds": ["s1"]},
+                {"peerId": "L1", "connected": true, "sources": ["lan", "global"], "spaceIds": ["s1"]},
+                {"peerId": "OLD", "connected": false, "sources": ["global"], "spaceIds": ["s2"]},
+            ]}
+        });
+        let d = direct_peers(&v);
+        assert_eq!(d["s1"], DirectPeers { lan: 1, p2p: 1, own: 1 });
+        // s2: only your own device is live — no one else's.
+        assert_eq!(d["s2"], DirectPeers { lan: 0, p2p: 0, own: 1 });
+    }
+
+    #[test]
+    fn emoji_modes() {
+        use EmojiMode::*;
+        // Old emoji pass; newer ones become ◌ in safe mode.
+        assert_eq!(terminal_safe("🌀", Safe), None);
+        assert_eq!(terminal_safe("🧉", Safe).as_deref(), Some("◌"));
+        assert_eq!(terminal_safe("🪐", Safe).as_deref(), Some("◌"));
+        assert_eq!(terminal_safe("🤡", Safe), None);
+        // Composed: the base is kept, the rest dropped.
+        assert_eq!(terminal_safe("🤦\u{200D}♀\u{FE0F}", Safe).as_deref(), Some("🤦"));
+        assert_eq!(terminal_safe("❤\u{FE0F}", Safe).as_deref(), Some("❤"));
+        assert_eq!(terminal_safe("👍\u{1F3FD}", Safe).as_deref(), Some("👍"));
+        // Off: 2-column text for the common ones, UI markers kept, symbols kept.
+        assert_eq!(terminal_safe("👍", Off).as_deref(), Some("+1"));
+        assert_eq!(terminal_safe("❤\u{FE0F}", Off).as_deref(), Some("<3"));
+        assert_eq!(terminal_safe("🌀", Off).as_deref(), Some("◌"));
+        assert_eq!(terminal_safe("🔒", Off), None);
+        assert_eq!(terminal_safe("★", Off), None);
+        // Full: untouched.
+        assert_eq!(terminal_safe("🧉", Full), None);
+        assert_eq!(terminal_safe("a", Safe), None);
+    }
+
+    #[test]
+    fn icons() {
+        assert_eq!(icon_glyph("🧉").as_deref(), Some("🧉"));
+        assert_eq!(icon_glyph(" "), None);
+        assert_eq!(
+            icon_glyph(r#"icon:v2:{"assignment":{"kind":"emoji","grapheme":"🎨"}}"#).as_deref(),
+            Some("🎨")
+        );
+        assert_eq!(
+            icon_glyph(r#"icon:v2:{"assignment":{"kind":"pack","ref":{"packId":"io.anyproto.iconoir","glyphId":"Home"}},"color":"blue"}"#).as_deref(),
+            Some("⌂")
+        );
+        assert_eq!(
+            icon_glyph(r#"icon:v2:{"assignment":{"kind":"pack","ref":{"packId":"io.anyproto.lucide","glyphId":"a-arrow-down"}}}"#).as_deref(),
+            Some("↓")
+        );
+        let pack = |g: &str| icon_glyph(&format!(r#"icon:v2:{{"assignment":{{"kind":"pack","ref":{{"packId":"p","glyphId":"{g}"}}}}}}"#));
+        assert_eq!(pack("PlanetSolid").as_deref(), Some("🪐"));
+        assert_eq!(pack("AirplaneOff").as_deref(), Some("✈"));
+        assert_eq!(pack("InputOutput").as_deref(), Some("⇄"));
+        assert_eq!(pack("ArrowUpRightCircleSolid").as_deref(), Some("↗"));
+        assert_eq!(pack("SomethingObscure"), None);
+        assert_eq!(icon_color(r#"icon:v2:{"assignment":{},"color":"teal"}"#).as_deref(), Some("teal"));
+        // Pictures aren't glyphs.
+        assert_eq!(icon_glyph("bafybeieiihixnxabsiacbqxkauywlsbqamrsi6s5lw5rpvyhoycvikz43u"), None);
+        assert_eq!(icon_glyph("any://f/sp/file1"), None);
+    }
+
+    #[test]
+    fn whisper_round_trip() {
+        let t = whisper_text("↪ Anna: shall we [ship]\nfriday?", "sp.1", "chat1", "m1", "honestly no");
+        assert_eq!(t, "[↪ Anna: shall we ship friday?](any://o/sp.1/chat1/chat_messages/m1) honestly no");
+        let w = parse_whisper(&t).unwrap();
+        assert_eq!((w.space_id.as_str(), w.chat_id.as_str(), w.msg_id.as_str()), ("sp.1", "chat1", "m1"));
+        assert_eq!(w.body, "honestly no");
+        assert_eq!(w.label, "↪ Anna: shall we ship friday?");
+        // A mention link or an object link is not a whisper.
+        assert!(parse_whisper("[Anna](any://m/sp/A1) hi").is_none());
+        assert!(parse_whisper("[x](any://o/sp/obj) hi").is_none());
+        assert!(parse_whisper("plain").is_none());
+    }
+
+    #[test]
+    fn urls_in_text() {
+        assert_eq!(
+            extract_urls("see https://a.io/x, and (https://b.io/y). [t](https://c.io/z)"),
+            vec!["https://a.io/x", "https://b.io/y", "https://c.io/z"]
+        );
+        assert_eq!(
+            extract_urls("https://en.wikipedia.org/wiki/Rust_(language)!"),
+            vec!["https://en.wikipedia.org/wiki/Rust_(language)"]
+        );
+        assert_eq!(extract_urls("http:// nothing https://"), Vec::<String>::new());
+        assert_eq!(extract_urls("<http://x.io/a>"), vec!["http://x.io/a"]);
+    }
+
+    #[test]
     fn highlight_whole_words_any_case() {
         let w = vec!["rust".to_string()];
         assert_eq!(highlight_hits("Rust and rustic, RUST.", &w), vec!["Rust", "RUST"]);
         assert!(highlight_hits("trust", &w).is_empty());
+        assert_eq!(find_ci("Trust me", &w, false), vec!["rust"]);
     }
 
     /// A working beat as the bus delivered it on 2026-09-21 (envelope verbatim

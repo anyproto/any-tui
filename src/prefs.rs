@@ -20,12 +20,26 @@ pub struct Prefs {
     /// `/hl` words: a message containing one reads like a mention.
     #[serde(default)]
     pub highlights: Vec<String>,
-    /// `/away` marker shown after your own name; `None` when back.
+    /// `/away` marker shown in the status bar; `None` when back.
     #[serde(default)]
     pub away: Option<String>,
     /// `/compact`: one line per message, IRC-log style.
     #[serde(default)]
     pub compact: bool,
+    /// `/icons`: `safe` | `off` | `full` (see `model::EmojiMode`); empty on
+    /// prefs written before the modes existed.
+    #[serde(default)]
+    pub icons: String,
+    /// The old on/off switch; still read so `off` carries over.
+    #[serde(default)]
+    pub hide_icons: bool,
+}
+
+impl Prefs {
+    pub fn emoji_mode(&self) -> crate::model::EmojiMode {
+        use crate::model::EmojiMode;
+        EmojiMode::parse(&self.icons).unwrap_or(if self.hide_icons { EmojiMode::Off } else { EmojiMode::Safe })
+    }
 }
 
 pub struct Loaded {

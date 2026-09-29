@@ -1,12 +1,13 @@
-use crate::app::{App, Focus, Mode, SearchScope};
-use crate::model::{BaoPresence, action_body, highlight_hits, md_unescape, render_mentions};
+use crate::app::{App, Focus, GalleryKind, Mode, SearchMode, SearchOrder, SearchScope};
+use crate::model::Liveness;
+use crate::model::{BaoPresence, action_body, find_ci, highlight_hits, md_unescape, parse_whisper, render_mentions};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
@@ -25,6 +26,11 @@ const ME: Color = Color::Green;
 /// Agent-authored messages get their own hue and a `✦` marker, since they're
 /// signed by the human account and would otherwise read as that person.
 const AGENT: Color = Color::LightBlue;
+/// Direct-sync badges (LAN / iroh p2p) on the chat list.
+const P2P: Color = Color::Indexed(114);
+/// Whispers — private notes about a message, carried in a DM — sit on a
+/// dark red band.
+const WHISPER_BG: Color = Color::Indexed(88);
 
 /// The author label + colour for a message: the agent's name when
 /// agent-authored (never the human that signed it), otherwise the sender.
@@ -39,9 +45,24 @@ fn author_label(app: &App, m: &crate::model::Message) -> (String, Color) {
 /// the identity, IRC-client style, so the same person keeps the same colour
 /// across chats and restarts.
 fn person_label(app: &App, identity: &str) -> (String, Color) {
-    let name = app.display_name(identity);
     let color = if identity == app.me { ME } else { nick_color(identity) };
-    (name, color)
+    (iconed_name(app, identity, app.display_name(identity)), color)
+}
+
+/// `(A7hQ66M)` — the start of a named person's identity, shown after the name so
+/// two people who picked the same name stay apart. None for agents (their
+/// name is theirs) and for people shown by id already (no name known).
+fn id_tag(app: &App, m_agent: bool, identity: &str) -> Option<String> {
+    let named = app.names.get(identity).is_some_and(|n| !n.is_empty());
+    (!m_agent && named).then(|| format!("({})", crate::model::short_id(identity)))
+}
+
+/// `🧉 Name` when the person's profile icon renders in a terminal.
+fn iconed_name(app: &App, identity: &str, name: String) -> String {
+    match app.member_icon(identity) {
+        Some(icon) => format!("{icon} {name}"),
+        None => name,
+    }
 }
 
 /// 256-colour picks that read on dark and light terminals and stay clear of
@@ -72,7 +93,7 @@ fn nick_color(identity: &str) -> Color {
 fn preview_sender(app: &App, chat: &crate::model::Chat) -> String {
     match &chat.last_agent {
         Some(name) => format!("✦ {}", short_name(name)),
-        None => short_name(&app.display_name(&chat.last_creator)),
+        None => iconed_name(app, &chat.last_creator, short_name(&app.display_name(&chat.last_creator))),
     }
 }
 
@@ -91,6 +112,26 @@ fn speaker_key(m: &crate::model::Message) -> String {
     match &m.agent {
         Some(a) => format!("agent:{}", a.name),
         None => m.creator.clone(),
+    }
+}
+
+/// The last pass over a finished frame: every cell's grapheme made safe for
+/// the terminal under the `/icons` mode (`model::terminal_safe`). Done on the
+/// buffer, after layout, so widths ratatui already allotted never change —
+/// the terminal just never receives a character its width table disagrees
+/// on.
+pub fn sanitize(buf: &mut ratatui::buffer::Buffer, mode: crate::model::EmojiMode) {
+    if mode == crate::model::EmojiMode::Full {
+        return;
+    }
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if let Some(safe) = crate::model::terminal_safe(cell.symbol(), mode) {
+                cell.set_symbol(&safe);
+            }
+        }
     }
 }
 
@@ -120,8 +161,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.picker.is_some() {
         draw_picker(f, app, f.area());
     }
+    if app.devices_view.is_some() {
+        draw_devices(f, f.area(), app);
+    }
     if app.show_help {
-        draw_help(f, f.area(), &app.version);
+        draw_help(f, f.area(), app);
     }
 }
 
@@ -252,7 +296,7 @@ fn focus_style(active: bool) -> Style {
     }
 }
 
-fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
+fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let total = app.total_unread();
     let title = if total > 0 {
@@ -267,19 +311,45 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.sidebar_h = inner.height as usize;
+    let app: &App = app;
 
     let mut lines: Vec<Line> = Vec::new();
     let mut last_space = String::new();
+    let width = inner.width as usize;
+    let compact = app.prefs.compact;
+    // Compact rows name the chat only where a space has more than one.
+    let mut per_space: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in &app.chats {
+        *per_space.entry(c.space_id.as_str()).or_default() += 1;
+    }
     // Chats arrive grouped by space, so a header emits on each space change.
     for (i, chat) in app.chats.iter().enumerate() {
-        if chat.space_id != last_space {
+        // How this space reaches other people's devices: `lan` (mDNS) and/or
+        // `p2p` (direct over iroh), `✗` when the space is offline.
+        let sync = app
+            .sync
+            .get(&chat.space_id)
+            .map(|st| sync_badge(st, app.direct_for(&chat.space_id)))
+            .unwrap_or_default();
+        let sync_style = Style::default().fg(if sync.starts_with('✗') { Color::Red } else { P2P });
+        let (icon, icon_style) = match app.space_icon(&chat.space_id) {
+            Some((g, c)) => (format!("{g} "), Style::default().fg(icon_palette(c.as_deref()))),
+            None => (String::new(), Style::default()),
+        };
+
+        if !compact && chat.space_id != last_space {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                truncate(&chat.space_name, inner.width as usize),
-                Style::default().fg(Color::White).bold(),
-            )));
+            let name = truncate(&chat.space_name, width.saturating_sub(icon.width() + sync.width() + 1));
+            let pad = width.saturating_sub(icon.width() + name.width() + sync.width());
+            lines.push(Line::from(vec![
+                Span::styled(icon.clone(), icon_style),
+                Span::styled(name, Style::default().fg(Color::White).bold()),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(sync.clone(), sync_style),
+            ]));
             last_space = chat.space_id.clone();
         }
 
@@ -312,22 +382,40 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             (false, false) => Style::default().fg(Color::Gray),
         };
 
-        let width = inner.width as usize;
-        let label = truncate(chat.label(), width.saturating_sub(4 + badge.width()));
-        let pad = width.saturating_sub(2 + label.width() + badge.width() + 1);
+        // Compact: one row per chat, `● 🧉 Gustavo   p2p 2`. Otherwise the
+        // chat's own row under its space header, then a preview line.
+        let (label, right) = if compact {
+            let label = if per_space.get(chat.space_id.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{}/{}", chat.space_name, chat.label())
+            } else {
+                chat.space_name.clone()
+            };
+            let right = if sync.is_empty() { String::new() } else { format!(" {sync}") };
+            (label, right)
+        } else {
+            (chat.label().to_string(), String::new())
+        };
+        let row_icon = if compact { icon.clone() } else { String::new() };
+        let label = truncate(&label, width.saturating_sub(4 + row_icon.width() + right.width() + badge.width()));
+        let pad = width.saturating_sub(2 + row_icon.width() + label.width() + right.width() + badge.width() + 1);
         let mut spans = vec![
             Span::styled(
                 if selected { "▌" } else { " " },
                 Style::default().fg(if selected { ACCENT } else { Color::Reset }),
             ),
             Span::styled(format!("{marker} "), name_style),
+            Span::styled(row_icon, icon_style),
             Span::styled(label, name_style),
             Span::raw(" ".repeat(pad)),
+            Span::styled(right, sync_style),
         ];
         if !badge.is_empty() {
             spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
         }
         lines.push(Line::from(spans));
+        if compact {
+            continue;
+        }
 
         // Preview line: several chats per space share the name "general", so
         // this is what actually distinguishes them.
@@ -352,7 +440,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Scroll just enough to keep the selected row (and its preview) on screen.
-    let sel_line = selected_line_index(app) + 1;
+    let sel_line = selected_line_index(app) + usize::from(!app.prefs.compact);
     let h = inner.height as usize;
     let offset = sel_line.saturating_sub(h.saturating_sub(1));
     f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
@@ -361,6 +449,10 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 /// Line index of the selected chat's title row, accounting for space headers,
 /// blank spacers and the per-chat preview line.
 fn selected_line_index(app: &App) -> usize {
+    // Compact: one row per chat, nothing else.
+    if app.prefs.compact {
+        return app.sel;
+    }
     let mut idx = 0usize;
     let mut last_space = String::new();
     for (i, chat) in app.chats.iter().enumerate() {
@@ -384,6 +476,10 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     // slot at the bottom (see draw_search_view).
     if app.search.is_some() {
         draw_search_view(f, app, area);
+        return;
+    }
+    if app.gallery.is_some() {
+        draw_gallery(f, app, area);
         return;
     }
     let input_h = input_height(app, area.width);
@@ -410,6 +506,8 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.view_lines = lines.len();
     app.view_height = inner.height as usize;
+    // Messages are one line apart; count that gap into each one's height.
+    app.msg_heights = ranges.iter().map(|(id, s0, e0)| (id.clone(), e0 - s0 + 1)).collect();
     let h = (inner.height as usize).max(1);
 
     // The viewport follows the message cursor: nudge the offset just enough to
@@ -449,17 +547,31 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_search_view(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
 
+    let (scope_title, mode_title) = search_titles(app);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(focus_style(true))
-        .title(" search ")
-        .title_alignment(Alignment::Left);
+        .title(scope_title)
+        .title(mode_title.right_aligned());
     let inner = block.inner(rows[0]);
     f.render_widget(block, rows[0]);
 
-    let (lines, ranges) = render_search_results(app, inner.width as usize);
+    let (mut lines, mut ranges) = render_search_results(app, inner.width as usize);
     let h = (inner.height as usize).max(1);
+    app.search_view_h = h;
+    app.search_heights = ranges.iter().map(|(id, s0, e0)| (id.clone(), e0 - s0 + 1)).collect();
+    // Results sit against the prompt, where the cursor starts (fzf-style);
+    // the tips on an empty query stay at the top.
+    let has_results = app.search.as_ref().is_some_and(|s| !s.results.is_empty());
+    if has_results && lines.len() < h {
+        let pad = h - lines.len();
+        lines.splice(0..0, std::iter::repeat_n(Line::from(""), pad));
+        for r in &mut ranges {
+            r.1 += pad;
+            r.2 += pad;
+        }
+    }
     let sel = app.search.as_ref().and_then(|s| s.sel.clone());
     let mut scroll = app.search.as_ref().map(|s| s.scroll).unwrap_or(0);
     if let Some(id) = &sel {
@@ -492,29 +604,252 @@ fn draw_search_view(f: &mut Frame, app: &mut App, area: Rect) {
     draw_search_query(f, app, rows[1]);
 }
 
+/// The open chat's files or links (`F` / `L`), newest first: one entry per
+/// file or link with who sent it and when, and a line of the message it came
+/// in. Replaces the message pane like the search view does.
+fn draw_gallery(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(g) = &app.gallery else { return };
+    let (kind, sel_idx) = (g.kind, g.sel);
+    let on = Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(DIM);
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!(" 📎 files {} ", app.files.len()), if kind == GalleryKind::Files { on } else { off }),
+        Span::styled("│", off),
+        Span::styled(format!(" 🔗 links {} ", app.links.len()), if kind == GalleryKind::Links { on } else { off }),
+        Span::raw(" "),
+    ]);
+    let hint = match kind {
+        GalleryKind::Files => " Enter message · o open · s save · Tab links · Esc ",
+        GalleryKind::Links => " Enter message · o open · Tab files · Esc ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_style(true))
+        .title(title)
+        .title_bottom(Line::from(Span::styled(hint, off)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let items = app.gallery_items();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_range = (0, 0);
+    if items.is_empty() {
+        let what = if kind == GalleryKind::Files { "files" } else { "links" };
+        let msg = if app.msg_total.is_none() {
+            "  loading…".to_string()
+        } else {
+            format!("  no {what} in this chat")
+        };
+        lines.push(Line::from(Span::styled(msg, off)));
+    }
+    for (i, it) in items.iter().enumerate() {
+        let selected = i == sel_idx;
+        let (who, color) = match &it.agent {
+            Some(n) => (format!("✦ {n}"), AGENT),
+            None => person_label(app, &it.creator),
+        };
+        let who = match id_tag(app, it.agent.is_some(), &it.creator) {
+            Some(t) => format!("{who} {t}"),
+            None => who,
+        };
+        let meta = format!("  {who} · {}", fmt_time(it.created_at));
+        let label = match &it.target {
+            crate::model::AttachmentTarget::File { file_id, .. } => match app.file_infos.get(file_id) {
+                Some(info) if !info.name.is_empty() => {
+                    format!("📎 {} · {}", info.name, crate::files::human_size(info.size))
+                }
+                _ => "📎 file".to_string(),
+            },
+            crate::model::AttachmentTarget::Object => "🔗 linked object".to_string(),
+            _ => format!("🔗 {}", it.link.trim_start_matches("https://").trim_start_matches("http://")),
+        };
+        let label_w = width.saturating_sub(meta.width() + 3).max(12);
+        let label = truncate(&label, label_w);
+        let pad = width.saturating_sub(2 + label.width() + meta.width());
+        let start = lines.len();
+        let mut head = vec![
+            Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(ACCENT)),
+            Span::styled(
+                label,
+                if selected {
+                    Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Blue)
+                },
+            ),
+            Span::raw(" ".repeat(pad)),
+        ];
+        head.push(Span::styled(format!("  {who}"), Style::default().fg(color)));
+        head.push(Span::styled(format!(" · {}", fmt_time(it.created_at)), off));
+        lines.push(Line::from(head));
+        // The message it came in, minus the link itself when that's all.
+        let preview = one_line(&it.text, width.saturating_sub(6));
+        if !preview.trim().is_empty() && preview.trim() != it.link {
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(ACCENT)),
+                Span::styled(format!("  ↳ {preview}"), off),
+            ]));
+        }
+        if selected {
+            sel_range = (start, lines.len());
+        }
+    }
+
+    // Keep the cursor's entry on screen.
+    let h = (inner.height as usize).max(1);
+    app.gallery_view_h = h;
+    let mut scroll = app.gallery.as_ref().map_or(0, |g| g.scroll);
+    if sel_range.0 < scroll {
+        scroll = sel_range.0;
+    } else if sel_range.1 > scroll + h {
+        scroll = sel_range.1 - h;
+    }
+    scroll = scroll.min(lines.len().saturating_sub(h));
+    if let Some(g) = &mut app.gallery {
+        g.scroll = scroll;
+    }
+    let end = (scroll + h).min(lines.len());
+    f.render_widget(Paragraph::new(lines[scroll..end].to_vec()), inner);
+}
+
+/// An `icon:v2` colour name (any-ui's icon palette) as a terminal colour.
+/// Emoji carry their own colours; an unnamed colour leaves the glyph plain.
+fn icon_palette(name: Option<&str>) -> Color {
+    match name {
+        Some("yellow") => Color::Indexed(178),
+        Some("orange") => Color::Indexed(208),
+        Some("red") => Color::Indexed(167),
+        Some("pink") => Color::Indexed(211),
+        Some("purple") => Color::Indexed(141),
+        Some("blue") => Color::Indexed(75),
+        Some("ice") => Color::Indexed(117),
+        Some("teal") => Color::Indexed(37),
+        Some("green") => Color::Indexed(71),
+        _ => Color::Reset,
+    }
+}
+
+/// The sidebar's per-space path badge: `lan`, `p2p`, `lan p2p`, or `✗`.
+/// Only other people's devices count when we can tell (`direct`): your own
+/// devices sync every space, so they'd badge them all.
+fn sync_badge(st: &crate::model::SyncStatus, direct: Option<crate::model::DirectPeers>) -> String {
+    if matches!(st.state.as_str(), "offline" | "error") {
+        return "✗".to_string();
+    }
+    let (lan, p2p) = match direct {
+        Some(d) => (d.lan, d.p2p),
+        None => (st.local_peers, st.global_peers),
+    };
+    let mut parts = Vec::new();
+    if lan > 0 {
+        parts.push("lan");
+    }
+    if p2p > 0 {
+        parts.push("p2p");
+    }
+    parts.join(" ")
+}
+
+/// The search view's two border titles, as segmented controls: where
+/// (`this chat │ space │ all spaces`, Tab) and how (`hybrid │ fts`, Ctrl-t,
+/// plus `semantic` while Ctrl-g has it on) with the order (Ctrl-o).
+fn search_titles(app: &App) -> (Line<'static>, Line<'static>) {
+    let Some(s) = &app.search else {
+        return (Line::from(" search "), Line::from(""));
+    };
+    let on = Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(DIM);
+    let seg = |label: &str, active: bool| Span::styled(format!(" {label} "), if active { on } else { off });
+    let bar = || Span::styled("│", off);
+
+    let chat = app.active_chat().map(|c| c.label().to_string()).unwrap_or_else(|| "chat".into());
+    let space = app.active_chat().map(|c| c.space_name.clone()).unwrap_or_else(|| "space".into());
+    let scope = Line::from(vec![
+        Span::raw(" "),
+        seg(&format!("⌕ {}", truncate(&chat, 18)), s.scope == SearchScope::Chat),
+        bar(),
+        seg(&truncate(&space, 18), s.scope == SearchScope::Space),
+        bar(),
+        seg("all spaces", s.scope == SearchScope::AllSpaces),
+        Span::raw(" "),
+    ]);
+
+    let mut mode = vec![
+        Span::raw(" "),
+        seg("hybrid", s.mode == SearchMode::Hybrid),
+        bar(),
+        seg("fts", s.mode == SearchMode::Fts),
+    ];
+    if s.mode == SearchMode::Vector {
+        mode.push(bar());
+        mode.push(seg("semantic", true));
+    }
+    mode.push(Span::styled(
+        match s.order {
+            SearchOrder::Best => "  best first ",
+            SearchOrder::Newest => "  newest first ",
+        },
+        off,
+    ));
+    (scope, Line::from(mode))
+}
+
+/// Lines of one hit shown when it isn't under the cursor; the selected one
+/// opens up to `SEL_HIT_LINES`.
+const HIT_LINES: usize = 3;
+const SEL_HIT_LINES: usize = 12;
+
 fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges: MsgRanges = Vec::new();
     let Some(s) = &app.search else {
         return (lines, ranges);
     };
+    let dim = Style::default().fg(DIM);
+    let where_ = match s.scope {
+        SearchScope::Chat => "this chat",
+        SearchScope::Space => "this space",
+        SearchScope::AllSpaces => "all spaces",
+    };
 
-    if s.query.value().trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  type to search messages",
-            Style::default().fg(DIM),
-        )));
+    let query = crate::app::search_terms(s.query.value());
+    if query.is_empty() {
+        lines.push(Line::from(Span::styled(format!("  type to search {where_}"), dim)));
+        lines.push(Line::from(""));
+        for (k, what) in [
+            ("Tab / S-Tab", "this chat → space → all spaces"),
+            ("Ctrl-t", "hybrid ⇄ fts (exact words)"),
+            ("Ctrl-g", "semantic only (meaning, not words)"),
+            ("Ctrl-o", "best first ⇄ newest first"),
+            ("from:@name", "only messages by someone"),
+            ("Enter / C-r", "jump to the message / and reply"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {k:<13}"), Style::default().fg(ACCENT)),
+                Span::styled(what.to_string(), dim),
+            ]));
+        }
         return (lines, ranges);
     }
     if s.results.is_empty() {
-        lines.push(Line::from(Span::styled(
-            if s.searching {
-                "  searching…"
-            } else {
-                "  no matches"
-            },
-            Style::default().fg(DIM),
-        )));
+        let msg = if s.searching {
+            format!("  searching {where_}…")
+        } else {
+            let wider = match s.scope {
+                SearchScope::Chat => " — Tab searches the whole space",
+                SearchScope::Space => " — Tab searches all spaces",
+                SearchScope::AllSpaces => "",
+            };
+            let loosen = match s.mode {
+                SearchMode::Fts => " · fts wants the exact words; Ctrl-t for hybrid",
+                _ => "",
+            };
+            format!("  no matches in {where_}{wider}{loosen}")
+        };
+        lines.push(Line::from(Span::styled(msg, dim)));
         return (lines, ranges);
     }
 
@@ -522,6 +857,7 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
     // With a wider scope the results span chats, so each row names its chat.
     let show_loc = s.scope != SearchScope::Chat;
     let sel_id = s.sel.clone().unwrap_or_default();
+    let term_style = Style::default().fg(UNREAD).add_modifier(Modifier::BOLD);
 
     for (i, hit) in s.results.iter().enumerate() {
         if i > 0 {
@@ -531,10 +867,12 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
             Some(name) => (format!("✦ {name}"), AGENT),
             None => person_label(app, &hit.creator),
         };
+        let tag = id_tag(app, hit.agent.is_some(), &hit.creator).map(|t| format!(" {t}")).unwrap_or_default();
         let mut head = vec![
-            Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(label.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(tag, dim),
             Span::raw("  "),
-            Span::styled(fmt_time(hit.created_at), Style::default().fg(DIM)),
+            Span::styled(fmt_time(hit.created_at), dim),
         ];
         if show_loc {
             let loc = app
@@ -557,12 +895,41 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
 
         let start_line = lines.len();
         let text = match action_body(&hit.text) {
-            Some(body) => format!("* {} {body}", head[0].content),
+            Some(body) => format!("* {label} {body}"),
             None => hit.text.clone(),
         };
         lines.push(Line::from(head));
-        for l in wrap(&text, text_w) {
-            lines.push(Line::from(vec![Span::raw("  "), Span::raw(l)]));
+
+        // Show a window of the wrapped text around the first matched term,
+        // with `…` where it was cut; the hit under the cursor opens up.
+        let wrapped = wrap(&text, text_w.saturating_sub(2));
+        let terms: Vec<String> = find_ci(&text, &query, false);
+        let marks: Vec<(String, Style)> = terms.into_iter().map(|t| (t, term_style)).collect();
+        let cap = if hit.msg_id == sel_id { SEL_HIT_LINES } else { HIT_LINES };
+        let first = wrapped
+            .iter()
+            .position(|l| !find_ci(l, &query, false).is_empty())
+            .unwrap_or(0);
+        let mut from = first.saturating_sub(1).min(wrapped.len().saturating_sub(cap));
+        // A cut window shouldn't open on a blank line.
+        while from > 0 && from < first && wrapped[from].trim().is_empty() {
+            from += 1;
+        }
+        let to = (from + cap).min(wrapped.len());
+        for (n, l) in wrapped[from..to].iter().enumerate() {
+            let mut spans = vec![Span::raw("  ")];
+            if n == 0 && from > 0 {
+                spans.push(Span::styled("… ", dim));
+            }
+            spans.extend(mark_spans(l, &marks));
+            lines.push(Line::from(spans));
+        }
+        if to < wrapped.len() {
+            let more = wrapped.len() - to;
+            lines.push(Line::from(Span::styled(
+                format!("  … {more} more line{}", if more == 1 { "" } else { "s" }),
+                dim,
+            )));
         }
         let end_line = lines.len();
         ranges.push((hit.msg_id.clone(), start_line, end_line));
@@ -595,7 +962,7 @@ fn draw_search_query(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT))
         .title(" / ")
         .title_bottom(Line::from(Span::styled(
-            " Enter open · Ctrl-r reply · Tab scope · Esc ",
+            " Enter open · C-r reply · Tab scope · C-t fts · C-o order · Esc ",
             Style::default().fg(DIM),
         )));
     let inner = block.inner(area);
@@ -675,11 +1042,22 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         let grouped = speaker == prev_speaker && (m.created_at - prev_time).abs() < 300.0;
         let compact = app.prefs.compact;
         let (label, color) = author_label(app, m);
+        let tag = id_tag(app, m.agent.is_some(), &m.creator);
+        // A reply to one of your messages gets its own `↪ reply to you` line;
+        // the server-derived `@you` would only repeat it.
+        let reply_to_me = m.reply_to.as_ref().is_some_and(|rid| {
+            app.msgs.iter().any(|x| &x.id == rid && x.creator == app.me && x.agent.is_none())
+        });
+        let pings_me = m.mentions_me(&app.me) && !reply_to_me;
         let name_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
         // Mention links render as `@Name` chips (current name, falling back
         // to the snapshot in the link text); `/hl` words in other people's
         // messages light up like a mention.
-        let (text, chips) = render_mentions(&m.text, |id| mention_name(app, id));
+        // A whisper in a DM: its link becomes a quote line (like a reply's),
+        // and only the private text is the body. Enter follows the link.
+        let whisper = parse_whisper(&m.text);
+        let raw = whisper.as_ref().map_or(m.text.as_str(), |w| w.body.as_str());
+        let (text, chips) = render_mentions(raw, |id| mention_name(app, id));
         let text = md_unescape(&text);
         // Agents sign as you too, so "yours" means human-authored by you.
         let hl = if m.creator == app.me && m.agent.is_none() {
@@ -709,10 +1087,11 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             }
             let mut head = vec![
                 Span::styled(label.clone(), name_style),
+                Span::styled(tag.as_ref().map(|t| format!(" {t}")).unwrap_or_default(), Style::default().fg(DIM)),
                 Span::raw("  "),
                 Span::styled(fmt_time(m.created_at), Style::default().fg(DIM)),
             ];
-            if m.mentions_me(&app.me) {
+            if pings_me {
                 head.push(Span::styled("  @you", Style::default().fg(UNREAD).bold()));
             } else if !hl.is_empty() {
                 head.push(Span::styled("  ★", Style::default().fg(UNREAD).bold()));
@@ -722,21 +1101,36 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
 
         let start_line = lines.len();
         if let Some(rid) = &m.reply_to {
-            let snippet = app
-                .msgs
-                .iter()
-                .find(|x| &x.id == rid)
+            let target = app.msgs.iter().find(|x| &x.id == rid);
+            // A reply to one of your own messages stands out; the rest stay
+            // quiet quotes.
+            let to_me = reply_to_me;
+            let snippet = target
                 .map(|x| {
                     let (text, _) = render_mentions(&x.text, |id| mention_name(app, id));
-                    preview_line(&app.display_name(&x.creator), &md_unescape(&text), 40)
+                    let who = if to_me { "reply to you".to_string() } else { app.display_name(&x.creator) };
+                    preview_line(&who, &md_unescape(&text), 40)
                 })
                 .unwrap_or_else(|| "…".to_string());
             // Truncate against the real pane width, otherwise a narrow pane
             // clips this mid-word with no ellipsis to show it was cut.
             lines.push(Line::from(Span::styled(
                 format!("  ↪ {}", one_line(&snippet, text_w.saturating_sub(2))),
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                if to_me {
+                    Style::default().fg(UNREAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
+                },
             )));
+        }
+        if let Some(w) = &whisper {
+            let place = app
+                .chats
+                .iter()
+                .find(|c| c.object_id == w.chat_id)
+                .map_or_else(|| "another chat".to_string(), |c| c.qualified());
+            let quote = format!("🔒 whisper about {} · in {place}", w.label.trim_start_matches("↪ "));
+            lines.push(whisper_band(&one_line(&quote, text_w.saturating_sub(2)), text_w, Modifier::BOLD));
         }
 
         if !m.text.is_empty() {
@@ -749,6 +1143,20 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 (true, None) => vec![time, (label.clone(), name_style)],
                 (true, Some(_)) => vec![time, (format!("* {label}"), name_style)],
             };
+            // Compact lines carry what a header would: the id tag, and the
+            // `@you` / `★` marks (compact has no header to put them on).
+            let mut lead = lead;
+            if compact {
+                if let Some(t) = &tag {
+                    lead.push((t.clone(), Style::default().fg(DIM)));
+                }
+                let mark = Style::default().fg(UNREAD).add_modifier(Modifier::BOLD);
+                if pings_me {
+                    lead.push(("@you".to_string(), mark));
+                } else if !hl.is_empty() {
+                    lead.push(("★".to_string(), mark));
+                }
+            }
             let body = action.as_deref().unwrap_or(&text);
             let lead_text: String = lead.iter().map(|(t, _)| format!("{t} ")).collect();
             // Compact continuation lines hang under the name, past the time.
@@ -816,6 +1224,34 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             lines.push(Line::from(spans));
         }
 
+        // Whispers about this message, from your DMs: only the two people
+        // in each DM ever see them. They sit on a full-width red band, under
+        // a label that says so, so they can't be mistaken for the chat.
+        let mut last_partner = String::new();
+        for n in app.whispers.iter().filter(|n| n.target == m.id) {
+            let peer = app.dm_peers.get(&n.dm_space).cloned().unwrap_or_default();
+            let partner = if n.creator == app.me { peer.clone() } else { n.creator.clone() };
+            let partner_name = app.display_name(&partner);
+            if partner != last_partner {
+                lines.push(whisper_band(
+                    &format!("🔒 WHISPER · only you and {partner_name} can see this"),
+                    text_w,
+                    Modifier::BOLD,
+                ));
+                last_partner = partner;
+            }
+            let who = if n.creator == app.me {
+                format!("you → {partner_name}")
+            } else {
+                format!("{partner_name} → you")
+            };
+            let (body, _) = render_mentions(&n.body, |id| mention_name(app, id));
+            let full = format!("{who}: {}", md_unescape(&body));
+            for l in wrap(&full, text_w.saturating_sub(2)) {
+                lines.push(whisper_band(&l, text_w, Modifier::empty()));
+            }
+        }
+
         // Only the newest message reflects a live run: a trailing not-done
         // agent message means the agent is still working. Older not-done
         // messages are just intermediate turns, not ongoing activity.
@@ -881,11 +1317,25 @@ fn attachment_label(app: &App, a: &crate::model::Attachment) -> (String, Option<
 
 /// "45%", or bytes so far when the size is unknown.
 fn progress_text(got: u64, total: u64) -> String {
-    if total > 0 {
-        format!("{}%", got * 100 / total)
-    } else {
-        crate::files::human_size(got)
+    match (got * 100).checked_div(total) {
+        Some(pct) => format!("{pct}%"),
+        None => crate::files::human_size(got),
     }
+}
+
+/// One line of a whisper: white on dark red, padded to the pane width so
+/// the band is solid rather than ending ragged at the text (a background
+/// only paints cells that hold something).
+fn whisper_band(text: &str, width: usize, extra: Modifier) -> Line<'static> {
+    let body = format!(" {text}");
+    let pad = width.saturating_sub(body.width());
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{body}{}", " ".repeat(pad)),
+            Style::default().fg(Color::White).bg(WHISPER_BG).add_modifier(extra),
+        ),
+    ])
 }
 
 /// Current display name for a mention identity, if the directory knows one.
@@ -1044,18 +1494,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     // Search takes over the mode indicator, and carries the scope/mode/count
     // the user needs to steer it (Tab and Ctrl-t change these live).
+    // The scope and mode are on the search view's border; the bar carries
+    // what the engine reports and the count.
     if let Some(s) = &app.search {
-        let scope = match s.scope {
-            SearchScope::Chat => app
-                .active_chat()
-                .map(|c| format!("chat: {}", c.label()))
-                .unwrap_or_else(|| "chat".to_string()),
-            SearchScope::Space => app
-                .active_chat()
-                .map(|c| format!("space: {}", c.space_name))
-                .unwrap_or_else(|| "space".to_string()),
-            SearchScope::AllSpaces => "all spaces".to_string(),
-        };
         let detail = if s.note.is_empty() {
             s.mode.as_str().to_string()
         } else {
@@ -1076,8 +1517,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                     .bg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {scope}"), Style::default().fg(ACCENT).bold()),
-            Span::styled(format!("  · {detail}"), Style::default().fg(DIM)),
+            Span::styled(format!("  {detail}"), Style::default().fg(DIM)),
             Span::styled(count, Style::default().fg(DIM)),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1108,6 +1548,19 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         used += t.width();
         spans.push(Span::styled(t, Style::default().fg(DIM)));
     }
+    // Incoming DM requests stay visible until accepted: a toast is too easy
+    // to miss.
+    if let Some(p) = app.pending_dms.first() {
+        let who = if p.name.is_empty() { "someone" } else { p.name.as_str() };
+        let more = match app.pending_dms.len() {
+            1 => String::new(),
+            n => format!(" +{}", n - 1),
+        };
+        let what = if p.is_dm() { "DM from" } else { "invite:" };
+        let t = format!(" ✉ {what} {}{more} (/accept)", truncate(who, 16));
+        used += t.width();
+        spans.push(Span::styled(t, Style::default().fg(UNREAD).bold()));
+    }
     // Downloads in flight: one by name, then how many more.
     if let Some((name, got, total)) = app.downloads.values().next() {
         let more = match app.downloads.len() {
@@ -1125,7 +1578,41 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Some(i) if i + 1 < app.msgs.len() => format!("  ↑{}/{}", i + 1, app.msgs.len()),
         _ => String::new(),
     };
-    let reserve = scroll_txt.width();
+    // The open chat's size, right-aligned: its width is held back from the
+    // unread list, and it goes first when even the short form won't fit.
+    let stats_txt = match app.msg_total {
+        Some(n) if app.active.is_some() => {
+            let long = format!("{n} msgs · {} files · {} links ", app.files.len(), app.links.len());
+            let short = format!("{n}m {}f {}l ", app.files.len(), app.links.len());
+            if narrow { short } else { long }
+        }
+        _ => String::new(),
+    };
+    let stats_txt = if used + stats_txt.width() + scroll_txt.width() + 16 <= total {
+        stats_txt
+    } else {
+        String::new()
+    };
+    // How the open chat's space syncs, left of the stats: state, then the
+    // live paths — sync nodes, LAN peers, direct p2p (iroh) peers.
+    let (sync_txt, sync_color) = match app.active_sync() {
+        Some(st) => {
+            let color = match st.state.as_str() {
+                "synced" => ME,
+                "syncing" => UNREAD,
+                "offline" | "error" => Color::Red,
+                _ => DIM,
+            };
+            (format!("{}  ", st.summary(narrow, app.direct_for(&st.space_id))), color)
+        }
+        None => (String::new(), DIM),
+    };
+    let sync_txt = if used + sync_txt.width() + stats_txt.width() + scroll_txt.width() + 16 <= total {
+        sync_txt
+    } else {
+        String::new()
+    };
+    let reserve = scroll_txt.width() + stats_txt.width() + sync_txt.width();
 
     // Bao's presence (anybao ADR-025), the way any-ui's status bar shows it:
     // nothing until the first beat, then what the agent is doing — its own
@@ -1216,13 +1703,125 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    if !stats_txt.is_empty() || !sync_txt.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(sync_txt, Style::default().fg(sync_color)),
+                Span::styled(stats_txt, Style::default().fg(DIM)),
+            ]))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
-fn draw_help(f: &mut Frame, area: Rect, version: &str) {
+/// `/devices`: every device of the account — this one first, then the
+/// online ones, then by last sign of life. Name, OS and `any` version come
+/// from the registry, which runs bao from its election; online / last seen
+/// from the p2p layer (the registry deliberately stores no liveness).
+fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
+    let Some((devs, live)) = &app.devices_view else { return };
+    let now = chrono::Utc::now().timestamp() as f64;
+    let mut rows: Vec<&crate::model::Device> = devs.devices.iter().collect();
+    let key = |d: &crate::model::Device| {
+        let l = live.get(&d.peer_id);
+        (
+            d.peer_id != devs.me,
+            !l.is_some_and(|l| l.connected),
+            -(l.and_then(|l| l.last_seen).unwrap_or(0.0) as i64),
+            d.name.clone(),
+        )
+    };
+    rows.sort_by_key(|d| key(d));
+
+    let os = |o: &str| match o {
+        "darwin" => "macOS",
+        "ios" => "iOS",
+        "android" => "Android",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+    .to_string();
+    let ago = |t: f64| {
+        let s = (now - t).max(0.0) as u64;
+        match s {
+            0..=59 => "just now".to_string(),
+            60..=3599 => format!("{}m ago", s / 60),
+            3600..=86399 => format!("{}h ago", s / 3600),
+            _ => format!("{}d ago", s / 86400),
+        }
+    };
+    let name_w = rows.iter().map(|d| d.name.width()).max().unwrap_or(4).clamp(4, 22);
+    let ver_w = rows.iter().map(|d| d.version.width()).max().unwrap_or(4).clamp(4, 26);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for d in &rows {
+        let me = d.peer_id == devs.me;
+        let l = live.get(&d.peer_id);
+        let (dot, state, color) = match l {
+            _ if me => ("◆", "this device".to_string(), ACCENT),
+            Some(l) if l.connected => ("●", format!("online · {}", l.via), ME),
+            Some(Liveness { last_seen: Some(t), .. }) => ("○", format!("seen {}", ago(*t)), DIM),
+            _ => ("○", "not seen".to_string(), DIM),
+        };
+        let bao = if devs.active.get("bao") == Some(&d.peer_id) {
+            Span::styled("✦ bao ", Style::default().fg(AGENT).add_modifier(Modifier::BOLD))
+        } else if d.apps.iter().any(|a| a == "bao") {
+            Span::styled("  bao ", Style::default().fg(DIM))
+        } else {
+            Span::raw("      ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {dot} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{:<name_w$}  ", truncate(&d.name, name_w)),
+                Style::default().fg(if me { SEL } else { Color::Gray }).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{:<8}", os(&d.os)), Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:<ver_w$}  ", truncate(&d.version, ver_w)), Style::default().fg(DIM)),
+            bao,
+            Span::styled(state, Style::default().fg(color)),
+        ]));
+    }
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(" no devices registered", Style::default().fg(DIM))));
+    }
+    if live.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " (this server doesn't report p2p peers, so online state is unknown)",
+            Style::default().fg(DIM),
+        )));
+    }
+
+    let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 2;
+    let w = content_w.max(40).min(area.width.saturating_sub(2));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" my devices ")
+        .title_bottom(Line::from(Span::styled(" r refresh · Esc close ", Style::default().fg(DIM))));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
+    let version = app.version.clone();
     // A phone-width pane can't fit the roomy keymap, and clipped help is worse
     // than terse help.
     if area.width < 56 {
-        return draw_help_compact(f, area, version);
+        return draw_help_compact(f, area, app);
     }
     let text = vec![
         "  Navigation",
@@ -1230,24 +1829,28 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    /               search messages",
         "    Ctrl-n / Ctrl-p next / previous chat",
         "    j / k, ↓ / ↑    move chat · move message cursor",
-        "    Enter           step into the chat",
+        "    Enter / l       step into the chat",
         "    Esc / h         back to chat list",
         "    Tab             switch pane",
         "    n               next chat with unread",
         "    g / G           oldest / newest message",
         "    Ctrl-d / Ctrl-u jump 5 messages",
+        "    C-v / A-v       page down / up (PgDn / PgUp)",
         "",
         "  Search (/)",
         "    type            query (updates as you type)",
-        "    Tab             scope: chat → space → all",
-        "    Ctrl-t          mode: hybrid → fts → vector",
-        "    ↓ / ↑, PgDn/PgUp move / page through results",
+        "    Tab / S-Tab     scope: chat → space → all",
+        "    Ctrl-t          hybrid ⇄ fts (exact words)",
+        "    Ctrl-g          semantic only",
+        "    Ctrl-o          best first ⇄ newest first",
+        "    ↓ / ↑, C-v/A-v  move / page through results",
         "    Enter           jump to the message",
         "    Ctrl-r          jump there and reply",
         "    from:@name      filter by sender",
         "",
         "  Chat list",
         "    z               show / hide the chat list",
+        "    C               compact: one line per message / chat",
         "                    (it hides itself anyway under 80 cols)",
         "",
         "  Messages",
@@ -1256,7 +1859,9 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    r               reply to the message under ▌",
         "    R               mark chat read now",
         "    D               DM the author under ▌",
+        "    W               whisper about the message under ▌",
         "    o / s           open / save its attachments",
+        "    F / L           this chat's files / links",
         "    ↑ / ↓           (composing) recall sent lines",
         "",
         "  Commands (type in the composer)",
@@ -1265,66 +1870,54 @@ fn draw_help(f: &mut Frame, area: Rect, version: &str) {
         "    s/old/new/[g]   edit your last message",
         "    /dm @name|id    open a DM (/dm alone: author under ▌)",
         "    /msg @name txt  send to a DM without leaving here",
-        "    /accept [name]  accept an incoming DM request",
+        "    /w @name txt    whisper about the message under ▌",
+        "    /accept [name]  accept a DM request / space invite",
         "    /join <chat>    open the best fuzzy match",
         "    /hl [word]      list / add highlight words; /unhl",
         "    /away [emoji]   mark yourself away; /back",
-        "    /compact        one line per message",
+        "    /compact        same as C",
+        "    /icons [mode]   safe / off / full: icons and emoji",
+        "    /devices        your devices: online, which runs bao",
+        "    /nick <name>    rename yourself (/name too)",
         "    //text          send a literal leading slash",
         "",
         "  Other",
         "    ?               toggle this help",
+        "    Ctrl-L          repaint the screen",
         "    q / Ctrl-c      quit",
         "",
         "  The bottom bar tracks unread in every other chat,",
         "  live, even when the chat list is hidden.",
     ];
-    let w = 60.min(area.width.saturating_sub(4));
-    // +1 for the daemon line appended below, +2 for the border.
-    let h = (text.len() as u16 + 3).min(area.height.saturating_sub(2));
-    let rect = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(" keys ");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
     let mut lines: Vec<Line> = text
         .iter()
         .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::Gray))))
         .collect();
     lines.push(Line::from(Span::styled(
-        one_line(
-            &format!("  daemon: {version}"),
-            inner.width as usize,
-        ),
+        one_line(&format!("  daemon: {version}"), 58),
         Style::default().fg(DIM),
     )));
-    f.render_widget(Paragraph::new(lines), inner);
+    help_box(f, area, lines, 60, &mut app.help_scroll, &mut app.help_rows);
 }
 
-fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
+fn draw_help_compact(f: &mut Frame, area: Rect, app: &mut App) {
+    let version = app.version.clone();
     let text = vec![
         "  Navigate",
         "   Space    find a chat",
         "   C-n/C-p  next/prev chat",
         "   j/k      move cursor",
-        "   Enter    step into chat",
+        "   Enter/l  step into chat",
         "   Esc/h    back to list",
         "   Tab      switch pane",
         "   n        next unread",
         "   g/G      oldest/newest",
         "   C-d/C-u  jump 5 msgs",
+        "   C-v/A-v  page down/up",
         "",
         "  Chat list",
         "   z        show/hide",
+        "   C        compact",
         "",
         "  Message",
         "   i        compose",
@@ -1332,41 +1925,73 @@ fn draw_help_compact(f: &mut Frame, area: Rect, version: &str) {
         "   r        reply to ▌",
         "   R        mark read",
         "   D        DM author",
+        "   W        whisper",
         "   o / s    open/save file",
+        "   F / L    files / links",
         "",
         "  Commands",
         "   /me /shrug s/a/b/",
         "   /dm /msg /accept",
         "   /join /hl /away",
-        "   /compact  //literal",
+        "   /compact /icons",
+        "   /devices /nick",
+        "   //literal",
         "",
         "   ?  help      q  quit",
     ];
-    let w = 30.min(area.width.saturating_sub(2));
-    let h = (text.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let mut lines: Vec<Line> = text
+        .iter()
+        .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::Gray))))
+        .collect();
+    lines.push(Line::from(Span::styled(one_line(&format!("  {version}"), 28), Style::default().fg(DIM))));
+    help_box(f, area, lines, 30, &mut app.help_scroll, &mut app.help_rows);
+}
+
+/// The help overlay's box, centred and at most `max_w` wide. When the text
+/// is taller than the screen it scrolls — `scroll` is clamped here, since
+/// only the draw knows the height — with a scrollbar on the right border and
+/// the keys for it on the bottom one.
+fn help_box(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>, max_w: u16, scroll: &mut usize, page: &mut usize) {
+    let w = max_w.min(area.width.saturating_sub(2));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
         width: w,
         height: h,
     };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
+    let rows = h.saturating_sub(2) as usize;
+    *page = rows;
+    let max_scroll = lines.len().saturating_sub(rows);
+    *scroll = (*scroll).min(max_scroll);
+
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .title(" keys ");
+    if max_scroll > 0 {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" j/k scroll · {}/{} · Esc ", *scroll + rows, lines.len()),
+            Style::default().fg(DIM),
+        )));
+    }
+    f.render_widget(Clear, rect);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    let mut lines: Vec<Line> = text
-        .iter()
-        .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::Gray))))
-        .collect();
-    lines.push(Line::from(Span::styled(
-        one_line(&format!("  {version}"), inner.width as usize),
-        Style::default().fg(DIM),
-    )));
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), inner);
+    if max_scroll > 0 {
+        let mut state = ScrollbarState::new(max_scroll).position(*scroll).viewport_content_length(rows);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(ACCENT))
+                .track_style(Style::default().fg(DIM)),
+            rect.inner(ratatui::layout::Margin { vertical: 1, horizontal: 0 }),
+            &mut state,
+        );
+    }
 }
 
 // ---- text helpers --------------------------------------------------------

@@ -19,7 +19,7 @@ const UNFLIP: &str = r"┬─┬ノ( º \_ ºノ)";
 /// The idle marker `/away` uses when given no emoji of its own.
 pub const DEFAULT_AWAY: &str = "💤";
 
-pub const HELP: &str = "/me /shrug /tableflip /unflip · /dm /msg /accept · /join /hl /unhl /away /back /compact · s/old/new/ · // literal";
+pub const HELP: &str = "/me /shrug /tableflip /unflip · /dm /msg /w /accept · /join /hl /unhl /away /back /compact /icons /devices /nick · s/old/new/ · // literal";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -36,13 +36,23 @@ pub enum Command {
     /// `/join <query>`: open the best fuzzy match.
     Join(String),
     Compact,
+    /// `/icons [safe|off|full]`: how icons and emoji are drawn; bare, the
+    /// next mode.
+    Icons(String),
+    /// `/devices`: your account's devices, which runs bao, which are online.
+    Devices,
+    /// `/nick <name>` (`/name`): rename yourself; bare, show your name.
+    Nick(String),
     /// `/dm [@name | identity]` — a person, or (empty) the author under the
     /// cursor. Unresolved: the roster lives in the app.
     Dm(String),
     /// `/msg @name text`: send into the DM without switching to it. The
     /// name/text split needs the roster too, so this is the raw rest.
     Msg(String),
-    /// `/accept [name]`: approve an incoming DM request.
+    /// `/w @name text`: whisper about the message under the cursor — sent
+    /// into your DM with them, shown to the two of you under that message.
+    Whisper(String),
+    /// `/accept [name]`: approve an incoming DM request or space invite.
     Accept(String),
     Help,
 }
@@ -82,9 +92,14 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "join" | "j" if arg.is_empty() => return Err(need("<chat>")),
         "join" | "j" => Command::Join(arg.to_string()),
         "compact" => Command::Compact,
+        "icons" => Command::Icons(arg.to_string()),
+        "devices" => Command::Devices,
+        "nick" | "name" => Command::Nick(arg.to_string()),
         "dm" | "query" => Command::Dm(arg.to_string()),
         "msg" if arg.is_empty() => return Err(need("@name <text>")),
         "msg" => Command::Msg(arg.to_string()),
+        "w" | "whisper" if arg.is_empty() => return Err(need("@name <text>")),
+        "w" | "whisper" => Command::Whisper(arg.to_string()),
         "accept" => Command::Accept(arg.to_string()),
         "help" => Command::Help,
         _ => return Err(format!("unknown command /{word} — /help lists them, // sends a literal slash")),
@@ -200,6 +215,10 @@ mod tests {
         assert_eq!(parse("/dm").unwrap(), Command::Dm(String::new()));
         assert_eq!(parse("/query @Anna").unwrap(), Command::Dm("@Anna".into()));
         assert!(parse("/msg").is_err());
+        assert_eq!(parse("/nick Ann Lee").unwrap(), Command::Nick("Ann Lee".into()));
+        assert_eq!(parse("/name").unwrap(), Command::Nick(String::new()));
+        assert_eq!(parse("/w @Bob psst").unwrap(), Command::Whisper("@Bob psst".into()));
+        assert!(parse("/w").is_err());
     }
 
     #[test]

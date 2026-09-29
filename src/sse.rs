@@ -26,6 +26,9 @@ pub enum Frame {
     Closed(String),
     /// One event-bus envelope, verbatim (`{type, scope, target?, data, sender}`).
     Event(Value),
+    /// A sync-status state flip (`/sync-status/subscribe`): one space's
+    /// status body, the same shape `GET …/sync-status` returns.
+    Status(Value),
     /// Unknown event names are passed through rather than treated as errors:
     /// the frame set is documented as additive.
     Other(#[allow(dead_code)] String),
@@ -149,6 +152,7 @@ fn parse_block(block: &str) -> Result<Option<Frame>> {
                     .to_string(),
             )
         }
+        "status" => Frame::Status(serde_json::from_str(&data).unwrap_or(Value::Null)),
         other => Frame::Other(other.to_string()),
     };
     Ok(Some(frame))

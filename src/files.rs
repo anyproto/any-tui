@@ -19,10 +19,10 @@ fn home() -> PathBuf {
 /// `user-dirs.dirs`, the file `xdg-user-dir` reads — read directly, since
 /// that tool often isn't installed), else `~/Downloads`, else `~`.
 pub fn download_dir() -> PathBuf {
-    if cfg!(target_os = "linux") {
-        if let Some(p) = xdg_download_dir().filter(|p| p.is_dir() && *p != home()) {
-            return p;
-        }
+    if cfg!(target_os = "linux")
+        && let Some(p) = xdg_download_dir().filter(|p| p.is_dir() && *p != home())
+    {
+        return p;
     }
     let d = home().join("Downloads");
     if d.is_dir() { d } else { home() }

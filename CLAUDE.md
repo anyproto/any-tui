@@ -13,9 +13,14 @@ file is for working on the code.
 
 ```sh
 cargo build            # or --release
-cargo test             # unit tests in fuzzy.rs, model.rs, commands.rs
+cargo test             # unit tests: model.rs, commands.rs, files.rs, fuzzy.rs, app.rs
 cargo run -- --no-auto-read      # see flags below
+nix run . -- --no-auto-read      # the flake's app; `nix build` → ./result/bin/any-tui
 ```
+
+The flake builds from git-tracked files only — `git add -N` a new source file
+before `nix build`, or it compiles without it. The tree is not rustfmt-clean;
+don't reformat wholesale in a feature change.
 
 Flags: `--api <url>`, `--no-auto-read`, `--layout auto|split|single`.
 
@@ -25,10 +30,15 @@ The any daemon runs locally and must be **authorized** — `GET /v1/health`
 returns an `account`; if it is `""`, authorize with curl (README § Quick
 start — `POST /v1/auth` with `{}` generates, with a `mnemonic` restores). **Which account `:7001` is has changed over time** —
 since 2026-09-21 it is the throwaway `any-prod-test-2` account (`A9fBcRQu…`,
-data dir `~/any/any-prod-test-2`, mnemonic in its `ACCOUNT.txt` and in
-`~/.any-accounts/`), one space `tui-test` with nobody else in it; before that
-it was the `repo-prod2` agent-repo account. Check `/health` and `/spaces`
-before assuming. On the throwaway account send/delete freely; on anything
+named "Ann", data dir `~/any/any-prod-test-2`, mnemonic in its `ACCOUNT.txt`
+and in `~/.any-accounts/`); before that it was the `repo-prod2` agent-repo
+account. **Its DM partner is `:7002`** — the throwaway `any-prod-test-3`
+("Bob", `A9Q7AUCZ…`, data dir `~/any/any-prod-test-3`, mnemonic likewise),
+created 2026-09-29 for DM/whisper tests. Both run the same `bin/any`
+(`nix develop -c ./bin/any run --data-dir <dir> --addr 127.0.0.1:<port>` from
+`../any`). They share `tui-test` (Ann's) and `bob-test` (Bob's) and have a
+1-1; drive one TUI per account in two tmux sessions. Check `/health` and
+`/spaces` before assuming. On the throwaway account send/delete freely; on anything
 else it is a real account with real chats, so testing needs care:
 
 - **Drive the TUI with tmux**, not by hand. Pattern: launch in a detached
@@ -38,11 +48,12 @@ else it is a real account with real chats, so testing needs care:
 - **Always run tests with `--no-auto-read`.** Opening a chat marks it read, and
   **the API has no un-read endpoint** — you cannot restore unread state. Never
   clear the user's real unread.
-- **Only send test messages to the solo `foo` space** (it has no other members),
-  and **delete them afterwards** (`DELETE …/chat/messages/{id}`). This
-  send-then-delete cycle is pre-approved for `foo`; do not send into shared
-  spaces (sync team, dev, bao, Alex). Discover ids at runtime rather than
-  hardcoding:
+- **Only send test messages on the throwaway accounts** (Ann `:7001`, Bob
+  `:7002` — `tui-test`, `bob-test`, their DM), and **delete them afterwards**
+  (`DELETE …/chat/messages/{id}`). Never send, `/dm`, rename or accept on a
+  real account (e.g. `:7009`): read-only there, with `--no-auto-read`; and
+  note `/compact`, `/icons`, `/hl` write that account's local prefs — put
+  them back. Discover ids at runtime rather than hardcoding:
   ```sh
   curl -s http://127.0.0.1:7001/v1/spaces | jq '.spaces[]|{name,id}'
   curl -s .../spaces/{id}/datasets | jq '.datasets[]|select(.name=="chat_messages")|.owners'
@@ -130,6 +141,88 @@ strictly-bound request schemas, which the generated file cannot.
   delivers it. Incoming requests are `GET /spaces?status=one_to_one_pending`
   (re-read on every space-list change), approved by `POST
   /spaces/{id}/one-to-one/accept`.
+- **DM naming**: a 1-1 you just opened has **no `name`** until the peer's
+  profile decrypts (after they accept), so the list labels it `@<peer>` from
+  `GET /spaces/{id}/members` (the non-me member). Chats take their space
+  label from the **current** listing (`App::space_label` in `upsert_chat` and
+  `set_spaces`) — the chat-subscription task holds a stale `Space` clone.
+  Identities are re-read on every space-list change, since names arrive late.
+  Pending requests: `GET /spaces?status=one_to_one_pending` (DMs) and
+  `status=invite_pending` (someone ran `acl/add` on you; accept with `POST
+  /spaces/{id}/invite/accept`) — polled every 30s too, as a pending row does
+  not always move the space-list stream.
+- **Sync status** (status bar): `GET /spaces/{id}/sync-status` → `{state:
+  unknown|offline|syncing|synced|error, synced, total, networkPeers,
+  localPeers, globalPeers, p2p: unknown|notpossible|notconnected|connected|
+  restricted}` — the peer counts are live connections syncing THAT space
+  (nodes, LAN/mDNS, internet-wide direct over iroh; any docs/30-global-p2p.md).
+  Live: `GET /sync-status/subscribe` (account-wide SSE, `ready` → sparse
+  `status` frames with the same body, `lagged`), **no snapshot** — read the
+  GET for every space at startup / for new spaces, and again for all on
+  (re)connect and on `lagged`; the stream carries every space's flips, and a
+  30s re-read of the open chat's space backs it up. The status bar shows the
+  open chat's space; the chat list badges each space header `lan` / `p2p`
+  (`✗` offline) — verified live 2026-09-29 by stopping and restarting Bob. Both test accounts run on this box, so Ann and Bob see each other over
+  LAN and iroh at once. `GET /debug/p2p` has the device-level picture
+  (relay session, discovered peers) — not used by the client.
+- **Own devices vs other people's** (`GET /debug/p2p`): the sync-status peer
+  counts include your own other devices, which find each other through the
+  account record and sync EVERY space — so on a multi-device account every
+  space reads `globalPeers ≥ 1`. `/debug/p2p` lists peers in both layers
+  (`peers` = LAN, `global.peers` = iroh) with `connected`, `lastSeen`,
+  `tier`, `spaceIds` and `sources` (`account` = your own device);
+  `model::direct_peers` folds it per space (lan / p2p = others, own), and
+  both the badges and the status bar use that, falling back to the plain
+  counts when the route is absent. No stream: re-read ≤5s after a sync flip
+  and every 30s.
+- **Devices** (`GET /devices`, any docs/23-devices.md): the account's
+  registry — `{devices: [{peerId, name, os, version, apps, activeClaims}],
+  self, active: {<app>: <peerId>}}` (the server computes the election).
+  **It holds no liveness by design** (a heartbeat would churn the CRDT);
+  bao's election is just one app's claim on it. Online / last seen comes
+  from `/debug/p2p`, whose `peerId` is the registry's row id. `/devices`
+  shows the join.
+- **Identities parse per row** (`Api::identities`): the wire sends
+  `"spaceIds": null` for some identities, and one such row in a whole-list
+  parse once wiped every name (the chat showed only id prefixes). Nullable
+  fields go through `null_as_default`.
+- **Emoji vs terminal width tables** (`/icons safe|off|full`,
+  `model::terminal_safe`, `ui::sanitize`): tmux, mosh and the outer
+  terminal each have their own wcwidth, and they disagree on emoji newer
+  than Unicode 9 and on ZWJ / VS16 / skin-tone sequences — the cursor
+  drifts and ratatui's diff redraw leaves stale cells (seen over
+  mosh → tmux on macOS, 2026-09-29). **tmux `capture-pane` shows tmux's
+  grid, not the outer terminal, so it never shows this.** The fix is a pass
+  over the finished frame buffer: composed graphemes → their base, newer
+  emoji → `◌` (`off`: common ones → 2-column text, UI markers kept),
+  never wider than ratatui allotted. Icons with newer emoji are dropped in
+  `safe`. `Ctrl-L` sets `App::clear_screen` → `terminal.clear()`.
+- **Member icons** are the identity's `iconCid` (`GET /identities`): a bare
+  emoji (`"🧉"`), an `icon:v2:{"assignment":{"kind":"emoji","grapheme":…}}`
+  or `{"kind":"pack","ref":{"packId","glyphId"}}` (lucide / iconoir), or a
+  picture ref. `model::icon_glyph` renders the first two (pack glyphs through
+  a small Unicode table, unmapped ones → none) and deliberately never
+  pictures. Spaces carry the same forms in their own `iconCid`; a DM uses
+  the peer's profile icon (`App::space_icon`), and an `icon:v2` `color`
+  (any-ui's palette names) tints the glyph (`ui::icon_palette`). Pack glyph
+  ids are matched after dropping variant words (`Solid`, `Off`, `Circle`),
+  then by arrow direction. `/compact` also collapses the chat list to one
+  row per chat (`selected_line_index` knows both layouts).
+  `PUT /account/metadata` is **full-replace** — send the name with
+  the icon or the name is wiped. `/nick` (`Api::rename`) therefore reads
+  `GET /account` → `metadata` first, re-sends description and icon, and
+  refuses to write when that read fails; it applies the new name locally
+  (`Ev::Renamed`) because the directory can lag the PUT for a moment.
+- **Whispers** are DM messages about a message elsewhere: the text opens with
+  `[↪ Author: quote](any://o/<sp>/<chat>/chat_messages/<msgId>)` then the
+  private body (`model::whisper_text` / `parse_whisper`). Readable in any
+  client, private because it lives in the 1-1. To show them under the target
+  message, **`GET /v1/backlinks?target=any://o/<sp>/<chat>`** (account-wide,
+  `parts` = edges to the chat's messages from every space) — the per-object
+  `…/objects/{chat}/backlinks` route does NOT include edges from other
+  spaces. Keep edges whose source space is a 1-1 and whose text parses as a
+  whisper for this chat; refreshed with the chat stats and when a DM
+  preview carries a whisper for the open chat. Verified 2026-09-29.
 - **Settings live in the local store** (`prefs.rs`; any
   `docs/26-local-store.md`): account-scoped collection `any_tui`, docs
   `prefs` and `history`. Device-only, never synced, not subscribe-able.
@@ -162,10 +255,16 @@ strictly-bound request schemas, which the generated file cannot.
   false` means the run is still streaming (show a "working…" hint on the trailing
   message only). Old run-start pings post a bare `"…"` text — hide those.
 - **Search** is `POST /spaces/{id}/search` — **per-space only**, there is no
-  global `/v1/search` (404). Body: `{query, scopes[], limit (≤100), mode,
-  require[], exclude[], maxData}`. `scopes:["chat"]` restricts to chat messages
-  (the only scope we use); there is **no** objectId/offset filter, so
-  single-chat scoping and paging are client-side. `mode` is `hybrid|fts|vector`
+  global `/v1/search` (404), so "all spaces" fans out one request per space
+  (concurrently; a failing space only loses its hits). Body: `{query,
+  scopes[], limit (≤100), mode, require[], exclude[], maxData, filter,
+  passages}`. `scopes:["chat"]` restricts to chat messages (the only scope we
+  use). **`filter` matches the hit's host object row** (`/objects/query`
+  grammar), so `{"id": <chat>}` narrows to one chat server-side and `limit`
+  then counts that chat's hits — the "this chat" scope uses it. No offset:
+  paging is not possible. Scores: fts is BM25; **hybrid is RRF,
+  `1/(60+rank)`, so every space's #1 hit scores the same** — merging spaces
+  by score interleaves them by rank (ties → newer). `mode` is `hybrid|fts|vector`
   (semantic is `vector`, not `"semantic"`). Hits are `{scope, dataset, objectId
   (the chat), recordId (the message id), chunk, data (windowed text),
   dataOffset, dataTotal, score}` — **no creator/timestamp**, so enrich via the
@@ -174,6 +273,14 @@ strictly-bound request schemas, which the generated file cannot.
   is **forward-only** (content written before indexing isn't found) and
   `vectorStatus` says whether the semantic leg ran
   (`used|unavailable|disabled|skipped`).
+- **Chat stats and the files/links lists** (`F` / `L`): the message count is
+  `includeTotal` on a 1-row query. Files and links come from ONE filtered
+  query — `{"$or": [{"text": {"$regex": "https?://"}}, {"attachments":
+  {"$exists": true}}]}`, paged by `_ver.id` (capped at 5000 messages) — then
+  attachments and `model::extract_urls` split them. The link index
+  (`…/objects/{chat}/links`) is **not** usable for this: it records only
+  `any://` references (files, objects, mentions), never web URLs. Refreshed on
+  chat open and, throttled to 3s, after message events.
 - **SSE** (`…/query/subscribe`, `…/objects/query/subscribe`): events are exactly
   `ready` → `snapshot` → `changes`* → `closed`. `changes` data is a JSON
   **array** of `{versionId, added[], updated[], removed[]}`. `removed` entries
@@ -221,12 +328,17 @@ strictly-bound request schemas, which the generated file cannot.
 
 `main.rs` owns the event loop: a channel of `Ev`, drained per frame, one redraw.
 Terminal input runs on a blocking thread; a 1s tick expires toasts and drives the
-auto-read dwell. All network work happens in spawned tasks that send `Ev`s back.
+auto-read dwell, the throttled chat-stats and `/debug/p2p` re-reads, and the
+30s pending-request / sync-status backstops. All network work happens in
+spawned tasks that send `Ev`s back. Each frame ends with `ui::sanitize`, the
+emoji pass over the finished buffer.
 
-**Four subscriptions run at once — know which signal is which** (the fourth,
-`spawn_bao_sub`, is the account event bus filtered to `bao.status`; it feeds
-only the status bar's bao segment and reconnects silently, since an account
-without a serve simply never beats):
+**Five subscriptions run at once — know which signal is which** (besides the
+three below: `spawn_bao_sub`, the account event bus filtered to `bao.status`,
+feeding only the status bar's bao segment, reconnecting silently since an
+account without a serve never beats; and `spawn_sync_sub`, the account-wide
+`/sync-status/subscribe` flips behind the sync segment and the `lan` / `p2p`
+badges):
 
 1. **Per space** (`spawn_chats_sub`) → chat list + unread counts. Fires **only
    when unread/reaction counters change**. It is an *unread* signal, not a

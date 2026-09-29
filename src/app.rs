@@ -2,8 +2,9 @@ use crate::api::{Api, FileInfo, SearchResults};
 use crate::files;
 use crate::commands::{self, Command};
 use crate::model::{
-    AttachmentTarget, BaoBeat, BaoPresence, Chat, Identity, Message, Space, derive_bao_presence,
-    highlight_hits,
+    AttachmentTarget, BaoBeat, BaoPresence, Chat, DirectPeers, Devices, Identity, Liveness, Message,
+    Space, SyncStatus, derive_bao_presence, direct_peers, peer_liveness,
+    extract_urls, highlight_hits, icon_color, icon_glyph, parse_whisper, whisper_text,
     link_mentions, md_unescape, render_mentions,
 };
 use crate::prefs::{self, HISTORY_MAX, Prefs};
@@ -29,6 +30,12 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Top-N hits fetched per space. The endpoint has no offset, so this is the
 /// whole result set; we re-sort it by time client-side.
 const SEARCH_LIMIT: usize = 100;
+
+/// Chat stats (message count, files, links) refresh at most this often
+/// while messages arrive.
+const STATS_EVERY: Duration = Duration::from_secs(3);
+/// Messages scanned for the files/links lists, newest first.
+const MEDIA_CAP: usize = 5000;
 
 /// A bao publisher is offline after three missed 10s beats (ADR-025 §2).
 const BAO_OFFLINE_AFTER: Duration = Duration::from_secs(30);
@@ -63,6 +70,26 @@ pub enum Ev {
     /// Bytes so far of a running download (`total` 0 = unknown).
     Download { file_id: String, name: String, got: u64, total: u64 },
     DownloadDone { file_id: String },
+    /// The open chat's message count and its messages with files/links.
+    ChatStats { chat: String, total: u64, media: Vec<Message> },
+    /// The other member of a DM space.
+    DmPeer { space_id: String, identity: String },
+    /// Whispers about the open chat's messages, from your DMs.
+    Whispers { chat: String, notes: Vec<WhisperNote> },
+    /// One space's sync status (a GET, or a flip off the live stream).
+    Sync(SyncStatus),
+    /// The sync stream (re)connected or dropped events: re-read what we show.
+    SyncResync,
+    /// Direct peers per space from `/debug/p2p`; `None` when the server
+    /// doesn't serve it (the sync-status counts are shown then).
+    Direct(Option<HashMap<String, DirectPeers>>),
+    /// `/devices`: the registry plus each peer's liveness (empty when the
+    /// server has no `/debug/p2p`).
+    Devices(Devices, HashMap<String, Liveness>),
+    /// A fresh identities directory (names show up as profiles decrypt).
+    Identities(Vec<Identity>),
+    /// `/nick` succeeded: your new name.
+    Renamed(String),
     Toast(String),
     Error(String),
 }
@@ -143,13 +170,16 @@ impl SearchMode {
             SearchMode::Vector => "vector",
         }
     }
-    fn next(self) -> SearchMode {
-        match self {
-            SearchMode::Hybrid => SearchMode::Fts,
-            SearchMode::Fts => SearchMode::Vector,
-            SearchMode::Vector => SearchMode::Hybrid,
-        }
-    }
+}
+
+/// How results are listed. Either way the "first" one sits at the bottom,
+/// next to the prompt, where the cursor starts (fzf-style).
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SearchOrder {
+    /// Best match first — the engine's fused score, merged across spaces.
+    Best,
+    /// Newest first, like reading the chat backwards.
+    Newest,
 }
 
 /// One enriched search result. The raw hit gives only id + text; creator and
@@ -165,6 +195,47 @@ pub struct SearchHit {
     pub agent: Option<String>,
     pub text: String,
     pub created_at: f64,
+    pub score: f64,
+}
+
+/// A whisper as shown under the message it's about.
+#[derive(Debug, Clone)]
+pub struct WhisperNote {
+    /// The message it's about, in the open chat.
+    pub target: String,
+    /// The DM space it lives in (its peer is the other party).
+    pub dm_space: String,
+    pub creator: String,
+    pub body: String,
+    pub created_at: f64,
+}
+
+/// One entry of the chat's files or links list.
+#[derive(Debug, Clone)]
+pub struct MediaItem {
+    pub msg_id: String,
+    pub creator: String,
+    pub agent: Option<String>,
+    pub created_at: f64,
+    /// The carrying message's text (mentions rendered), for the preview line.
+    pub text: String,
+    pub target: AttachmentTarget,
+    /// The link as written (a URL or `any://…`).
+    pub link: String,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum GalleryKind {
+    Files,
+    Links,
+}
+
+/// The files / links list for the open chat (`F` / `L`); takes over the
+/// message pane like search does.
+pub struct Gallery {
+    pub kind: GalleryKind,
+    pub sel: usize,
+    pub scroll: usize,
 }
 
 /// The full-text/semantic search view. Takes over the message pane; the query
@@ -173,6 +244,10 @@ pub struct Search {
     pub query: Input,
     pub scope: SearchScope,
     pub mode: SearchMode,
+    pub order: SearchOrder,
+    /// Hits as the last response ranked them (best first); `results` is
+    /// this in display order.
+    ranked: Vec<SearchHit>,
     pub results: Vec<SearchHit>,
     /// Cursor over `results`, keyed by message id (the list re-sorts on each run).
     pub sel: Option<String>,
@@ -183,6 +258,29 @@ pub struct Search {
     pub searching: bool,
 }
 
+
+impl Search {
+    /// Adopts a best-first hit list and lays it out for display: the first
+    /// in the chosen order goes at the bottom, by the prompt. The cursor
+    /// holds its message when it survives, else lands on that first one.
+    pub fn set_hits(&mut self, ranked: Vec<SearchHit>) {
+        let mut shown = ranked.clone();
+        match self.order {
+            SearchOrder::Best => shown.reverse(),
+            SearchOrder::Newest => shown.sort_by(|a, b| {
+                a.created_at.total_cmp(&b.created_at).then(a.msg_id.cmp(&b.msg_id))
+            }),
+        }
+        self.ranked = ranked;
+        self.sel = self
+            .sel
+            .take()
+            .filter(|id| shown.iter().any(|h| &h.msg_id == id))
+            .or_else(|| shown.last().map(|h| h.msg_id.clone()));
+        self.results = shown;
+        self.scroll = 0;
+    }
+}
 
 pub struct App {
     pub api: Api,
@@ -230,6 +328,11 @@ pub struct App {
     /// Message id we want the cursor on once its chat's history reaches it.
     pending_jump: Option<String>,
     pub show_help: bool,
+    /// Lines the help overlay is scrolled down (clamped when drawn).
+    pub help_scroll: usize,
+    /// Set to repaint the whole screen on the next frame (Ctrl-L, or after
+    /// the emoji mode changes what's on it).
+    pub clear_screen: bool,
     pub auto_read: bool,
     pub quit: bool,
     pub loading: bool,
@@ -238,6 +341,16 @@ pub struct App {
     /// scrolling can be clamped correctly.
     pub view_lines: usize,
     pub view_height: usize,
+    /// Rendered height in lines of each message (by id) and search hit, set
+    /// at draw time: a "page" is however many of them fill one screen.
+    pub msg_heights: HashMap<String, usize>,
+    pub search_heights: HashMap<String, usize>,
+    pub search_view_h: usize,
+    /// Visible rows of the files/links list, the help box and the chat
+    /// list, as last drawn — their page sizes.
+    pub gallery_view_h: usize,
+    pub help_rows: usize,
+    pub sidebar_h: usize,
     msg_task: Option<JoinHandle<()>>,
     /// One live preview subscription per chat, keyed by object id so we spawn
     /// each once and can abort it when the chat goes away.
@@ -271,6 +384,33 @@ pub struct App {
     /// Running downloads by file id: (name, bytes so far, total). Drives the
     /// status bar and the attachment line's percentage.
     pub downloads: HashMap<String, (String, u64, u64)>,
+    /// The open chat's total message count, once known.
+    pub msg_total: Option<u64>,
+    /// Files then links carried by the open chat's messages, newest first.
+    pub files: Vec<MediaItem>,
+    pub links: Vec<MediaItem>,
+    stats_dirty: bool,
+    stats_at: Instant,
+    pub gallery: Option<Gallery>,
+    /// DM space id → the other person's identity. A new 1-1 has no name
+    /// until the peer's profile decrypts, so it's labelled by the peer.
+    pub dm_peers: HashMap<String, String>,
+    /// Whispers about the open chat's messages, oldest first.
+    pub whispers: Vec<WhisperNote>,
+    /// Profile icons that render in a terminal (emoji, mapped pack glyphs),
+    /// by identity. Pictures are left out.
+    pub icons: HashMap<String, String>,
+    /// The `icon:v2` colour name of those icons, where they have one.
+    pub icon_colors: HashMap<String, String>,
+    /// Sync status per space id — the status bar shows the open chat's.
+    pub sync: HashMap<String, SyncStatus>,
+    /// Direct peers per space, own devices apart; `None` until read or when
+    /// the server has no `/debug/p2p`.
+    pub direct: Option<HashMap<String, DirectPeers>>,
+    direct_dirty: bool,
+    direct_at: Instant,
+    /// The `/devices` overlay, while it's up.
+    pub devices_view: Option<(Devices, HashMap<String, Liveness>)>,
 }
 
 impl App {
@@ -313,12 +453,20 @@ impl App {
             search_task: None,
             pending_jump: None,
             show_help: false,
+            help_scroll: 0,
+            clear_screen: false,
             auto_read,
             quit: false,
             loading: false,
             exhausted: false,
             view_lines: 0,
             view_height: 0,
+            msg_heights: HashMap::new(),
+            search_heights: HashMap::new(),
+            search_view_h: 0,
+            gallery_view_h: 0,
+            help_rows: 0,
+            sidebar_h: 0,
             msg_task: None,
             preview_subs: HashMap::new(),
             last_read_marked: HashMap::new(),
@@ -335,6 +483,21 @@ impl App {
             file_infos: HashMap::new(),
             files_requested: HashSet::new(),
             downloads: HashMap::new(),
+            msg_total: None,
+            files: Vec::new(),
+            links: Vec::new(),
+            stats_dirty: false,
+            stats_at: Instant::now(),
+            gallery: None,
+            dm_peers: HashMap::new(),
+            whispers: Vec::new(),
+            icons: HashMap::new(),
+            icon_colors: HashMap::new(),
+            sync: HashMap::new(),
+            direct: None,
+            direct_dirty: true,
+            direct_at: Instant::now() - Duration::from_secs(60),
+            devices_view: None,
         }
     }
 
@@ -423,6 +586,24 @@ impl App {
                 self.remove_chat(&c);
             }
         }
+        for s in spaces.iter().filter(|s| s.is_dm() && !self.dm_peers.contains_key(&s.id)) {
+            let (api, tx, me, id) = (self.api.clone(), self.tx.clone(), self.me.clone(), s.id.clone());
+            tokio::spawn(async move {
+                if let Ok(members) = api.members(&id).await
+                    && let Some(peer) = members.into_iter().find(|m| *m != me)
+                {
+                    let _ = tx.send(Ev::DmPeer { space_id: id, identity: peer });
+                }
+            });
+        }
+        let unseen: Vec<String> = spaces
+            .iter()
+            .filter(|s| !self.sync.contains_key(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        if !unseen.is_empty() {
+            self.fetch_sync(unseen);
+        }
         for s in &spaces {
             if !self.chat_subs.contains_key(&s.id) {
                 let h = spawn_chats_sub(self.api.clone(), s.clone(), self.tx.clone());
@@ -430,6 +611,7 @@ impl App {
             }
         }
         self.spaces = spaces;
+        self.relabel_chats();
         let keep = self.selected_chat().map(|c| c.object_id.clone());
         self.sort_chats();
         self.restore_selection(keep);
@@ -442,7 +624,7 @@ impl App {
             }
         }
         // Fall back to a short form of the account address.
-        identity.chars().take(8).collect()
+        crate::model::short_id(identity)
     }
 
     pub fn active_chat(&self) -> Option<&Chat> {
@@ -495,9 +677,104 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
+    /// A space's icon as a terminal glyph: a DM shows the other person's
+    /// profile icon, any other space its own. None with `/icons` off.
+    /// Also its `icon:v2` colour name, if any.
+    pub fn space_icon(&self, space_id: &str) -> Option<(String, Option<String>)> {
+        let space = self.spaces.iter().find(|s| s.id == space_id)?;
+        if space.is_dm()
+            && let Some(peer) = self.dm_peers.get(space_id)
+            && let Some(icon) = self.member_icon(peer)
+        {
+            return Some((icon, self.icon_colors.get(peer).cloned()));
+        }
+        let glyph = icon_glyph(&space.icon_cid).filter(|g| self.icon_drawable(g))?;
+        Some((glyph, icon_color(&space.icon_cid)))
+    }
+
+    /// A member's icon, if it's shown under the `/icons` mode.
+    pub fn member_icon(&self, identity: &str) -> Option<String> {
+        self.icons.get(identity).filter(|g| self.icon_drawable(g)).cloned()
+    }
+
+    /// Icons are decoration: with `/icons off` none show, and in `safe` an
+    /// emoji terminals may misdraw is left out rather than drawn as `◌`.
+    fn icon_drawable(&self, glyph: &str) -> bool {
+        match self.prefs.emoji_mode() {
+            crate::model::EmojiMode::Off => false,
+            crate::model::EmojiMode::Safe => !glyph.chars().any(crate::model::emoji_is_new),
+            crate::model::EmojiMode::Full => true,
+        }
+    }
+
+    /// What a space is called in the list: its name, or for a DM whose name
+    /// hasn't arrived yet, `@` and the peer.
+    fn space_label(&self, space_id: &str) -> Option<String> {
+        let space = self.spaces.iter().find(|s| s.id == space_id)?;
+        if !space.name.is_empty() {
+            return Some(space.name.clone());
+        }
+        let peer = self.dm_peers.get(space_id)?;
+        Some(format!("@{}", self.display_name(peer)))
+    }
+
+    /// Re-labels every chat from the current spaces (a rename, a DM peer
+    /// learned, a name arrived).
+    pub fn relabel_chats(&mut self) {
+        let labels: HashMap<String, String> = self
+            .spaces
+            .iter()
+            .filter_map(|s| self.space_label(&s.id).map(|l| (s.id.clone(), l)))
+            .collect();
+        for c in &mut self.chats {
+            if let Some(l) = labels.get(&c.space_id) {
+                c.space_name = l.clone();
+            }
+        }
+    }
+
+    pub fn set_dm_peer(&mut self, space_id: String, identity: String) {
+        self.dm_peers.insert(space_id, identity);
+        self.relabel_chats();
+    }
+
+    pub fn set_identities(&mut self, ids: Vec<Identity>) {
+        for id in &ids {
+            if !id.name.is_empty() {
+                self.names.insert(id.identity.clone(), id.name.clone());
+            }
+            match icon_glyph(&id.icon_cid) {
+                Some(g) => self.icons.insert(id.identity.clone(), g),
+                None => self.icons.remove(&id.identity),
+            };
+            match icon_color(&id.icon_cid) {
+                Some(c) => self.icon_colors.insert(id.identity.clone(), c),
+                None => self.icon_colors.remove(&id.identity),
+            };
+        }
+        self.identities = ids;
+        self.relabel_chats();
+    }
+
+    /// Re-reads the identities directory in the background.
+    pub fn refresh_identities(&self) {
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            if let Ok(ids) = api.identities().await {
+                let _ = tx.send(Ev::Identities(ids));
+            }
+        });
+    }
+
     // ---- chat list -------------------------------------------------------
 
     pub fn upsert_chat(&mut self, mut chat: Chat) {
+        // The subscription task holds the space as it was when it started;
+        // label from the current listing instead (spaces get renamed, and a
+        // DM gets its name only once the peer's profile decrypts).
+        if let Some(label) = self.space_label(&chat.space_id) {
+            chat.space_name = label;
+        }
         let keep = self.selected_chat().map(|c| c.object_id.clone());
         match self
             .chats
@@ -571,6 +848,10 @@ impl App {
         let preview = msg
             .as_ref()
             .map(|m| md_unescape(&render_mentions(&m.preview_text(), |id| self.mention_name(id)).0));
+        // A whisper about the open chat just landed in a DM: refresh soon.
+        if msg.as_ref().and_then(|m| parse_whisper(&m.text)).is_some_and(|w| self.active.as_deref() == Some(w.chat_id.as_str())) {
+            self.stats_changed();
+        }
         let hl = msg.as_ref().is_some_and(|m| {
             (m.creator != self.me || m.agent.is_some())
                 && !highlight_hits(&m.text, &self.prefs.highlights).is_empty()
@@ -785,6 +1066,13 @@ impl App {
         self.reply_to = None;
         self.exhausted = false;
         self.loading = true;
+        self.gallery = None;
+        self.msg_total = None;
+        self.files.clear();
+        self.links.clear();
+        self.whispers.clear();
+        self.refresh_stats();
+        self.refresh_sync();
         self.msg_task = Some(spawn_messages_sub(
             self.api.clone(),
             chat.space_id.clone(),
@@ -988,10 +1276,49 @@ impl App {
                 }
             }
             Command::Join(q) => self.join(&q),
-            Command::Compact => {
-                self.prefs.compact = !self.prefs.compact;
+            Command::Compact => self.toggle_compact(),
+            Command::Nick(name) if name.is_empty() => {
+                let me = self.display_name(&self.me);
+                self.toast(format!("you are {me} ({}) — /nick <name> to change", crate::model::short_id(&self.me)));
+            }
+            Command::Nick(name) => {
+                let (api, tx) = (self.api.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    match api.rename(&name).await {
+                        Ok(()) => {
+                            // Applied locally at once: the directory can
+                            // still answer with the old name for a moment.
+                            let _ = tx.send(Ev::Renamed(name.clone()));
+                            let _ = tx.send(Ev::Toast(format!("you're now {name}")));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Ev::Error(format!("rename: {e}")));
+                        }
+                    }
+                });
+            }
+            Command::Devices => {
+                self.mode = Mode::Normal;
+                self.show_devices();
+            }
+            Command::Icons(arg) => {
+                let mode = if arg.is_empty() {
+                    self.prefs.emoji_mode().next()
+                } else {
+                    match crate::model::EmojiMode::parse(&arg) {
+                        Some(m) => m,
+                        None => return self.toast("usage: /icons [safe|off|full]"),
+                    }
+                };
+                self.prefs.icons = mode.as_str().to_string();
+                self.prefs.hide_icons = false;
                 self.save_prefs();
-                self.toast(if self.prefs.compact { "compact layout" } else { "grouped layout" });
+                self.clear_screen = true;
+                self.toast(match mode {
+                    crate::model::EmojiMode::Safe => "icons: safe — newer emoji show as ◌ so no terminal misdraws them",
+                    crate::model::EmojiMode::Off => "icons: off — no icons, emoji as text (+1, <3, :D)",
+                    crate::model::EmojiMode::Full => "icons: full — every emoji as sent (may misdraw over tmux/mosh)",
+                });
             }
             Command::Dm(target) => self.dm(&target, None),
             Command::Msg(rest) => match commands::resolve_person(&rest, &self.people()) {
@@ -1002,13 +1329,22 @@ impl App {
                 }
                 None => self.toast(format!("no one called {rest}")),
             },
+            Command::Whisper(rest) => self.whisper(&rest),
             Command::Accept(who) => self.accept_dm(&who),
             Command::Help => {
                 self.mode = Mode::Normal;
                 self.show_help = true;
+                self.help_scroll = 0;
                 self.toast(commands::HELP);
             }
         }
+    }
+
+    /// `C` / `/compact`: IRC-log layout for messages and the chat list.
+    pub fn toggle_compact(&mut self) {
+        self.prefs.compact = !self.prefs.compact;
+        self.save_prefs();
+        self.toast(if self.prefs.compact { "compact layout (C to undo)" } else { "grouped layout" });
     }
 
     fn send_text(&mut self, chat: &Chat, text: String) {
@@ -1169,6 +1505,48 @@ impl App {
         });
     }
 
+    /// `/w @name text`: a private note about the message under the cursor,
+    /// sent into the DM with `name` as a link to that message plus the text
+    /// (`model::whisper_text`). Both of you then see it under the message.
+    fn whisper(&mut self, rest: &str) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return self.toast("open a chat and put ▌ on the message first");
+        };
+        let Some(m) = self.selected_message().cloned() else {
+            return self.toast("put ▌ on the message to whisper about");
+        };
+        let (id, text) = match commands::resolve_person(rest, &self.people()) {
+            Some((_, "")) => return self.toast("usage: /w @name <text>"),
+            Some((id, text)) => (id, text.to_string()),
+            None => return self.toast(format!("no one called {rest}")),
+        };
+        let author = match &m.agent {
+            Some(a) => a.name.clone(),
+            None => self.display_name(&m.creator),
+        };
+        let quoted = md_unescape(&render_mentions(&m.text, |i| self.mention_name(i)).0);
+        let label = format!("↪ {author}: {quoted}");
+        let text = whisper_text(&label, &chat.space_id, &chat.object_id, &m.id, &text);
+        self.dm(&id, Some(text));
+        // The link index picks the new edge up after a short debounce.
+        self.stats_changed();
+    }
+
+    /// `W`: start a whisper to the author of the message under the cursor.
+    pub fn start_whisper(&mut self) {
+        let Some(m) = self.selected_message().cloned() else {
+            return self.toast("put ▌ on the message to whisper about");
+        };
+        let to = if m.creator == self.me || m.agent.is_some() {
+            String::from("@")
+        } else {
+            format!("@{} ", self.display_name(&m.creator))
+        };
+        self.input = Input::new(format!("/w {to}"));
+        self.mode = Mode::Insert;
+        self.focus = Focus::Messages;
+    }
+
     /// Re-reads incoming DM requests; says so when a new one shows up.
     pub fn check_pending_dms(&self) {
         let (api, tx) = (self.api.clone(), self.tx.clone());
@@ -1186,13 +1564,17 @@ impl App {
             .collect();
         if let Some(p) = new.first() {
             let name = if p.name.is_empty() { "someone" } else { p.name.as_str() };
-            self.toast(format!("DM request from {name} — /accept to open it"));
+            self.toast(if p.is_dm() {
+                format!("DM request from {name} — /accept to open it")
+            } else {
+                format!("you were added to {name} — /accept to join")
+            });
         }
         self.pending_dms = pending;
     }
 
-    /// `/accept [name]`: approve an incoming DM request (the only one, or the
-    /// one whose name matches) and open its chat.
+    /// `/accept [name]`: approve an incoming DM request or space invite (the
+    /// only one, or the one whose name matches); a DM opens straight away.
     fn accept_dm(&mut self, who: &str) {
         let who_l = who.trim().trim_start_matches('@').to_lowercase();
         let matches: Vec<&Space> = self
@@ -1201,8 +1583,8 @@ impl App {
             .filter(|p| who_l.is_empty() || p.name.to_lowercase().contains(&who_l))
             .collect();
         let space = match matches.as_slice() {
-            [] if self.pending_dms.is_empty() => return self.toast("no DM requests"),
-            [] => return self.toast(format!("no DM request from {who}")),
+            [] if self.pending_dms.is_empty() => return self.toast("nothing to accept"),
+            [] => return self.toast(format!("no request or invite matching {who}")),
             [one] => (*one).clone(),
             many => {
                 let names: Vec<&str> = many.iter().map(|p| p.name.as_str()).collect();
@@ -1212,6 +1594,15 @@ impl App {
         self.pending_dms.retain(|p| p.id != space.id);
         let (api, tx) = (self.api.clone(), self.tx.clone());
         tokio::spawn(async move {
+            // A space invite just joins; the space-list stream brings its
+            // chats in. A DM is also set up and opened.
+            if !space.is_dm() {
+                let _ = tx.send(match api.accept_invite(&space.id).await {
+                    Ok(()) => Ev::Toast(format!("joined {}", space.name)),
+                    Err(e) => Ev::Error(format!("accept {}: {e}", space.name)),
+                });
+                return;
+            }
             let res = async {
                 api.accept_dm(&space.id).await?;
                 api.general_chat(&space.id).await
@@ -1389,6 +1780,291 @@ impl App {
         self.toast("no unread chats");
     }
 
+    // ---- sync status ----------------------------------------------------
+
+    /// Re-reads the open chat's space sync status (a cheap GET).
+    pub fn refresh_sync(&self) {
+        if let Some(sp) = self.active_chat().map(|c| c.space_id.clone()) {
+            self.fetch_sync(vec![sp]);
+        }
+    }
+
+    /// Re-reads every space's sync status — at startup, on a stream
+    /// (re)connect and on `lagged`, since the stream has no snapshot. The
+    /// stream itself carries every space's flips in between.
+    pub fn refresh_sync_all(&self) {
+        self.fetch_sync(self.spaces.iter().map(|s| s.id.clone()).collect());
+    }
+
+    fn fetch_sync(&self, spaces: Vec<String>) {
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let all = futures_util::future::join_all(spaces.iter().map(|sp| api.sync_status(sp))).await;
+            for st in all.into_iter().flatten() {
+                if tx.send(Ev::Sync(st)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    pub fn set_sync(&mut self, st: SyncStatus) {
+        if !st.space_id.is_empty() {
+            self.sync.insert(st.space_id.clone(), st);
+        }
+        // Peer counts moved: re-read who those peers are, soon.
+        self.direct_dirty = true;
+    }
+
+    /// Re-reads `/debug/p2p` when a sync flip asked for it (at most every
+    /// 5s) or every 30s regardless — it has no stream of its own.
+    pub fn direct_tick(&mut self) {
+        let since = self.direct_at.elapsed();
+        if !(self.direct_dirty && since >= Duration::from_secs(5) || since >= Duration::from_secs(30)) {
+            return;
+        }
+        self.direct_dirty = false;
+        self.direct_at = Instant::now();
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let d = api.debug_p2p().await.ok().map(|v| direct_peers(&v));
+            let _ = tx.send(Ev::Direct(d));
+        });
+    }
+
+    /// Reads the registry and the p2p layer, then opens the overlay.
+    pub fn show_devices(&self) {
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let (devs, p2p) = tokio::join!(api.devices(), api.debug_p2p());
+            match devs {
+                Ok(d) => {
+                    let live = p2p.map(|v| peer_liveness(&v)).unwrap_or_default();
+                    let _ = tx.send(Ev::Devices(d, live));
+                }
+                Err(e) => {
+                    let _ = tx.send(Ev::Error(format!("devices: {e}")));
+                }
+            }
+        });
+    }
+
+    /// A space's direct peers, when `/debug/p2p` is available. A space no
+    /// connected peer names has none.
+    pub fn direct_for(&self, space_id: &str) -> Option<DirectPeers> {
+        self.direct.as_ref().map(|d| d.get(space_id).copied().unwrap_or_default())
+    }
+
+    /// The open chat's space status, once known.
+    pub fn active_sync(&self) -> Option<&SyncStatus> {
+        self.active_chat().and_then(|c| self.sync.get(&c.space_id))
+    }
+
+    // ---- chat stats, files and links -----------------------------------
+
+    /// Re-reads the open chat's message count and its files/links now.
+    pub fn refresh_stats(&mut self) {
+        let Some(chat) = self.active_chat().cloned() else { return };
+        self.stats_dirty = false;
+        self.stats_at = Instant::now();
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let (total, media) = tokio::join!(
+                api.message_count(&chat.space_id, &chat.object_id),
+                api.media_messages(&chat.space_id, &chat.object_id, MEDIA_CAP),
+            );
+            match (total, media) {
+                (Ok(total), Ok(media)) => {
+                    let _ = tx.send(Ev::ChatStats { chat: chat.object_id.clone(), total, media });
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = tx.send(Ev::Error(format!("chat stats: {e}")));
+                }
+            }
+            // Whispers: edges into this chat from DM spaces, whose messages
+            // open with the link (a plain link from elsewhere isn't one).
+            let Ok(edges) = api.message_backlinks(&chat.space_id, &chat.object_id).await else { return };
+            let mut by_chat: HashMap<(String, String), Vec<String>> = HashMap::new();
+            for (sp, obj, rec, _) in edges.into_iter().filter(|e| e.0 != chat.space_id) {
+                by_chat.entry((sp, obj)).or_default().push(rec);
+            }
+            let mut notes = Vec::new();
+            for ((sp, obj), ids) in by_chat {
+                for m in api.messages_by_ids(&sp, &obj, &ids).await.unwrap_or_default() {
+                    let Some(w) = parse_whisper(&m.text) else { continue };
+                    if w.chat_id != chat.object_id {
+                        continue;
+                    }
+                    notes.push(WhisperNote {
+                        target: w.msg_id,
+                        dm_space: sp.clone(),
+                        creator: m.creator,
+                        body: w.body,
+                        created_at: m.created_at,
+                    });
+                }
+            }
+            notes.sort_by(|a, b| a.created_at.total_cmp(&b.created_at));
+            let _ = tx.send(Ev::Whispers { chat: chat.object_id, notes });
+        });
+    }
+
+    /// Only DM spaces carry whispers; an edge from a group space is a link.
+    pub fn set_whispers(&mut self, chat: &str, notes: Vec<WhisperNote>) {
+        if self.active.as_deref() != Some(chat) {
+            return;
+        }
+        let dms: HashSet<&str> = self.spaces.iter().filter(|s| s.is_dm()).map(|s| s.id.as_str()).collect();
+        self.whispers = notes.into_iter().filter(|n| dms.contains(n.dm_space.as_str())).collect();
+    }
+
+    /// Enter on a whisper in a DM: open the message it's about.
+    pub fn follow_whisper(&mut self) -> bool {
+        let Some(w) = self.selected_message().and_then(|m| parse_whisper(&m.text)) else {
+            return false;
+        };
+        if !self.chats.iter().any(|c| c.object_id == w.chat_id) {
+            self.toast("that chat isn't in your list");
+            return true;
+        }
+        self.open_chat_id(&w.chat_id);
+        self.pending_jump = Some(w.msg_id);
+        self.try_resolve_jump();
+        true
+    }
+
+    /// Something changed in the open chat: refresh the stats soon (the tick
+    /// picks it up, at most every `STATS_EVERY`).
+    pub fn stats_changed(&mut self) {
+        self.stats_dirty = true;
+    }
+
+    pub fn stats_tick(&mut self) {
+        if self.stats_dirty && self.stats_at.elapsed() >= STATS_EVERY {
+            self.refresh_stats();
+        }
+    }
+
+    pub fn set_chat_stats(&mut self, chat: &str, total: u64, media: Vec<Message>) {
+        if self.active.as_deref() != Some(chat) {
+            return;
+        }
+        self.msg_total = Some(total);
+        let (mut files, mut links) = (Vec::new(), Vec::new());
+        for m in &media {
+            self.fetch_file_infos(m);
+            let text = md_unescape(&render_mentions(&m.text, |id| self.mention_name(id)).0);
+            let item = |target: AttachmentTarget, link: &str| MediaItem {
+                msg_id: m.id.clone(),
+                creator: m.creator.clone(),
+                agent: m.agent.as_ref().map(|a| a.name.clone()),
+                created_at: m.created_at,
+                text: text.clone(),
+                target,
+                link: link.to_string(),
+            };
+            for a in &m.attachments {
+                match a.target() {
+                    t @ AttachmentTarget::File { .. } => files.push(item(t, &a.link)),
+                    t @ (AttachmentTarget::Url(_) | AttachmentTarget::Object) => links.push(item(t, &a.link)),
+                    AttachmentTarget::Unknown => {}
+                }
+            }
+            // Web links written in the text; mention links are `any://`, so
+            // they never match.
+            for u in extract_urls(&m.text) {
+                links.push(item(AttachmentTarget::Url(u.clone()), &u));
+            }
+        }
+        self.files = files;
+        self.links = links;
+        if let Some(kind) = self.gallery.as_ref().map(|g| g.kind) {
+            let last = self.gallery_len(kind).saturating_sub(1);
+            if let Some(g) = &mut self.gallery {
+                g.sel = g.sel.min(last);
+            }
+        }
+    }
+
+    fn gallery_len(&self, kind: GalleryKind) -> usize {
+        match kind {
+            GalleryKind::Files => self.files.len(),
+            GalleryKind::Links => self.links.len(),
+        }
+    }
+
+    pub fn gallery_items(&self) -> &[MediaItem] {
+        match self.gallery.as_ref().map(|g| g.kind) {
+            Some(GalleryKind::Files) => &self.files,
+            Some(GalleryKind::Links) => &self.links,
+            None => &[],
+        }
+    }
+
+    /// `F` / `L`: the open chat's files or links; pressing it again closes.
+    pub fn open_gallery(&mut self, kind: GalleryKind) {
+        if self.active.is_none() {
+            return self.toast("open a chat first");
+        }
+        if self.gallery.as_ref().is_some_and(|g| g.kind == kind) {
+            self.gallery = None;
+            return;
+        }
+        self.close_search();
+        self.gallery = Some(Gallery { kind, sel: 0, scroll: 0 });
+        self.focus = Focus::Messages;
+    }
+
+    pub fn gallery_switch(&mut self) {
+        if let Some(g) = &mut self.gallery {
+            g.kind = match g.kind {
+                GalleryKind::Files => GalleryKind::Links,
+                GalleryKind::Links => GalleryKind::Files,
+            };
+            g.sel = 0;
+            g.scroll = 0;
+        }
+    }
+
+    pub fn gallery_move(&mut self, d: isize) {
+        let Some(kind) = self.gallery.as_ref().map(|g| g.kind) else { return };
+        let len = self.gallery_len(kind);
+        if let Some(g) = &mut self.gallery {
+            g.sel = (g.sel as isize + d).clamp(0, len.saturating_sub(1) as isize) as usize;
+        }
+    }
+
+    fn gallery_selected(&self) -> Option<MediaItem> {
+        let g = self.gallery.as_ref()?;
+        self.gallery_items().get(g.sel).cloned()
+    }
+
+    /// Enter: close the list and put the message cursor on the item's message.
+    pub fn gallery_jump(&mut self) {
+        let Some(item) = self.gallery_selected() else { return };
+        self.gallery = None;
+        self.pending_jump = Some(item.msg_id);
+        self.try_resolve_jump();
+    }
+
+    /// `o` / `s` on the item under the cursor: files download (then open, or
+    /// save and reveal); web links open in the browser.
+    pub fn gallery_action(&mut self, open: bool) {
+        let Some(item) = self.gallery_selected() else { return };
+        match item.target {
+            AttachmentTarget::File { space_id, file_id } => {
+                let info = self.file_infos.get(&file_id).cloned();
+                self.fetch_files(vec![(space_id, file_id, info)], open);
+            }
+            AttachmentTarget::Url(url) => match files::open_external(&url) {
+                Ok(()) => self.toast(format!("opened {url} in the browser")),
+                Err(e) => self.toast(format!("open: {e}")),
+            },
+            AttachmentTarget::Object => self.toast("that links an object — Enter shows the message"),
+            AttachmentTarget::Unknown => {}
+        }
+    }
+
     // ---- search ----------------------------------------------------------
 
     /// Turns the message pane into the search view. Anchored on the active
@@ -1402,6 +2078,8 @@ impl App {
             query: Input::default(),
             scope: SearchScope::Chat,
             mode: SearchMode::Hybrid,
+            order: SearchOrder::Best,
+            ranked: Vec::new(),
             results: Vec::new(),
             sel: None,
             scroll: 0,
@@ -1418,22 +2096,43 @@ impl App {
         }
     }
 
-    pub fn search_cycle_scope(&mut self) {
+    /// Tab widens (this chat → space → all spaces), Shift-Tab narrows.
+    pub fn search_cycle_scope(&mut self, wider: bool) {
         if let Some(s) = &mut self.search {
-            s.scope = match s.scope {
-                SearchScope::Chat => SearchScope::Space,
-                SearchScope::Space => SearchScope::AllSpaces,
-                SearchScope::AllSpaces => SearchScope::Chat,
+            use SearchScope::*;
+            s.scope = match (s.scope, wider) {
+                (Chat, true) | (AllSpaces, false) => Space,
+                (Space, true) => AllSpaces,
+                (Space, false) | (AllSpaces, true) => Chat,
+                (Chat, false) => AllSpaces,
             };
         }
         self.run_search();
     }
 
-    pub fn search_cycle_mode(&mut self) {
+    /// Ctrl-t: hybrid ⇄ fts. Ctrl-g: semantic only (again: back to hybrid).
+    pub fn search_set_mode(&mut self, semantic: bool) {
         if let Some(s) = &mut self.search {
-            s.mode = s.mode.next();
+            s.mode = match (s.mode, semantic) {
+                (SearchMode::Vector, true) => SearchMode::Hybrid,
+                (_, true) => SearchMode::Vector,
+                (SearchMode::Hybrid, false) => SearchMode::Fts,
+                (_, false) => SearchMode::Hybrid,
+            };
         }
         self.run_search();
+    }
+
+    /// Ctrl-o: best first ⇄ newest first. Re-sorts what's already held.
+    pub fn search_toggle_order(&mut self) {
+        if let Some(s) = &mut self.search {
+            s.order = match s.order {
+                SearchOrder::Best => SearchOrder::Newest,
+                SearchOrder::Newest => SearchOrder::Best,
+            };
+            let ranked = s.ranked.clone();
+            s.set_hits(ranked);
+        }
     }
 
     /// (Re)launches a debounced search for the current query/scope/mode. Bumps
@@ -1451,7 +2150,7 @@ impl App {
         let mode = s.mode.as_str().to_string();
         let scope = s.scope;
 
-        // Which space(s) to hit, and whether to keep only one chat's hits.
+        // Which space(s) to hit, and whether to narrow to one chat.
         let (spaces, chat_filter): (Vec<String>, Option<String>) = match scope {
             SearchScope::Chat => match self.active_chat() {
                 Some(c) => (vec![c.space_id.clone()], Some(c.object_id.clone())),
@@ -1616,6 +2315,47 @@ impl App {
         }
     }
 
+    /// PgDn / PgUp (Ctrl-v / Alt-v) in the message pane: move the cursor a
+    /// screenful — past as many messages as fill the pane's height.
+    pub fn page_msgs(&mut self, down: bool) {
+        if self.msgs.is_empty() {
+            return;
+        }
+        let cur = self.sel_msg_idx().unwrap_or(self.msgs.len() - 1);
+        let ids: Vec<&str> = if down {
+            self.msgs[cur + 1..].iter().map(|m| m.id.as_str()).collect()
+        } else {
+            self.msgs[..cur].iter().rev().map(|m| m.id.as_str()).collect()
+        };
+        let n = page_steps(ids.iter().map(|id| self.msg_heights.get(*id).copied().unwrap_or(2)), self.view_height);
+        self.move_msg_cursor(if down { n as isize } else { -(n as isize) });
+    }
+
+    /// A screenful through the search results.
+    pub fn page_search(&mut self, down: bool) {
+        let Some(s) = &self.search else { return };
+        let cur = s
+            .sel
+            .as_ref()
+            .and_then(|id| s.results.iter().position(|h| &h.msg_id == id))
+            .unwrap_or(s.results.len().saturating_sub(1));
+        let ids: Vec<&str> = if down {
+            s.results.iter().skip(cur + 1).map(|h| h.msg_id.as_str()).collect()
+        } else {
+            s.results[..cur.min(s.results.len())].iter().rev().map(|h| h.msg_id.as_str()).collect()
+        };
+        let n = page_steps(ids.iter().map(|id| self.search_heights.get(*id).copied().unwrap_or(3)), self.search_view_h);
+        self.search_move(if down { n as isize } else { -(n as isize) });
+    }
+
+    /// A screenful through the chat list (a chat is one row compact, about
+    /// three with its header and preview otherwise).
+    pub fn page_chats(&mut self, down: bool) {
+        let per = if self.prefs.compact { 1 } else { 3 };
+        let n = (self.sidebar_h / per).max(1) as isize;
+        self.select_delta(if down { n } else { -n });
+    }
+
     pub fn select_oldest(&mut self) {
         if let Some(m) = self.msgs.first() {
             self.sel_msg = Some(m.id.clone());
@@ -1644,6 +2384,18 @@ fn common_prefix_ci(names: &[String]) -> String {
 /// Splits a `from:@name` (or `from:name`) token out of the query. The search
 /// API can't filter by sender, so we strip it and filter client-side. Returns
 /// (remaining query, optional name needle).
+/// The words of a search query worth highlighting in results: the query
+/// minus its `from:` filter, split on whitespace, quotes and operators
+/// stripped, single characters dropped.
+pub fn search_terms(raw: &str) -> Vec<String> {
+    parse_from_filter(raw)
+        .0
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| w.chars().count() > 1)
+        .collect()
+}
+
 fn parse_from_filter(raw: &str) -> (String, Option<String>) {
     let mut from = None;
     let mut rest: Vec<&str> = Vec::new();
@@ -1670,8 +2422,10 @@ fn search_note(res: &SearchResults) -> String {
     }
 }
 
-/// Runs the actual search: fan out per space, keep chat-scope hits, enrich each
-/// (one query per chat), apply the `from:` filter, and sort chronologically.
+/// Runs the actual search: every space at once (one failing space costs its
+/// hits, not the search), narrowed server-side to one chat when asked; then
+/// enrich the hits (one query per chat, also concurrent), apply `from:`, and
+/// rank best-first by the fused score.
 async fn run_search_task(
     api: &Api,
     spaces: &[String],
@@ -1681,46 +2435,66 @@ async fn run_search_task(
     from: Option<&str>,
     names: &HashMap<String, String>,
 ) -> anyhow::Result<(Vec<SearchHit>, String)> {
-    // (space, chat) -> message ids of the hits in that chat.
-    let mut groups: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut note = String::new();
+    let replies = futures_util::future::join_all(spaces.iter().map(|sp| async move {
+        (sp.clone(), api.search(sp, query, mode, SEARCH_LIMIT, chat_filter).await)
+    }))
+    .await;
 
-    for sp in spaces {
-        let res = api.search(sp, query, mode, SEARCH_LIMIT).await?;
-        note = search_note(&res);
-        for h in res.hits {
-            if let Some(cf) = chat_filter {
-                if h.object_id != cf {
-                    continue;
+    // (space, chat) -> (message id, score) of that chat's hits.
+    let mut groups: HashMap<(String, String), Vec<(String, f64)>> = HashMap::new();
+    let mut note = String::new();
+    let mut failed = Vec::new();
+    for (sp, res) in replies {
+        match res {
+            Ok(res) => {
+                note = search_note(&res);
+                for h in res.hits {
+                    groups
+                        .entry((sp.clone(), h.object_id))
+                        .or_default()
+                        .push((h.record_id, h.score));
                 }
             }
-            groups
-                .entry((sp.clone(), h.object_id.clone()))
-                .or_default()
-                .push(h.record_id.clone());
+            Err(e) => failed.push(e),
         }
     }
+    // Only when nothing answered is it an error; otherwise say what's missing.
+    if failed.len() == spaces.len() {
+        if let Some(e) = failed.into_iter().next() {
+            return Err(e);
+        }
+    } else if !failed.is_empty() {
+        note = format!("{note} · {} space(s) failed", failed.len());
+    }
 
-    let mut rows: Vec<SearchHit> = Vec::new();
-    for ((sp, chat), ids) in groups {
+    let enriched = futures_util::future::join_all(groups.into_iter().map(|((sp, chat), hits)| async move {
+        let ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
         // A failed enrichment for one chat shouldn't sink the whole search.
         let msgs = api.messages_by_ids(&sp, &chat, &ids).await.unwrap_or_default();
+        (chat, hits, msgs)
+    }))
+    .await;
+
+    let mut rows: Vec<SearchHit> = Vec::new();
+    for (chat, hits, msgs) in enriched {
         for m in msgs {
             if m.is_agent_presence_marker() {
                 continue;
             }
+            let score = hits.iter().find(|(id, _)| *id == m.id).map_or(0.0, |(_, s)| *s);
             rows.push(SearchHit {
                 chat_id: chat.clone(),
                 msg_id: m.id,
                 creator: m.creator,
                 agent: m.agent.map(|a| a.name),
                 text: md_unescape(
-                    &render_mentions(&m.text, |id| {
+                    &render_mentions(&parse_whisper(&m.text).map_or(m.text.clone(), |w| format!("🔒 {}", w.body)), |id| {
                         names.get(id).filter(|n| !n.is_empty()).cloned()
                     })
                     .0,
                 ),
                 created_at: m.created_at,
+                score,
             });
         }
     }
@@ -1735,10 +2509,11 @@ async fn run_search_task(
         });
     }
 
-    // Chronological, like the chat itself; the cursor then lands on the newest.
+    // Best first; ties (common in fts) go to the newer message.
     rows.sort_by(|a, b| {
-        a.created_at
-            .total_cmp(&b.created_at)
+        b.score
+            .total_cmp(&a.score)
+            .then(b.created_at.total_cmp(&a.created_at))
             .then(a.msg_id.cmp(&b.msg_id))
     });
     Ok((rows, note))
@@ -1933,6 +2708,35 @@ pub fn spawn_bao_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
     })
 }
 
+/// Account-wide sync-status flips. The stream has no snapshot, so each
+/// (re)connect and each `lagged` asks the app to re-read what it shows.
+pub fn spawn_sync_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = 1u64;
+        loop {
+            if let Ok(mut reader) = api.subscribe_sync_status().await {
+                backoff = 1;
+                loop {
+                    let ev = match reader.next_frame().await {
+                        Ok(Some(Frame::Status(v))) => match serde_json::from_value(v) {
+                            Ok(st) => Ev::Sync(st),
+                            Err(_) => continue,
+                        },
+                        Ok(Some(Frame::Ready)) | Ok(Some(Frame::Other(_))) => Ev::SyncResync,
+                        Ok(Some(Frame::Closed(_))) | Ok(None) | Err(_) => break,
+                        Ok(Some(_)) => continue,
+                    };
+                    if tx.send(ev).is_err() {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
+    })
+}
+
 pub fn spawn_spaces_sub(api: Api, tx: UnboundedSender<Ev>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = 1u64;
@@ -2094,7 +2898,7 @@ async fn fetch_file(
         // unknown), not per chunk.
         let mut last = 0u64;
         let res = files::download(api, space_id, file_id, &dest, |got, total| {
-            let step = if total > 0 { got * 100 / total } else { got >> 18 };
+            let step = (got * 100).checked_div(total).unwrap_or(got >> 18);
             if step != last {
                 last = step;
                 progress(got, total);
@@ -2119,4 +2923,33 @@ async fn fetch_file(
         }
     }
     Some(dest)
+}
+
+/// How many items (with these heights, in the direction of travel) one
+/// screen of `screen` lines passes: at least one, and a line of context kept.
+fn page_steps(heights: impl Iterator<Item = usize>, screen: usize) -> usize {
+    let budget = screen.saturating_sub(1).max(1);
+    let mut used = 0;
+    let mut n = 0;
+    for h in heights {
+        if n > 0 && used + h > budget {
+            break;
+        }
+        used += h;
+        n += 1;
+    }
+    n.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_steps;
+
+    #[test]
+    fn pages_fill_a_screen() {
+        assert_eq!(page_steps([2, 2, 2, 2, 2].into_iter(), 7), 3);
+        // A message taller than the screen still counts as one step.
+        assert_eq!(page_steps([40, 2].into_iter(), 10), 1);
+        assert_eq!(page_steps(std::iter::empty(), 10), 1);
+    }
 }

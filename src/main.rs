@@ -15,7 +15,7 @@ mod sse;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, Ev, Focus, Mode, spawn_bao_sub, spawn_spaces_sub};
+use app::{App, Ev, Focus, GalleryKind, Mode, spawn_bao_sub, spawn_spaces_sub, spawn_sync_sub};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
@@ -31,7 +31,7 @@ struct Args {
     #[arg(long)]
     no_auto_read: bool,
     /// Pane layout: auto shows one pane below 80 columns (phone-width tmux),
-    /// two above. Toggle at runtime with z.
+    /// two above. `z` hides or shows the chat list at runtime.
     #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
     layout: LayoutArg,
 }
@@ -93,10 +93,7 @@ async fn main() -> Result<()> {
     if !prefs_ok {
         app.toast("local store unavailable — settings won't persist");
     }
-    for id in &identities {
-        app.names.insert(id.identity.clone(), id.name.clone());
-    }
-    app.identities = identities;
+    app.set_identities(identities);
 
     // One live subscription per space keeps unread counts and the chat list
     // fresh; the space-list subscription adds/removes those as spaces come and go.
@@ -104,6 +101,8 @@ async fn main() -> Result<()> {
     spawn_spaces_sub(api.clone(), tx.clone());
     // Bao's presence beats, for the status bar.
     spawn_bao_sub(api.clone(), tx.clone());
+    // Sync status flips (nodes / LAN / iroh p2p peers), for the status bar.
+    spawn_sync_sub(api.clone(), tx.clone());
     app.check_pending_dms();
 
     // Terminal input runs on its own blocking thread.
@@ -156,7 +155,15 @@ async fn run(
     mut rx: UnboundedReceiver<Ev>,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        if app.clear_screen {
+            app.clear_screen = false;
+            terminal.clear()?;
+        }
+        let mode = app.prefs.emoji_mode();
+        terminal.draw(|f| {
+            ui::draw(f, app);
+            ui::sanitize(f.buffer_mut(), mode);
+        })?;
         if app.quit {
             return Ok(());
         }
@@ -182,13 +189,35 @@ fn handle(app: &mut App, ev: Ev) {
         // rather than only firing on keys and arriving messages.
         Ev::Tick => {
             app.ticks += 1;
-            app.maybe_mark_read()
+            app.maybe_mark_read();
+            app.stats_tick();
+            app.direct_tick();
+            // A pending 1-1 row doesn't always move the space-list stream.
+            if app.ticks.is_multiple_of(30) {
+                app.check_pending_dms();
+                // State-flip streams can drop events; a slow re-read backs them up.
+                app.refresh_sync();
+            }
         }
         Ev::BaoBeat(b) => app.apply_bao_beat(b),
         Ev::Spaces(spaces) => {
             app.set_spaces(spaces);
-            // An incoming DM request lands in the spaces dataset too.
+            // An incoming DM request lands in the spaces dataset too, and a
+            // new space can bring new people (or a DM peer's name).
             app.check_pending_dms();
+            app.refresh_identities();
+        }
+        Ev::DmPeer { space_id, identity } => app.set_dm_peer(space_id, identity),
+        Ev::Whispers { chat, notes } => app.set_whispers(&chat, notes),
+        Ev::Sync(st) => app.set_sync(st),
+        Ev::SyncResync => app.refresh_sync_all(),
+        Ev::Direct(d) => app.direct = d,
+        Ev::Devices(d, live) => app.devices_view = Some((d, live)),
+        Ev::Identities(ids) => app.set_identities(ids),
+        Ev::Renamed(name) => {
+            let me = app.me.clone();
+            app.names.insert(me, name);
+            app.relabel_chats();
         }
         Ev::OpenChat(id) => app.open_chat_id(&id),
         Ev::PendingDms(p) => app.set_pending_dms(p),
@@ -201,6 +230,7 @@ fn handle(app: &mut App, ev: Ev) {
         Ev::DownloadDone { file_id } => {
             app.downloads.remove(&file_id);
         }
+        Ev::ChatStats { chat, total, media } => app.set_chat_stats(&chat, total, media),
         Ev::ChatsSnapshot { space_id, chats } => {
             // Replace this space's chats wholesale, keeping other spaces intact.
             let keep: Vec<String> = chats.iter().map(|c| c.object_id.clone()).collect();
@@ -225,6 +255,7 @@ fn handle(app: &mut App, ev: Ev) {
                 app.refresh_active_preview();
                 app.maybe_mark_read();
                 app.try_resolve_jump();
+                app.stats_changed();
             }
         }
         Ev::MsgRemoved { chat, id } => {
@@ -235,6 +266,7 @@ fn handle(app: &mut App, ev: Ev) {
                     app.select_newest();
                 }
                 app.refresh_active_preview();
+                app.stats_changed();
             }
         }
         Ev::History {
@@ -255,15 +287,8 @@ fn handle(app: &mut App, ev: Ev) {
             if seq == app.search_gen {
                 if let Some(s) = &mut app.search {
                     s.searching = false;
-                    let keep = s.sel.clone();
-                    s.results = hits;
                     s.note = note;
-                    // Hold the cursor on the same message when it survives the
-                    // new result set; otherwise fall to the newest.
-                    s.sel = keep
-                        .filter(|id| s.results.iter().any(|h| &h.msg_id == id))
-                        .or_else(|| s.results.last().map(|h| h.msg_id.clone()));
-                    s.scroll = 0;
+                    s.set_hits(hits);
                 }
             }
         }
@@ -287,6 +312,21 @@ fn on_key(app: &mut App, k: KeyEvent) {
         app.quit = true;
         return;
     }
+    // Ctrl-L: repaint everything, the usual cure for a garbled screen.
+    if ctrl && matches!(k.code, KeyCode::Char('l')) {
+        app.clear_screen = true;
+        return;
+    }
+
+    // Emacs paging: Ctrl-v / Alt-v are PgDn / PgUp everywhere but the
+    // composer (where they're left to the editor).
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let k = match k.code {
+        KeyCode::Char('v') if app.mode != Mode::Insert && ctrl => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        KeyCode::Char('v') if app.mode != Mode::Insert && alt => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        _ => k,
+    };
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
     // The picker owns the keyboard while it's up.
     if app.picker.is_some() {
@@ -299,6 +339,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('p') if ctrl => app.picker_move(-1),
             KeyCode::Char('j') if ctrl => app.picker_move(1),
             KeyCode::Char('k') if ctrl => app.picker_move(-1),
+            KeyCode::PageDown => app.picker_move(10),
+            KeyCode::PageUp => app.picker_move(-10),
             // Everything else is line editing on the query.
             _ => {
                 let edited = app
@@ -317,19 +359,21 @@ fn on_key(app: &mut App, k: KeyEvent) {
     // The search view owns the keyboard while it's up. The query is always
     // live, so navigation and actions are on non-letter / Ctrl keys.
     if app.search.is_some() {
-        let page: isize = 5;
         match k.code {
             KeyCode::Esc => app.close_search(),
             KeyCode::Enter => app.search_accept(false),
             KeyCode::Char('r') if ctrl => app.search_accept(true),
-            KeyCode::Tab | KeyCode::BackTab => app.search_cycle_scope(),
-            KeyCode::Char('t') if ctrl => app.search_cycle_mode(),
+            KeyCode::Tab => app.search_cycle_scope(true),
+            KeyCode::BackTab => app.search_cycle_scope(false),
+            KeyCode::Char('t') if ctrl => app.search_set_mode(false),
+            KeyCode::Char('g') if ctrl => app.search_set_mode(true),
+            KeyCode::Char('o') if ctrl => app.search_toggle_order(),
             KeyCode::Down => app.search_move(1),
             KeyCode::Up => app.search_move(-1),
             KeyCode::Char('n') if ctrl => app.search_move(1),
             KeyCode::Char('p') if ctrl => app.search_move(-1),
-            KeyCode::PageDown => app.search_move(page),
-            KeyCode::PageUp => app.search_move(-page),
+            KeyCode::PageDown => app.page_search(true),
+            KeyCode::PageUp => app.page_search(false),
             // Everything else edits the query and re-runs (debounced).
             _ => {
                 let edited = app
@@ -341,6 +385,30 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     app.run_search();
                 }
             }
+        }
+        return;
+    }
+
+    // The files / links list owns the keyboard while it's up.
+    if app.gallery.is_some() && app.mode == Mode::Normal {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.gallery = None,
+            KeyCode::Char('F') => app.open_gallery(GalleryKind::Files),
+            KeyCode::Char('L') => app.open_gallery(GalleryKind::Links),
+            KeyCode::Tab | KeyCode::BackTab => app.gallery_switch(),
+            KeyCode::Char('j') | KeyCode::Down => app.gallery_move(1),
+            KeyCode::Char('k') | KeyCode::Up => app.gallery_move(-1),
+            KeyCode::Char('d') if ctrl => app.gallery_move(5),
+            KeyCode::Char('u') if ctrl => app.gallery_move(-5),
+            // Entries are one or two lines; a page is about a screenful.
+            KeyCode::PageDown => app.gallery_move((app.gallery_view_h / 2).max(1) as isize),
+            KeyCode::PageUp => app.gallery_move(-((app.gallery_view_h / 2).max(1) as isize)),
+            KeyCode::Char('g') | KeyCode::Home => app.gallery_move(isize::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => app.gallery_move(isize::MAX / 2),
+            KeyCode::Enter => app.gallery_jump(),
+            KeyCode::Char('o') => app.gallery_action(true),
+            KeyCode::Char('s') => app.gallery_action(false),
+            _ => {}
         }
         return;
     }
@@ -382,8 +450,41 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    // While help is up, swallow everything except the keys that dismiss it.
-    if app.show_help && !matches!(k.code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
+    // The devices overlay: any of these closes it, `r` re-reads it.
+    if app.devices_view.is_some() && app.mode == Mode::Normal {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.devices_view = None,
+            KeyCode::Char('r') => app.show_devices(),
+            _ => {}
+        }
+        return;
+    }
+
+    // While help is up it owns the keyboard: scroll it, or close it. (`q`
+    // closes help here — it used to fall through and quit the app.)
+    if app.show_help {
+        let by = |app: &mut App, d: isize| {
+            app.help_scroll = app.help_scroll.saturating_add_signed(d);
+        };
+        match k.code {
+            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => app.show_help = false,
+            KeyCode::Char('j') | KeyCode::Down => by(app, 1),
+            KeyCode::Char('k') | KeyCode::Up => by(app, -1),
+            KeyCode::Char('d') if ctrl => by(app, 10),
+            KeyCode::Char('u') if ctrl => by(app, -10),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                let n = app.help_rows.saturating_sub(1).max(1) as isize;
+                by(app, n)
+            }
+            KeyCode::PageUp => {
+                let n = app.help_rows.saturating_sub(1).max(1) as isize;
+                by(app, -n)
+            }
+            KeyCode::Char('g') | KeyCode::Home => app.help_scroll = 0,
+            // Clamped to the real end at draw time.
+            KeyCode::Char('G') | KeyCode::End => app.help_scroll = usize::MAX / 2,
+            _ => {}
+        }
         return;
     }
 
@@ -392,8 +493,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
     let page: isize = 5;
     match k.code {
         KeyCode::Char('q') => app.quit = true,
-        KeyCode::Char('?') => app.show_help = !app.show_help,
+        KeyCode::Char('?') => {
+            app.show_help = true;
+            app.help_scroll = 0;
+        }
         KeyCode::Char('z') => app.toggle_sidebar(),
+        KeyCode::Char('C') => app.toggle_compact(),
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
             if app.show_help {
                 app.show_help = false;
@@ -425,27 +530,42 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char(' ') => app.open_picker(),
         KeyCode::Char('/') => app.open_search(),
         KeyCode::Enter => {
+            // On a whisper in a DM, Enter goes to the message it's about.
+            if app.focus == Focus::Messages && app.follow_whisper() {
+                return;
+            }
+            app.user_selected = true;
+            app.open_selected();
+        }
+        // `l` / → mirror `h` / ←: from the list, step into the chat.
+        KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Sidebar => {
             app.user_selected = true;
             app.open_selected();
         }
         KeyCode::Char('n') => app.next_unread(),
         KeyCode::Char('d') if ctrl => app.move_msg_cursor(page),
         KeyCode::Char('u') if ctrl => app.move_msg_cursor(-page),
-        KeyCode::PageDown => app.move_msg_cursor(page),
-        KeyCode::PageUp => app.move_msg_cursor(-page),
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let down = k.code == KeyCode::PageDown;
+            match app.focus {
+                Focus::Sidebar => app.page_chats(down),
+                Focus::Messages => app.page_msgs(down),
+            }
+        }
         KeyCode::Char('G') | KeyCode::End => {
             app.select_newest();
             app.maybe_mark_read();
         }
         KeyCode::Char('g') | KeyCode::Home => app.select_oldest(),
         KeyCode::Char('i') => {
-            if app.active.is_some() {
-                app.mode = Mode::Insert;
-                // The input box lives in the message pane; in single-pane mode
-                // it isn't on screen unless we focus it.
-                app.focus = Focus::Messages;
-            } else {
-                app.toast("open a chat first (Enter)");
+            // Without an open chat the composer still takes commands (`/dm`,
+            // `/join`, `/accept`, …); a plain message is refused on send.
+            app.mode = Mode::Insert;
+            // The input box lives in the message pane; in single-pane mode
+            // it isn't on screen unless we focus it.
+            app.focus = Focus::Messages;
+            if app.active.is_none() {
+                app.toast("no chat open — commands only (/dm, /join, /accept, /help)");
             }
         }
         KeyCode::Char('r') => {
@@ -462,9 +582,14 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('R') => app.mark_read_now(),
         // DM the author of the message under the cursor.
         KeyCode::Char('D') => app.dm("", None),
+        // Whisper about the message under the cursor (to its author).
+        KeyCode::Char('W') => app.start_whisper(),
         // Attachments of the message under the cursor: open / save.
         KeyCode::Char('o') => app.attachment_action(true),
         KeyCode::Char('s') => app.attachment_action(false),
+        // The open chat's files / links, with the message each came in.
+        KeyCode::Char('F') => app.open_gallery(GalleryKind::Files),
+        KeyCode::Char('L') => app.open_gallery(GalleryKind::Links),
         _ => {}
     }
 }

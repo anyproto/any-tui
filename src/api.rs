@@ -1,6 +1,6 @@
 //! REST client for the any local API (default http://127.0.0.1:7001/v1).
 
-use crate::model::{Identity, Message, Space};
+use crate::model::{Identity, Message, Space, SyncStatus};
 use crate::sse::SseReader;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -29,12 +29,14 @@ pub struct Health {
 
 /// One raw search hit. For a chat-scope hit, `object_id` is the chat and
 /// `record_id` is the message id. The matched text is fetched during
-/// enrichment (alongside creator/timestamp), so it isn't kept here. The wire
-/// also carries a `score`, but results are re-sorted by time, so we drop it.
+/// enrichment (alongside creator/timestamp), so it isn't kept here.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub object_id: String,
     pub record_id: String,
+    /// Fused rank score; higher is better. Comparable within one mode, which
+    /// is what merging results across spaces relies on.
+    pub score: f64,
 }
 
 /// A search response: ranked hits plus what the engine actually did. `mode` is
@@ -103,13 +105,15 @@ impl Api {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// The identities directory. Rows are parsed one by one: a single odd
+    /// row must not cost every other name (a whole-list parse did, once a
+    /// `"spaceIds": null` appeared).
     pub async fn identities(&self) -> Result<Vec<Identity>> {
         let v = self.get_json("/identities").await?;
-        let arr = v
-            .get("identities")
-            .cloned()
-            .unwrap_or(Value::Array(vec![]));
-        Ok(serde_json::from_value(arr).unwrap_or_default())
+        Ok(v.get("identities")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|i| serde_json::from_value(i.clone()).ok()).collect())
+            .unwrap_or_default())
     }
 
     pub async fn spaces(&self) -> Result<Vec<Space>> {
@@ -158,23 +162,29 @@ impl Api {
     /// Full-text / semantic search over chat messages in one space. `mode` is
     /// "hybrid" | "fts" | "vector"; we always restrict to the "chat" scope so
     /// only messages come back (never pages or object names).
+    /// Chat-message search in one space. `object` narrows it to one chat on
+    /// the server (`filter` is matched against the hit's host object row, so
+    /// `{"id": chat}` keeps that chat's messages) — then `limit` counts that
+    /// chat's hits, rather than the space's top N filtered afterwards.
     pub async fn search(
         &self,
         space_id: &str,
         query: &str,
         mode: &str,
         limit: usize,
+        object: Option<&str>,
     ) -> Result<SearchResults> {
+        let mut body = json!({
+            "query": query,
+            "scopes": ["chat"],
+            "mode": mode,
+            "limit": limit,
+        });
+        if let Some(o) = object {
+            body["filter"] = json!({ "id": o });
+        }
         let v = self
-            .post_json(
-                &format!("/spaces/{space_id}/search"),
-                json!({
-                    "query": query,
-                    "scopes": ["chat"],
-                    "mode": mode,
-                    "limit": limit,
-                }),
-            )
+            .post_json(&format!("/spaces/{space_id}/search"), body)
             .await?;
         // Long records are indexed as several chunks, each its own hit with the
         // same (objectId, recordId) — a message must count once, so dedupe on
@@ -195,6 +205,7 @@ impl Api {
                         let hit = SearchHit {
                             object_id: h.get("objectId")?.as_str()?.to_string(),
                             record_id: h.get("recordId")?.as_str()?.to_string(),
+                            score: h.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
                         };
                         seen.insert((hit.object_id.clone(), hit.record_id.clone()))
                             .then_some(hit)
@@ -215,6 +226,92 @@ impl Api {
                 .unwrap_or("")
                 .to_string(),
         })
+    }
+
+    /// How many messages the chat holds (`includeTotal` on a 1-row query;
+    /// `limit > 0` needs a `sort`).
+    pub async fn message_count(&self, space_id: &str, object_id: &str) -> Result<u64> {
+        let v = self
+            .post_json(
+                &format!("/spaces/{space_id}/query"),
+                json!({
+                    "objectId": object_id,
+                    "dataset": DATASET_CHAT_MESSAGES,
+                    "sort": [SORT_NEWEST_FIRST],
+                    "limit": 1,
+                    "includeTotal": true,
+                }),
+            )
+            .await?;
+        Ok(v.get("total").and_then(|t| t.as_u64()).unwrap_or(0))
+    }
+
+    /// Every message that carries an attachment or a web link, newest first —
+    /// the source of the chat's file and link lists. Filtered server-side
+    /// (`$regex` on the text, `$exists` on attachments) and paged by
+    /// `_ver.id`, up to `cap` messages.
+    pub async fn media_messages(&self, space_id: &str, object_id: &str, cap: usize) -> Result<Vec<Message>> {
+        const PAGE: usize = 1000;
+        let media = json!({ "$or": [
+            { "text": { "$regex": "https?://" } },
+            { "attachments": { "$exists": true } },
+        ]});
+        let mut out: Vec<Message> = Vec::new();
+        loop {
+            let filter = match out.last() {
+                Some(m) if !m.ver.is_empty() => json!({ "$and": [media, { "_ver.id": { "$lt": m.ver } }] }),
+                Some(_) => break,
+                None => media.clone(),
+            };
+            let v = self
+                .post_json(
+                    &format!("/spaces/{space_id}/query"),
+                    json!({
+                        "objectId": object_id,
+                        "dataset": DATASET_CHAT_MESSAGES,
+                        "filter": filter,
+                        "sort": [SORT_NEWEST_FIRST],
+                        "limit": PAGE,
+                    }),
+                )
+                .await?;
+            let page: Vec<Message> = v
+                .get("records")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(Message::from_record).collect())
+                .unwrap_or_default();
+            let done = page.len() < PAGE;
+            out.extend(page);
+            if done || out.len() >= cap {
+                break;
+            }
+        }
+        out.truncate(cap);
+        Ok(out)
+    }
+
+    /// Edges from any space this device holds that point at one of the
+    /// chat's messages: `(source space, source object, source record, target
+    /// record)`. The account-wide read — the per-object backlinks route only
+    /// sees edges from the chat's own space, and whispers live in DMs.
+    pub async fn message_backlinks(&self, space_id: &str, chat_id: &str) -> Result<Vec<(String, String, String, String)>> {
+        let target = format!("any://o/{space_id}/{chat_id}");
+        let v = self
+            .get_json(&format!("/backlinks?kind=link&target={}", url_encode(&target)))
+            .await?;
+        let mut out = Vec::new();
+        for sp in v.get("spaces").and_then(|s| s.as_array()).into_iter().flatten() {
+            for e in sp.get("parts").and_then(|p| p.as_array()).into_iter().flatten() {
+                let src = |k: &str| e.pointer(&format!("/source/{k}")).and_then(|x| x.as_str());
+                let tgt = e.pointer("/target/recordId").and_then(|x| x.as_str());
+                if let (Some(s), Some(o), Some(r), Some(t)) = (src("spaceId"), src("objectId"), src("recordId"), tgt)
+                    && src("dataset") == Some(DATASET_CHAT_MESSAGES)
+                {
+                    out.push((s.to_string(), o.to_string(), r.to_string(), t.to_string()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Fetches specific chat messages by id. Search hits carry only the message
@@ -300,11 +397,37 @@ impl Api {
         str_field(&v, "id")
     }
 
-    /// Incoming DM requests: 1-1 rows this device hasn't approved yet.
+    /// Member identities of a space (for a DM: you and the peer).
+    pub async fn members(&self, space_id: &str) -> Result<Vec<String>> {
+        let v = self.get_json(&format!("/spaces/{space_id}/members")).await?;
+        Ok(v.get("members")
+            .and_then(|m| m.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.get("identity").and_then(|i| i.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Requests waiting on you: 1-1 rows not approved yet
+    /// (`one_to_one_pending`) and spaces someone added you to
+    /// (`invite_pending`). `status` on each row says which.
     pub async fn pending_dms(&self) -> Result<Vec<Space>> {
-        let v = self.get_json("/spaces?status=one_to_one_pending").await?;
-        let arr = v.get("spaces").cloned().unwrap_or(Value::Array(vec![]));
-        Ok(serde_json::from_value(arr)?)
+        let mut out = Vec::new();
+        for status in ["one_to_one_pending", "invite_pending"] {
+            let v = self.get_json(&format!("/spaces?status={status}")).await?;
+            let arr = v.get("spaces").cloned().unwrap_or(Value::Array(vec![]));
+            out.extend(serde_json::from_value::<Vec<Space>>(arr)?);
+        }
+        Ok(out)
+    }
+
+    /// Accepts a direct-add invite to a space (materializes it here).
+    pub async fn accept_invite(&self, space_id: &str) -> Result<()> {
+        self.post_json(&format!("/spaces/{space_id}/invite/accept"), json!({}))
+            .await?;
+        Ok(())
     }
 
     pub async fn accept_dm(&self, space_id: &str) -> Result<()> {
@@ -482,6 +605,61 @@ impl Api {
     /// is in `types` (exact, or a `prefix.*`). We listen for the serving
     /// anyrt's `bao.status` presence beats (anybao ADR-025), which any-ui's
     /// status bar reads the same way.
+    /// Renames the account. `PUT /account/metadata` is full-replace, so the
+    /// stored profile (`GET /account` → `metadata`) is read first and its
+    /// description and icon are sent back unchanged. If that read fails
+    /// nothing is written: replacing a profile we couldn't see could wipe it.
+    pub async fn rename(&self, name: &str) -> Result<()> {
+        let account = self.get_json("/account").await.context("read the current profile")?;
+        let mut body = json!({ "name": name });
+        if let Some(meta) = account.get("metadata") {
+            for key in ["description", "iconCid"] {
+                if let Some(v) = meta.get(key).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                    body[key] = json!(v);
+                }
+            }
+        }
+        let resp = self
+            .http
+            .put(self.url("/account/metadata"))
+            .json(&body)
+            .send()
+            .await
+            .context("PUT /account/metadata")?;
+        json_or_err(resp, "/account/metadata").await?;
+        Ok(())
+    }
+
+    /// The account's device registry, with this device and the elected
+    /// active device per app.
+    pub async fn devices(&self) -> Result<crate::model::Devices> {
+        Ok(crate::model::Devices::from_json(&self.get_json("/devices").await?))
+    }
+
+    /// Both p2p layers' peers (`GET /debug/p2p`): who is connected, over
+    /// what, for which spaces, and whether it's one of your own devices.
+    pub async fn debug_p2p(&self) -> Result<Value> {
+        self.get_json("/debug/p2p").await
+    }
+
+    pub async fn sync_status(&self, space_id: &str) -> Result<SyncStatus> {
+        let v = self.get_json(&format!("/spaces/{space_id}/sync-status")).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// Account-wide sync-status flips: `ready`, then sparse `status` frames
+    /// (no snapshot — read the GET first), `lagged` when some were dropped.
+    pub async fn subscribe_sync_status(&self) -> Result<SseReader> {
+        let path = "/sync-status/subscribe";
+        let resp = self
+            .http
+            .get(self.url(path))
+            .send()
+            .await
+            .with_context(|| format!("subscribe {path}"))?;
+        open_stream(resp, path).await
+    }
+
     pub async fn subscribe_events(&self, types: &[&str]) -> Result<SseReader> {
         let path = "/events/subscribe";
         // Types are dotted `[a-z0-9_.*]` slugs by the bus grammar, so the
@@ -547,6 +725,19 @@ async fn json_or_err(resp: reqwest::Response, path: &str) -> Result<Value> {
         return Ok(Value::Null);
     }
     serde_json::from_str(&text).with_context(|| format!("{path}: bad json"))
+}
+
+/// Percent-encodes a query value (everything but the unreserved set).
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 fn str_field(v: &Value, key: &str) -> Result<String> {

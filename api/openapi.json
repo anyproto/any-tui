@@ -138,6 +138,45 @@
         },
         "type": "object"
       },
+      "api.AccountDiscoveryStatus": {
+        "description": "Account is the account-level discovery record (pkarr).",
+        "properties": {
+          "clockAheadMs": {
+            "description": "ClockAheadMs is how far the relays' record was dated past this\ndevice's clock — a sibling whose clock runs ahead. Zero when it\nwas not.",
+            "type": "integer"
+          },
+          "devices": {
+            "description": "Devices is how many sibling devices the record names.",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "lastError": {
+            "description": "LastError is the last failed cycle; empty after a good one.",
+            "type": "string"
+          },
+          "lastPublished": {
+            "type": "string"
+          },
+          "lastResolved": {
+            "type": "string"
+          },
+          "ownEntry": {
+            "description": "OwnEntry — the record names this device with its current relay.",
+            "type": "boolean"
+          },
+          "relays": {
+            "description": "Relays are the configured pkarr relays, as hosts.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          }
+        },
+        "type": "object"
+      },
       "api.AccountMetadata": {
         "additionalProperties": false,
         "properties": {
@@ -1404,6 +1443,9 @@
         "properties": {
           "app": {
             "type": "string"
+          },
+          "peerId": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -1415,6 +1457,9 @@
           },
           "seq": {
             "type": "integer"
+          },
+          "target": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -1639,6 +1684,42 @@
             "type": "string"
           },
           "state": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "api.GlobalP2PStatus": {
+        "description": "Global is the internet-wide layer (iroh over the relays).",
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/api.AccountDiscoveryStatus"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpointId": {
+            "description": "EndpointId is this device's iroh endpoint id (its device key).",
+            "type": "string"
+          },
+          "homeRelay": {
+            "description": "HomeRelay is the relay URL inside Ticket.",
+            "type": "string"
+          },
+          "peers": {
+            "description": "Peers are the peers known through records, connected or not —\nexcept any in the disabled tier, which the SDK drops from this\nlist. A device silent for 30 days is therefore absent here, not\nlisted as disabled.",
+            "items": {
+              "$ref": "#/components/schemas/api.P2PPeerStatus"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "relayConnected": {
+            "description": "RelayConnected — the session to the home relay is up. Until it\nis, this device can dial out but cannot be reached.",
+            "type": "boolean"
+          },
+          "ticket": {
+            "description": "Ticket is what this device publishes for others to dial; empty\nuntil the relay session is up. Relay-only by construction — it\nnever carries this device's IP addresses.",
             "type": "string"
           }
         },
@@ -2190,6 +2271,23 @@
         },
         "type": "object"
       },
+      "api.LocalDiscoveryRequest": {
+        "properties": {
+          "enabled": {
+            "description": "Enabled false stops announce and browse within seconds and keeps\nthem stopped; true starts them at once. Required: an absent value\nis 400 request.missing_field rather than a silent off. Held for\nthe process lifetime, across logout and account switches; a host\nrestates it after a restart, and may state it before the first\nPOST /v1/auth.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "api.LocalDiscoveryResponse": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "api.LocalDocsRequest": {
         "properties": {
           "coll": {
@@ -2725,8 +2823,24 @@
           "connected": {
             "type": "boolean"
           },
+          "failures": {
+            "description": "Failures counts consecutive failed global dials.",
+            "type": "integer"
+          },
+          "lastSeen": {
+            "description": "LastSeen is the newest liveness evidence — a record heartbeat or\na local connection. Zero for LAN-only peers.",
+            "type": "string"
+          },
           "peerId": {
             "type": "string"
+          },
+          "sources": {
+            "description": "Sources that know the peer: \"lan\", \"global\" (a space's records),\n\"account\" (this account's own device record), in any\ncombination. A peer in the top-level list always carries at\nleast \"lan\", and one in global.peers may also carry it — a\ndevice on the same LAN that a space's records also name appears\nin both lists, so presence under global is not proof that\ntraffic is relayed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
           },
           "spaceIds": {
             "items": {
@@ -2734,6 +2848,10 @@
             },
             "type": "array",
             "uniqueItems": false
+          },
+          "tier": {
+            "description": "Tier derived from LastSeen: active, stale, dormant, disabled. It\nsets how often the peer is dialed. Empty for LAN-only peers.",
+            "type": "string"
           }
         },
         "type": "object"
@@ -2743,7 +2861,14 @@
           "enabled": {
             "type": "boolean"
           },
+          "global": {
+            "$ref": "#/components/schemas/api.GlobalP2PStatus"
+          },
           "listenerStarted": {
+            "type": "boolean"
+          },
+          "localDiscovery": {
+            "description": "LocalDiscovery is the mDNS switch (PUT /v1/local-discovery): false\nmeans announce and browse are off and Possibility reads `disabled`.\nDistinct from Enabled, the p2p.enabled config opt-out fixed at\nboot, which also takes the QUIC listener down.",
             "type": "boolean"
           },
           "peerId": {
@@ -3782,6 +3907,9 @@
       },
       "api.SpaceSyncStatusResponse": {
         "properties": {
+          "globalPeers": {
+            "type": "integer"
+          },
           "lastSyncedAt": {
             "type": "string"
           },
@@ -4699,7 +4827,7 @@
             "description": "OK"
           }
         },
-        "summary": "Local-network (p2p) layer snapshot (diagnostic, unstable)",
+        "summary": "Direct (p2p) layer snapshot — local network and global (diagnostic, unstable)",
         "tags": [
           "debug"
         ]
@@ -4747,14 +4875,14 @@
                   },
                   {
                     "$ref": "#/components/schemas/api.DeviceActivateRequest",
-                    "description": "App slug",
+                    "description": "App slug; optional target peer id",
                     "summary": "body"
                   }
                 ]
               }
             }
           },
-          "description": "App slug",
+          "description": "App slug; optional target peer id",
           "required": true
         },
         "responses": {
@@ -4770,6 +4898,16 @@
               }
             },
             "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not Found"
           },
           "409": {
             "content": {
@@ -4792,7 +4930,7 @@
             "description": "Internal Server Error"
           }
         },
-        "summary": "Claim the active role for an app on this device",
+        "summary": "Claim the active role for an app on this or another device",
         "tags": [
           "devices"
         ]
@@ -5388,6 +5526,84 @@
         "summary": "Get a known identity by account address",
         "tags": [
           "identities"
+        ]
+      }
+    },
+    "/local-discovery": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.LocalDiscoveryResponse"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "summary": "Whether this device announces and browses on the local network",
+        "tags": [
+          "p2p"
+        ]
+      },
+      "put": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "$ref": "#/components/schemas/api.LocalDiscoveryRequest",
+                    "description": "Desired state",
+                    "summary": "body"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "Desired state",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.LocalDiscoveryResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "summary": "Switch local-network discovery (mDNS) on or off",
+        "tags": [
+          "p2p"
         ]
       }
     },
@@ -12324,6 +12540,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/api.ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gone"
           },
           "500": {
             "content": {
