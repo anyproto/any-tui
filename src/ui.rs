@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
@@ -145,7 +145,10 @@ pub fn sanitize(buf: &mut ratatui::buffer::Buffer, mode: crate::model::EmojiMode
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let root = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+    // No boxes: one vertical rule between the panes (the sidebar's right
+    // border) and one horizontal rule above the status bar.
+    let root = Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(f.area());
 
     // Either the user hid the list with `z`, or the terminal is too narrow to
     // hold both panes. Both end up showing one pane; the status bar still
@@ -165,7 +168,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_sidebar(f, app, cols[0]);
         draw_chat(f, app, cols[1]);
     }
-    draw_status(f, app, root[1]);
+    let rule = Style::default().fg(DIM);
+    f.render_widget(Block::default().borders(Borders::TOP).border_style(rule), root[1]);
+    if !app.single_now {
+        // Join the vertical rule onto the horizontal one.
+        let x = root[1].x + SIDEBAR_W - 1;
+        if let Some(cell) = f.buffer_mut().cell_mut((x, root[1].y)) {
+            cell.set_symbol("┴").set_style(rule);
+        }
+    }
+    draw_status(f, app, root[2]);
 
     if app.picker.is_some() {
         draw_picker(f, app, f.area());
@@ -309,10 +321,13 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         " chats ".to_string()
     };
+    // The right border is the rule between the panes; alone on screen the
+    // list has none.
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(focus_style(focused))
+        .borders(if app.single_now { Borders::NONE } else { Borders::RIGHT })
+        .border_style(Style::default().fg(DIM))
+        .padding(Padding::left(1))
+        .title_style(focus_style(focused))
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -328,6 +343,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     for c in &app.chats {
         *per_space.entry(c.space_id.as_str()).or_default() += 1;
     }
+    let icon_col = app.chats.iter().any(|c| app.space_icon(&c.space_id).is_some());
     // Chats arrive grouped by space, so a header emits on each space change.
     for (i, chat) in app.chats.iter().enumerate() {
         // How this space reaches other people's devices: `lan` (mDNS) and/or
@@ -338,8 +354,14 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|st| sync_badge(st, app.direct_for(&chat.space_id)))
             .unwrap_or_default();
         let sync_style = Style::default().fg(if sync.starts_with('✗') { Color::Red } else { P2P });
+        // Icons are a column: each glyph padded to 2 cells, and spaces without
+        // one leave the slot blank so the names still line up.
         let (icon, icon_style) = match app.space_icon(&chat.space_id) {
-            Some((g, c)) => (format!("{g} "), Style::default().fg(icon_palette(c.as_deref()))),
+            Some((g, c)) => (
+                format!("{g}{} ", " ".repeat(2usize.saturating_sub(g.width()))),
+                Style::default().fg(icon_palette(c.as_deref())),
+            ),
+            None if icon_col => ("   ".to_string(), Style::default()),
             None => (String::new(), Style::default()),
         };
 
@@ -498,9 +520,8 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         None => " no chat open ".to_string(),
     };
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(focus_style(focused))
+        .padding(Padding::horizontal(1))
+        .title_style(focus_style(focused))
         .title(title)
         .title_alignment(Alignment::Left);
     let inner = block.inner(rows[0]);
@@ -553,9 +574,8 @@ fn draw_search_view(f: &mut Frame, app: &mut App, area: Rect) {
 
     let (scope_title, mode_title) = search_titles(app);
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(focus_style(true))
+        .padding(Padding::horizontal(1))
+        .title_style(focus_style(true))
         .title(scope_title)
         .title(mode_title.right_aligned());
     let inner = block.inner(rows[0]);
@@ -628,9 +648,7 @@ fn draw_gallery(f: &mut Frame, app: &mut App, area: Rect) {
         GalleryKind::Links => " Enter message · o open · Tab files · Esc ",
     };
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(focus_style(true))
+        .padding(Padding::horizontal(1))
         .title(title)
         .title_bottom(Line::from(Span::styled(hint, off)));
     let inner = block.inner(area);
@@ -1049,9 +1067,8 @@ fn draw_search_query(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
+        .padding(Padding::horizontal(1))
+        .title_style(Style::default().fg(ACCENT))
         .title(" / ")
         .title_bottom(Line::from(Span::styled(
             " Enter open · C-r reply · Tab scope · C-t fts · C-o order · Esc ",
@@ -1530,9 +1547,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         }
 
         let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
+            .padding(Padding::horizontal(1))
+            .title_style(Style::default().fg(ACCENT))
             .title(" message ")
             .title_bottom(Line::from(Span::styled(
                 " Enter send · Alt-Enter newline · Esc cancel ",
