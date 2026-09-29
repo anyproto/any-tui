@@ -19,19 +19,19 @@ by default). No SDK, no direct store access.
 ```
 ╭ chats (2) ─────────────────────╮╭ tui-test/General ────────────────────────────────╮
 │tui-test                 lan p2p││  ── beginning of chat ──                         │
-│▌○ General                      ││★ Ann  21 Sep 00:11                               │
+│▌ General                       ││★ Ann  21 Sep 00:11                               │
 │   ✦ bao: hello from qwen       ││▌ hello from any-tui check                        │
 │                                ││▌ 🔒 Bob → you: is this still true?               │
 │Bob                      lan p2p││▌ 🔒 you → Bob: yes, still true                   │
-│ ● General                     2││  second message via curl (live SSE check)        │
+│  General                    (2)││  second message via curl (live SSE check)        │
 │   ★ Ann: 🔒 yes, still true    ││  third message typed in the TUI                  │
 │                                ││                                                  │
 │bob-test                 lan p2p││★ Ann  21 Sep 00:25                               │
-│ ○ General                      ││  fourth: after the id-in-owners filter           │
+│  General                       ││  fourth: after the id-in-owners filter           │
 │   no messages                  ││                                                  │
 │                                ││★ Ann  21 Sep 00:38                               │
 │bao                             ││  hello from qwen                                 │
-│ ○ General                      │╰──────────────────────────────────────────────────╯
+│  General                       │╰──────────────────────────────────────────────────╯
 ╰────────────────────────────────╯  i  compose   r  reply   ?  help
  NORMAL   new: +1  ↑1/7         ✓ 3 nodes · 1 lan · 1 p2p  7 msgs · 0 files · 0 links
 ```
@@ -199,6 +199,10 @@ The composer and the picker query support readline editing (`Ctrl-a`/`Ctrl-e`,
 `Alt-b`/`Alt-f`, `Ctrl-w`, `Ctrl-u`/`Ctrl-k`, …).
 In the composer `↑` / `↓` recall lines you sent before.
 
+Unread shows as a count after the chat, `(2)` — `(@2)` in red when
+something unread mentions you, `(★2)` in violet for a highlight word, capped
+at `(999+)` — the same in the list, the picker and the status bar.
+
 The status bar holds, left to right: the mode, your away marker, a waiting DM
 request or invite (`✉`), a running download, bao's presence, unread in other
 chats — and at the right end how the open chat's space is syncing and its
@@ -233,9 +237,9 @@ text goes out as-is.
 | `/w @name text` | whisper about the message under the cursor — see [Whispers](#whispers) (`W` starts one to its author) |
 | `/accept [name]` | accept an incoming DM request or space invite (the status bar shows `✉` while one waits) |
 | `/join <chat>` (`/j`) | open the best fuzzy match, like `Space` |
-| `/hl [word]`, `/unhl word` | list / add / remove highlight words: others' messages containing one get the word lit up and a `★` in the list and status bar |
+| `/hl [word]`, `/unhl word` | list / add / remove highlight words: others' messages containing one get the word lit up (violet) and the chat's count reads `(★2)` |
 | `/away [emoji]`, `/back` | show an away marker (default 💤) in your status bar |
-| `/compact` (`C`) | toggle an IRC-log layout: one `HH:MM Name text` line per message with per-day dividers, and one line per chat in the list (`● 🧉 Gustavo  p2p 2`) |
+| `/compact` (`C`) | toggle an IRC-log layout: one `HH:MM Name text` line per message with per-day dividers, and one line per chat in the list (`🧉 Gustavo   p2p (2)`) |
 | `/icons [safe\|off\|full]` | how icons and emoji are drawn — see [Emoji and odd terminals](#emoji-and-odd-terminals); bare, the next mode |
 | `/nick <name>` (`/name`) | rename yourself (keeps your description and icon); bare, it shows your current name and short id |
 | `/devices` | your account's devices: this one, which are online (and over what) or when last seen, which one runs bao |

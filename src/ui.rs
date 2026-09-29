@@ -22,6 +22,10 @@ const UNREAD: Color = Color::Yellow;
 /// Selected rows brighten their text instead of taking a background tint.
 const SEL: Color = Color::White;
 const SEL_UNREAD: Color = Color::LightYellow;
+/// Something unread that pings you: `@3`, `@you`, `↪ reply to you`.
+const MENTION: Color = Color::Indexed(203);
+/// A `/hl` word: `★2`, the `★` mark, the word itself in the text.
+const HIGHLIGHT: Color = Color::Indexed(141);
 const ME: Color = Color::Green;
 /// Agent-authored messages get their own hue and a `✦` marker, since they're
 /// signed by the human account and would otherwise read as that person.
@@ -224,14 +228,10 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         };
         let selected = i == p.sel;
 
-        let badge = if chat.unread_mentions > 0 {
-            format!("@ {} ", chat.unread)
-        } else if chat.unread > 0 {
-            format!("● {} ", chat.unread)
-        } else if chat.unread_reactions > 0 {
-            format!("♥ {} ", chat.unread_reactions)
-        } else {
-            String::new()
+        let (badge, badge_color) = match unread_badge(chat) {
+            Some((b, c)) => (format!("{b} "), c),
+            None if chat.unread_reactions > 0 => (format!("(♥{}) ", chat.unread_reactions), UNREAD),
+            None => (String::new(), UNREAD),
         };
 
         // Highlight the chars the query matched, like helix does.
@@ -266,7 +266,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         let pad = width.saturating_sub(2 + shown + badge.width());
         spans.push(Span::raw(" ".repeat(pad)));
         if !badge.is_empty() {
-            spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
+            spans.push(Span::styled(badge, Style::default().fg(badge_color).bold()));
         }
         lines.push(Line::from(spans));
 
@@ -356,21 +356,10 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         let selected = i == app.sel;
         let has_unread = chat.unread > 0;
 
-        // `@` when something unread pings you, `★` for a `/hl` word, `●`
-        // for plain unread.
-        let marker = if chat.unread_mentions > 0 {
-            "@"
-        } else if chat.hl && has_unread {
-            "★"
-        } else if has_unread {
-            "●"
-        } else {
-            "○"
-        };
-        let badge = if chat.unread > 0 {
-            format!(" {}", chat.unread)
-        } else {
-            String::new()
+        // No marker column: the unread count says it (`unread_badge`).
+        let (badge, badge_color) = match unread_badge(chat) {
+            Some((b, c)) => (format!(" {b}"), c),
+            None => (String::new(), UNREAD),
         };
         // Selection is the ▌ bar plus brighter text, not a background tint: a
         // tint only paints cells that hold text, so it stops short on
@@ -396,21 +385,21 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             (chat.label().to_string(), String::new())
         };
         let row_icon = if compact { icon.clone() } else { String::new() };
-        let label = truncate(&label, width.saturating_sub(4 + row_icon.width() + right.width() + badge.width()));
-        let pad = width.saturating_sub(2 + row_icon.width() + label.width() + right.width() + badge.width() + 1);
+        let label = truncate(&label, width.saturating_sub(3 + row_icon.width() + right.width() + badge.width()));
+        let pad = width.saturating_sub(2 + row_icon.width() + label.width() + right.width() + badge.width());
         let mut spans = vec![
             Span::styled(
                 if selected { "▌" } else { " " },
                 Style::default().fg(if selected { ACCENT } else { Color::Reset }),
             ),
-            Span::styled(format!("{marker} "), name_style),
+            Span::raw(" "),
             Span::styled(row_icon, icon_style),
             Span::styled(label, name_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(right, sync_style),
         ];
         if !badge.is_empty() {
-            spans.push(Span::styled(badge, Style::default().fg(UNREAD).bold()));
+            spans.push(Span::styled(badge, Style::default().fg(badge_color).bold()));
         }
         lines.push(Line::from(spans));
         if compact {
@@ -715,6 +704,27 @@ fn draw_gallery(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines[scroll..end].to_vec()), inner);
 }
 
+/// An unread count as shown: `999+` past that.
+fn unread_count(n: u64) -> String {
+    if n > 999 { "999+".to_string() } else { n.to_string() }
+}
+
+/// A chat's unread badge and its colour — `(3)`, `(@3)` when something
+/// unread pings you, `(★3)` for a `/hl` word — or None when it's read.
+fn unread_badge(chat: &crate::model::Chat) -> Option<(String, Color)> {
+    if chat.unread == 0 {
+        return None;
+    }
+    let (mark, color) = if chat.unread_mentions > 0 {
+        ("@", MENTION)
+    } else if chat.hl {
+        ("★", HIGHLIGHT)
+    } else {
+        ("", UNREAD)
+    };
+    Some((format!("({mark}{})", unread_count(chat.unread)), color))
+}
+
 /// An `icon:v2` colour name (any-ui's icon palette) as a terminal colour.
 /// Emoji carry their own colours; an unnamed colour leaves the glyph plain.
 fn icon_palette(name: Option<&str>) -> Color {
@@ -859,8 +869,9 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
     let sel_id = s.sel.clone().unwrap_or_default();
     let term_style = Style::default().fg(UNREAD).add_modifier(Modifier::BOLD);
 
+    let compact = app.prefs.compact;
     for (i, hit) in s.results.iter().enumerate() {
-        if i > 0 {
+        if i > 0 && !compact {
             lines.push(Line::from(""));
         }
         let (label, color) = match &hit.agent {
@@ -898,38 +909,101 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
             Some(body) => format!("* {label} {body}"),
             None => hit.text.clone(),
         };
-        lines.push(Line::from(head));
-
-        // Show a window of the wrapped text around the first matched term,
-        // with `…` where it was cut; the hit under the cursor opens up.
-        let wrapped = wrap(&text, text_w.saturating_sub(2));
         let terms: Vec<String> = find_ci(&text, &query, false);
         let marks: Vec<(String, Style)> = terms.into_iter().map(|t| (t, term_style)).collect();
         let cap = if hit.msg_id == sel_id { SEL_HIT_LINES } else { HIT_LINES };
-        let first = wrapped
-            .iter()
-            .position(|l| !find_ci(l, &query, false).is_empty())
-            .unwrap_or(0);
-        let mut from = first.saturating_sub(1).min(wrapped.len().saturating_sub(cap));
-        // A cut window shouldn't open on a blank line.
-        while from > 0 && from < first && wrapped[from].trim().is_empty() {
-            from += 1;
-        }
-        let to = (from + cap).min(wrapped.len());
-        for (n, l) in wrapped[from..to].iter().enumerate() {
-            let mut spans = vec![Span::raw("  ")];
-            if n == 0 && from > 0 {
-                spans.push(Span::styled("… ", dim));
+
+        // Compact: IRC-log lines, `24 Sep 13:32 Name (tag) · place text…`,
+        // continuations hanging past the time. The first line always shows
+        // (it says who and where); a match further in follows after `…`.
+        if compact {
+            let mut lead: Vec<(String, Style)> = head
+                .iter()
+                .filter(|sp| !sp.content.trim().is_empty())
+                .map(|sp| (sp.content.trim().to_string(), sp.style))
+                .collect();
+            // Time first, as in the chat's compact lines; a colon after the
+            // place, so the text doesn't run into it.
+            if let Some(pos) = lead.iter().position(|(t, _)| *t == fmt_time(hit.created_at)) {
+                let t = lead.remove(pos);
+                lead.insert(0, t);
             }
-            spans.extend(mark_spans(l, &marks));
-            lines.push(Line::from(spans));
-        }
-        if to < wrapped.len() {
-            let more = wrapped.len() - to;
-            lines.push(Line::from(Span::styled(
-                format!("  … {more} more line{}", if more == 1 { "" } else { "s" }),
-                dim,
-            )));
+            if let Some(last) = lead.last_mut().filter(|(t, _)| t.starts_with("· ")) {
+                last.0.push(':');
+            }
+            let lead_text: String = lead.iter().map(|(t, _)| format!("{t} ")).collect();
+            let hang = 6;
+            let wrapped = wrap(&format!("{lead_text}{text}"), text_w.saturating_sub(hang));
+            let first = wrapped
+                .iter()
+                .position(|l| !find_ci(l, &query, false).is_empty())
+                .unwrap_or(0);
+            let mut shown: Vec<(usize, bool)> = vec![(0, false)];
+            if first < cap {
+                shown.extend((1..cap.min(wrapped.len())).map(|n| (n, false)));
+            } else {
+                let from = first.saturating_sub(1).max(1);
+                shown.extend((from..(from + cap - 1).min(wrapped.len())).enumerate().map(|(k, n)| (n, k == 0)));
+            }
+            let last = shown.last().map_or(0, |(n, _)| *n);
+            for (n, cut) in shown {
+                let mut spans = vec![Span::raw("  ")];
+                if n > 0 {
+                    spans.push(Span::raw(" ".repeat(hang)));
+                }
+                if cut {
+                    spans.push(Span::styled("… ", dim));
+                }
+                let mut rest = wrapped[n].as_str();
+                if n == 0 {
+                    for (t, st) in &lead {
+                        let Some(r) = rest.strip_prefix(t.as_str()) else { break };
+                        spans.push(Span::styled(t.clone(), *st));
+                        spans.push(Span::raw(" "));
+                        rest = r.strip_prefix(' ').unwrap_or(r);
+                    }
+                }
+                spans.extend(mark_spans(rest, &marks));
+                lines.push(Line::from(spans));
+            }
+            if last + 1 < wrapped.len() {
+                let more = wrapped.len() - last - 1;
+                lines.push(Line::from(Span::styled(
+                    format!("  {}… {more} more line{}", " ".repeat(hang), if more == 1 { "" } else { "s" }),
+                    dim,
+                )));
+            }
+        } else {
+            lines.push(Line::from(head));
+
+            // Show a window of the wrapped text around the first matched term,
+            // with `…` where it was cut; the hit under the cursor opens up.
+            let wrapped = wrap(&text, text_w.saturating_sub(2));
+            let first = wrapped
+                .iter()
+                .position(|l| !find_ci(l, &query, false).is_empty())
+                .unwrap_or(0);
+            let mut from = first.saturating_sub(1).min(wrapped.len().saturating_sub(cap));
+            // A cut window shouldn't open on a blank line.
+            while from > 0 && from < first && wrapped[from].trim().is_empty() {
+                from += 1;
+            }
+            let to = (from + cap).min(wrapped.len());
+            for (n, l) in wrapped[from..to].iter().enumerate() {
+                let mut spans = vec![Span::raw("  ")];
+                if n == 0 && from > 0 {
+                    spans.push(Span::styled("… ", dim));
+                }
+                spans.extend(mark_spans(l, &marks));
+                lines.push(Line::from(spans));
+            }
+            if to < wrapped.len() {
+                let more = wrapped.len() - to;
+                lines.push(Line::from(Span::styled(
+                    format!("  … {more} more line{}", if more == 1 { "" } else { "s" }),
+                    dim,
+                )));
+            }
         }
         let end_line = lines.len();
         ranges.push((hit.msg_id.clone(), start_line, end_line));
@@ -1069,7 +1143,7 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             .into_iter()
             .map(|c| (c, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
             .collect();
-        marks.extend(hl.iter().map(|h| (h.clone(), Style::default().fg(UNREAD).add_modifier(Modifier::BOLD))));
+        marks.extend(hl.iter().map(|h| (h.clone(), Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD))));
         let action = action_body(&text).map(str::to_string);
 
         // Compact mode has no headers: every line carries its own time
@@ -1092,9 +1166,9 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 Span::styled(fmt_time(m.created_at), Style::default().fg(DIM)),
             ];
             if pings_me {
-                head.push(Span::styled("  @you", Style::default().fg(UNREAD).bold()));
+                head.push(Span::styled("  @you", Style::default().fg(MENTION).bold()));
             } else if !hl.is_empty() {
-                head.push(Span::styled("  ★", Style::default().fg(UNREAD).bold()));
+                head.push(Span::styled("  ★", Style::default().fg(HIGHLIGHT).bold()));
             }
             lines.push(Line::from(head));
         }
@@ -1117,7 +1191,7 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             lines.push(Line::from(Span::styled(
                 format!("  ↪ {}", one_line(&snippet, text_w.saturating_sub(2))),
                 if to_me {
-                    Style::default().fg(UNREAD).add_modifier(Modifier::BOLD)
+                    Style::default().fg(MENTION).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
                 },
@@ -1150,11 +1224,11 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
                 if let Some(t) = &tag {
                     lead.push((t.clone(), Style::default().fg(DIM)));
                 }
-                let mark = Style::default().fg(UNREAD).add_modifier(Modifier::BOLD);
+                let mark = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
                 if pings_me {
-                    lead.push(("@you".to_string(), mark));
+                    lead.push(("@you".to_string(), mark(MENTION)));
                 } else if !hl.is_empty() {
-                    lead.push(("★".to_string(), mark));
+                    lead.push(("★".to_string(), mark(HIGHLIGHT)));
                 }
             }
             let body = action.as_deref().unwrap_or(&text);
@@ -1674,19 +1748,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 c.qualified()
             };
-            let mark = if c.unread_mentions > 0 {
-                "@"
-            } else if c.hl {
-                "★"
-            } else {
-                "●"
-            };
-            let e = format!("{mark}{} {}  ", name, c.unread);
+            let (badge, color) = unread_badge(c).unwrap_or_default();
+            let e = format!("{name} {badge}  ");
             // Leave room for a "+N" overflow marker.
             if used + e.width() + reserve + 4 > total {
                 break;
             }
-            spans.push(Span::styled(e.clone(), Style::default().fg(UNREAD)));
+            spans.push(Span::styled(e.clone(), Style::default().fg(color)));
             used += e.width();
             shown += 1;
         }
