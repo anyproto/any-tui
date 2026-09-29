@@ -343,7 +343,6 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     for c in &app.chats {
         *per_space.entry(c.space_id.as_str()).or_default() += 1;
     }
-    let icon_col = app.chats.iter().any(|c| app.space_icon(&c.space_id).is_some());
     // Chats arrive grouped by space, so a header emits on each space change.
     for (i, chat) in app.chats.iter().enumerate() {
         // How this space reaches other people's devices: `lan` (mDNS) and/or
@@ -354,14 +353,10 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|st| sync_badge(st, app.direct_for(&chat.space_id)))
             .unwrap_or_default();
         let sync_style = Style::default().fg(if sync.starts_with('✗') { Color::Red } else { P2P });
-        // Icons are a column: each glyph padded to 2 cells, and spaces without
-        // one leave the slot blank so the names still line up.
+        // The icon follows the name, one space after it, so names line up
+        // whether or not a space has one.
         let (icon, icon_style) = match app.space_icon(&chat.space_id) {
-            Some((g, c)) => (
-                format!("{g}{} ", " ".repeat(2usize.saturating_sub(g.width()))),
-                Style::default().fg(icon_palette(c.as_deref())),
-            ),
-            None if icon_col => ("   ".to_string(), Style::default()),
+            Some((g, c)) => (format!(" {g}"), Style::default().fg(icon_palette(c.as_deref()))),
             None => (String::new(), Style::default()),
         };
 
@@ -378,8 +373,8 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             let name = truncate(&chat.space_name, width.saturating_sub(icon.width() + sync.width() + 1));
             let pad = width.saturating_sub(icon.width() + name.width() + sync.width());
             lines.push(Line::from(vec![
-                Span::styled(icon.clone(), icon_style),
                 Span::styled(name, Style::default().fg(Color::White).bold()),
+                Span::styled(icon.clone(), icon_style),
                 Span::raw(" ".repeat(pad)),
                 Span::styled(sync.clone(), sync_style),
             ]));
@@ -426,8 +421,8 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(if selected { ACCENT } else { Color::Reset }),
             ),
             Span::raw(" "),
-            Span::styled(row_icon, icon_style),
             Span::styled(label, name_style),
+            Span::styled(row_icon, icon_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(right, sync_style),
         ];
