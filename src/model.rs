@@ -607,6 +607,24 @@ pub fn find_ci(text: &str, words: &[String], whole_word: bool) -> Vec<String> {
     hits
 }
 
+/// A leading role / speaker tag, `[Narrator] And then…` → `[Narrator]`:
+/// short (≤ 32 chars inside), at the very start, followed by a space or
+/// the end — and not a markdown link (`[text](url)`). Readers style it as
+/// a label.
+pub fn leading_tag(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let inner = &rest[..close];
+    if inner.trim().is_empty() || inner.chars().count() > 32 || inner.contains('[') {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    if !(after.is_empty() || after.starts_with(' ')) {
+        return None;
+    }
+    Some(&text[..close + 2])
+}
+
 /// Web links (`http://…`, `https://…`) in message text, in order, as
 /// written. A URL ends at whitespace, a markdown link's `)`, `<>"'` or a
 /// closing bracket; trailing sentence punctuation and an unbalanced `)` are
@@ -1432,6 +1450,17 @@ mod tests {
         assert!(parse_whisper("[Anna](any://m/sp/A1) hi").is_none());
         assert!(parse_whisper("[x](any://o/sp/obj) hi").is_none());
         assert!(parse_whisper("plain").is_none());
+    }
+
+    #[test]
+    fn leading_tags() {
+        assert_eq!(leading_tag("[Narrator] And then"), Some("[Narrator]"));
+        assert_eq!(leading_tag("[GM]"), Some("[GM]"));
+        assert_eq!(leading_tag("[x](https://a.io) link"), None);
+        assert_eq!(leading_tag("[Anna](any://m/sp/A1) hi"), None);
+        assert_eq!(leading_tag("hi [not] start"), None);
+        assert_eq!(leading_tag("[] empty"), None);
+        assert_eq!(leading_tag("[a very long tag that goes on and on and on] x"), None);
     }
 
     #[test]

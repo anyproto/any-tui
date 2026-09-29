@@ -1,6 +1,6 @@
 use crate::app::{App, Focus, GalleryKind, Mode, SearchMode, SearchOrder, SearchScope};
 use crate::model::Liveness;
-use crate::model::{BaoPresence, action_body, find_ci, highlight_hits, md_unescape, parse_whisper, render_mentions};
+use crate::model::{BaoPresence, action_body, find_ci, highlight_hits, leading_tag, md_unescape, parse_whisper, render_mentions};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     Frame,
@@ -83,6 +83,11 @@ const NICKS: [Color; 10] = [
     Color::Indexed(209),
     Color::Indexed(147),
 ];
+
+/// A leading `[Tag]` in a message: bold, in a colour hashed from the tag.
+fn tag_style(tag: &str) -> Style {
+    Style::default().fg(nick_color(tag)).add_modifier(Modifier::BOLD)
+}
 
 fn nick_color(identity: &str) -> Color {
     // FNV-1a: tiny, stable across runs (unlike std's randomized hasher).
@@ -910,7 +915,10 @@ fn render_search_results(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRan
             None => hit.text.clone(),
         };
         let terms: Vec<String> = find_ci(&text, &query, false);
-        let marks: Vec<(String, Style)> = terms.into_iter().map(|t| (t, term_style)).collect();
+        let mut marks: Vec<(String, Style)> = terms.into_iter().map(|t| (t, term_style)).collect();
+        if let Some(t) = leading_tag(&text) {
+            marks.push((t.to_string(), tag_style(t)));
+        }
         let cap = if hit.msg_id == sel_id { SEL_HIT_LINES } else { HIT_LINES };
 
         // Compact: IRC-log lines, `24 Sep 13:32 Name (tag) · place text…`,
@@ -1144,6 +1152,11 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
             .map(|c| (c, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
             .collect();
         marks.extend(hl.iter().map(|h| (h.clone(), Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD))));
+        // A leading `[Narrator]`-style tag reads as a label, coloured by its
+        // text the way nicks are.
+        if let Some(t) = leading_tag(&text) {
+            marks.push((t.to_string(), tag_style(t)));
+        }
         let action = action_body(&text).map(str::to_string);
 
         // Compact mode has no headers: every line carries its own time

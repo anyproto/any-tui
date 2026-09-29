@@ -245,6 +245,10 @@ text goes out as-is.
 | `/devices` | your account's devices: this one, which are online (and over what) or when last seen, which one runs bao |
 | `/help` | the command list |
 
+A message that opens with a bracketed tag, IRC-style — `[Narrator] And then…`
+— shows the tag as a bold label in its own colour (the same tag always gets
+the same one). Markdown links like `[text](url)` don't count.
+
 Every name carries the first 7 characters of its identity,
 `tolya 🌴 (A7hQ66M)`, so two people who picked the same name stay apart.
 Nicks get a stable colour hashed from the identity, and the member's profile
