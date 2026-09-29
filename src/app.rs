@@ -612,9 +612,6 @@ impl App {
         }
         self.spaces = spaces;
         self.relabel_chats();
-        let keep = self.selected_chat().map(|c| c.object_id.clone());
-        self.sort_chats();
-        self.restore_selection(keep);
     }
 
     pub fn display_name(&self, identity: &str) -> String {
@@ -718,8 +715,15 @@ impl App {
         Some(format!("@{}", self.display_name(peer)))
     }
 
+    /// True for the first space chat after the DM group — where the chat
+    /// list draws its `---` separator (`sort_chats` puts DMs first).
+    pub fn starts_space_group(&self, i: usize) -> bool {
+        let is_dm = |c: &Chat| self.spaces.iter().any(|s| s.id == c.space_id && s.is_dm());
+        i > 0 && !is_dm(&self.chats[i]) && is_dm(&self.chats[i - 1])
+    }
+
     /// Re-labels every chat from the current spaces (a rename, a DM peer
-    /// learned, a name arrived).
+    /// learned, a name arrived) and re-sorts, since the list is alphabetical.
     pub fn relabel_chats(&mut self) {
         let labels: HashMap<String, String> = self
             .spaces
@@ -731,6 +735,9 @@ impl App {
                 c.space_name = l.clone();
             }
         }
+        let keep = self.selected_chat().map(|c| c.object_id.clone());
+        self.sort_chats();
+        self.restore_selection(keep);
     }
 
     pub fn set_dm_peer(&mut self, space_id: String, identity: String) {
@@ -887,19 +894,16 @@ impl App {
         self.restore_selection(keep);
     }
 
-    /// Groups chats by the space order the API returned, then by most recent
-    /// activity within each space, so live chats float to the top.
+    /// Groups chats into DMs, then spaces, each group alphabetical by its
+    /// label (case-insensitive), then by most recent activity within each
+    /// space, so live chats float to the top.
     fn sort_chats(&mut self) {
-        let order: HashMap<String, usize> = self
-            .spaces
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.id.clone(), i))
-            .collect();
+        let dms: HashSet<&str> = self.spaces.iter().filter(|s| s.is_dm()).map(|s| s.id.as_str()).collect();
+        let key = |c: &Chat| (!dms.contains(c.space_id.as_str()), c.space_name.to_lowercase());
         self.chats.sort_by(|a, b| {
-            let sa = order.get(&a.space_id).copied().unwrap_or(usize::MAX);
-            let sb = order.get(&b.space_id).copied().unwrap_or(usize::MAX);
-            sa.cmp(&sb)
+            key(a)
+                .cmp(&key(b))
+                .then(a.space_id.cmp(&b.space_id))
                 .then(b.last_at.total_cmp(&a.last_at))
                 .then(a.pos.cmp(&b.pos))
                 .then(a.object_id.cmp(&b.object_id))

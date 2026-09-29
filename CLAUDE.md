@@ -371,7 +371,8 @@ layout), `main.rs` (CLI, terminal, keymap, loop).
   Applies to sidebar, picker, and the message cursor (`▌` bar).
 - **Picker items are keyed by `object_id`, not list index.** The chat list
   re-sorts by recency on every new message; a stale index opens the wrong chat.
-- Chats sort by space order, then most-recent-activity, then sidebar pos
+- Chats sort DMs first, then spaces, each group alphabetical by label
+  (case-insensitive), then most-recent-activity, then sidebar pos
   (`miniapp.pos`).
 - The message cursor drives the viewport (scroll follows it at render time);
   `r` replies to the message under the cursor, not "the newest".

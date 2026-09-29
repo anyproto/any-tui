@@ -343,8 +343,14 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             None => (String::new(), Style::default()),
         };
 
+        // DMs come first; `---` sets them apart from the spaces (in place of
+        // the blank spacer between spaces).
+        let group_break = app.starts_space_group(i);
+        if group_break {
+            lines.push(Line::from(Span::styled("---", Style::default().fg(DIM))));
+        }
         if !compact && chat.space_id != last_space {
-            if !lines.is_empty() {
+            if !lines.is_empty() && !group_break {
                 lines.push(Line::from(""));
             }
             let name = truncate(&chat.space_name, width.saturating_sub(icon.width() + sync.width() + 1));
@@ -441,17 +447,21 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Line index of the selected chat's title row, accounting for space headers,
-/// blank spacers and the per-chat preview line.
+/// blank spacers, the DM/space `---` separator and the per-chat preview line.
 fn selected_line_index(app: &App) -> usize {
-    // Compact: one row per chat, nothing else.
+    // Compact: one row per chat, plus the separator.
     if app.prefs.compact {
-        return app.sel;
+        return app.sel + usize::from((1..=app.sel).any(|i| app.starts_space_group(i)));
     }
     let mut idx = 0usize;
     let mut last_space = String::new();
     for (i, chat) in app.chats.iter().enumerate() {
+        let group_break = app.starts_space_group(i);
+        if group_break {
+            idx += 1; // `---` between DMs and spaces
+        }
         if chat.space_id != last_space {
-            if idx > 0 {
+            if idx > 0 && !group_break {
                 idx += 1; // blank spacer between spaces
             }
             idx += 1; // space header
