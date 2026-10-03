@@ -341,9 +341,16 @@ pub struct App {
     /// scrolling can be clamped correctly.
     pub view_lines: usize,
     pub view_height: usize,
-    /// Rendered height in lines of each message (by id) and search hit, set
-    /// at draw time: a "page" is however many of them fill one screen.
-    pub msg_heights: HashMap<String, usize>,
+    /// Where each message sits in the rendered pane: `(id, first line, end
+    /// line exclusive)`, set at draw time. Paging scrolls by lines and picks
+    /// the cursor from these.
+    pub msg_ranges: Vec<(String, usize, usize)>,
+    /// The message a page scroll left the cursor on when none fit the view
+    /// whole: the render then keeps the paged position instead of pinning
+    /// that message's top, so a long message pages like `less`.
+    pub paged_onto: Option<String>,
+    /// Rendered height in lines of each search hit, set at draw time: a
+    /// "page" is however many of them fill one screen.
     pub search_heights: HashMap<String, usize>,
     pub search_view_h: usize,
     /// Visible rows of the files/links list, the help box and the chat
@@ -461,7 +468,8 @@ impl App {
             exhausted: false,
             view_lines: 0,
             view_height: 0,
-            msg_heights: HashMap::new(),
+            msg_ranges: Vec::new(),
+            paged_onto: None,
             search_heights: HashMap::new(),
             search_view_h: 0,
             gallery_view_h: 0,
@@ -2308,8 +2316,12 @@ impl App {
         }
         let cur = self.sel_msg_idx().unwrap_or(self.msgs.len() - 1) as isize;
         let last = self.msgs.len() as isize - 1;
-        let next = (cur + d).clamp(0, last) as usize;
+        self.select_msg_at((cur + d).clamp(0, last) as usize);
+    }
+
+    fn select_msg_at(&mut self, next: usize) {
         self.sel_msg = Some(self.msgs[next].id.clone());
+        self.paged_onto = None;
         // Near the top of what we've loaded: pull in more history.
         if next < 5 {
             self.load_more();
@@ -2319,20 +2331,45 @@ impl App {
         }
     }
 
-    /// PgDn / PgUp (Ctrl-v / Alt-v) in the message pane: move the cursor a
-    /// screenful — past as many messages as fill the pane's height.
+    /// PgDn / PgUp (Ctrl-v / Alt-v) in the message pane: scroll the view a
+    /// screenful less one line of context, like `less`, then put the cursor on
+    /// a message inside the new view. (Moving the cursor a screenful of
+    /// messages instead only scrolled as far as the cursor poked out — often
+    /// half a page.)
     pub fn page_msgs(&mut self, down: bool) {
+        self.scroll_msgs(down, self.view_height.saturating_sub(1).max(1));
+    }
+
+    /// Ctrl-d / Ctrl-u: half a screen.
+    pub fn half_page_msgs(&mut self, down: bool) {
+        self.scroll_msgs(down, (self.view_height / 2).max(1));
+    }
+
+    fn scroll_msgs(&mut self, down: bool, step: usize) {
         if self.msgs.is_empty() {
             return;
         }
-        let cur = self.sel_msg_idx().unwrap_or(self.msgs.len() - 1);
-        let ids: Vec<&str> = if down {
-            self.msgs[cur + 1..].iter().map(|m| m.id.as_str()).collect()
-        } else {
-            self.msgs[..cur].iter().rev().map(|m| m.id.as_str()).collect()
-        };
-        let n = page_steps(ids.iter().map(|id| self.msg_heights.get(*id).copied().unwrap_or(2)), self.view_height);
-        self.move_msg_cursor(if down { n as isize } else { -(n as isize) });
+        let (scroll, pick) = page_view(
+            &self.msg_ranges,
+            self.view_lines,
+            self.view_height,
+            self.scroll,
+            self.sel_msg.as_deref(),
+            if down { -(step as isize) } else { step as isize },
+        );
+        self.scroll = scroll;
+        let (h, total) = (self.view_height, self.view_lines);
+        let whole = pick.is_some_and(|r| {
+            let (_, s, e) = self.msg_ranges[r];
+            s >= total.saturating_sub(scroll + h) && e <= total - scroll.min(total)
+        });
+        let idx = pick
+            .and_then(|r| self.msgs.iter().position(|m| m.id == self.msg_ranges[r].0))
+            .unwrap_or(if down { self.msgs.len() - 1 } else { 0 });
+        self.select_msg_at(idx);
+        if !whole {
+            self.paged_onto = pick.map(|r| self.msg_ranges[r].0.clone());
+        }
     }
 
     /// A screenful through the search results.
@@ -2929,6 +2966,47 @@ async fn fetch_file(
     Some(dest)
 }
 
+/// Scrolls a pane of `total` lines, `h` tall, showing `scroll` lines up from
+/// the bottom, by `delta` lines (positive = up), and picks the message (index
+/// into `ranges`) for the cursor: one wholly inside the new view, as near the
+/// old cursor's shifted position as possible, so the render doesn't nudge the
+/// view back. At either end the cursor goes to the first / last message.
+fn page_view(
+    ranges: &[(String, usize, usize)],
+    total: usize,
+    h: usize,
+    scroll: usize,
+    cur: Option<&str>,
+    delta: isize,
+) -> (usize, Option<usize>) {
+    if ranges.is_empty() {
+        return (scroll, None);
+    }
+    let max_scroll = total.saturating_sub(h);
+    let new = (scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+    if new == scroll {
+        return (scroll, Some(if delta > 0 { 0 } else { ranges.len() - 1 }));
+    }
+    let end = total - new;
+    let start = end.saturating_sub(h);
+    let moved = new as isize - scroll as isize;
+    let target = match cur.and_then(|id| ranges.iter().find(|r| r.0 == id)) {
+        Some(r) => (r.1 as isize - moved).max(0) as usize,
+        None if delta > 0 => start,
+        None => end,
+    };
+    let inside = ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.1 >= start && r.2 <= end)
+        .min_by_key(|(_, r)| r.1.abs_diff(target))
+        .map(|(i, _)| i);
+    // A message taller than the screen: take the one covering the top.
+    let edge = if delta > 0 { start } else { end - 1 };
+    let pick = inside.or_else(|| ranges.iter().position(|r| r.1 <= edge && edge < r.2));
+    (new, pick)
+}
+
 /// How many items (with these heights, in the direction of travel) one
 /// screen of `screen` lines passes: at least one, and a line of context kept.
 fn page_steps(heights: impl Iterator<Item = usize>, screen: usize) -> usize {
@@ -2947,7 +3025,37 @@ fn page_steps(heights: impl Iterator<Item = usize>, screen: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::page_steps;
+    use super::{page_steps, page_view};
+
+    fn msgs(spans: &[(usize, usize)]) -> Vec<(String, usize, usize)> {
+        spans.iter().enumerate().map(|(i, &(s, e))| (format!("m{i}"), s, e)).collect()
+    }
+
+    #[test]
+    fn page_scrolls_a_screen_less_one_line() {
+        // 10 two-line messages, one blank between: 30 lines, 10-line view.
+        let r = msgs(&(0..10).map(|i| (i * 3, i * 3 + 2)).collect::<Vec<_>>());
+        // At the bottom (scroll 0) on the newest, page up 9 lines.
+        let (scroll, pick) = page_view(&r, 30, 10, 0, Some("m9"), 9);
+        assert_eq!(scroll, 9);
+        // View is lines 11..21; the cursor lands inside it, near 27-9=18.
+        let p = &r[pick.unwrap()];
+        assert!(p.1 >= 11 && p.2 <= 21);
+        assert_eq!(p.0, "m6");
+        // Clamped at the top of what's loaded; then the cursor goes to the first.
+        assert_eq!(page_view(&r, 30, 10, 18, Some("m1"), 9).0, 20);
+        assert_eq!(page_view(&r, 30, 10, 20, Some("m1"), 9), (20, Some(0)));
+        // And at the bottom, to the last.
+        assert_eq!(page_view(&r, 30, 10, 0, Some("m8"), -9), (0, Some(9)));
+    }
+
+    #[test]
+    fn page_over_a_tall_message_takes_the_one_covering_the_top() {
+        let r = msgs(&[(0, 2), (3, 40), (41, 43)]);
+        let (scroll, pick) = page_view(&r, 44, 10, 0, Some("m2"), 9);
+        assert_eq!(scroll, 9);
+        assert_eq!(pick, Some(1));
+    }
 
     #[test]
     fn pages_fill_a_screen() {

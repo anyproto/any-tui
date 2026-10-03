@@ -488,9 +488,6 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    // The cursor steps over messages, not lines, so a "page" is a message
-    // count rather than a fraction of the pane height.
-    let page: isize = 5;
     match k.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('?') => {
@@ -543,8 +540,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.open_selected();
         }
         KeyCode::Char('n') => app.next_unread(),
-        KeyCode::Char('d') if ctrl => app.move_msg_cursor(page),
-        KeyCode::Char('u') if ctrl => app.move_msg_cursor(-page),
+        KeyCode::Char('d') if ctrl => app.half_page_msgs(true),
+        KeyCode::Char('u') if ctrl => app.half_page_msgs(false),
         KeyCode::PageDown | KeyCode::PageUp => {
             let down = k.code == KeyCode::PageDown;
             match app.focus {

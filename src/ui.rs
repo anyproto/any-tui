@@ -526,15 +526,20 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.view_lines = lines.len();
     app.view_height = inner.height as usize;
-    // Messages are one line apart; count that gap into each one's height.
-    app.msg_heights = ranges.iter().map(|(id, s0, e0)| (id.clone(), e0 - s0 + 1)).collect();
+    app.msg_ranges = ranges.clone();
     let h = (inner.height as usize).max(1);
 
     // The viewport follows the message cursor: nudge the offset just enough to
     // keep the selected message on screen, so appends at the bottom and history
     // loaded at the top both leave the reader where they were.
+    // Paging onto a message taller than the pane leaves the view where the
+    // page put it while any of that message shows (`App::paged_onto`).
+    let paged = |id: &String, s: usize, e: usize| {
+        let end = lines.len().saturating_sub(app.scroll);
+        app.paged_onto.as_ref() == Some(id) && s < end && e > end.saturating_sub(h)
+    };
     if let Some(id) = &app.sel_msg {
-        if let Some((_, s, e)) = ranges.iter().find(|(mid, _, _)| mid == id) {
+        if let Some((_, s, e)) = ranges.iter().find(|(mid, s, e)| mid == id && !paged(mid, *s, *e)) {
             let (s, e) = (*s, *e);
             let mut end = lines.len().saturating_sub(app.scroll);
             if e > end {
@@ -1936,7 +1941,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "    Tab             switch pane",
         "    n               next chat with unread",
         "    g / G           oldest / newest message",
-        "    Ctrl-d / Ctrl-u jump 5 messages",
+        "    Ctrl-d / Ctrl-u half a page",
         "    C-v / A-v       page down / up (PgDn / PgUp)",
         "",
         "  Search (/)",
@@ -2014,7 +2019,7 @@ fn draw_help_compact(f: &mut Frame, area: Rect, app: &mut App) {
         "   Tab      switch pane",
         "   n        next unread",
         "   g/G      oldest/newest",
-        "   C-d/C-u  jump 5 msgs",
+        "   C-d/C-u  half page",
         "   C-v/A-v  page down/up",
         "",
         "  Chat list",

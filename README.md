@@ -179,7 +179,7 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `Space` | fuzzy-find any chat (`stg` finds **s**ync **t**eam: **g**eneral) |
 | `Ctrl-n` / `Ctrl-p` | next / previous chat without leaving the message pane |
 | `n` | jump to the next chat with unread, wherever it is |
-| `Ctrl-d` / `Ctrl-u`, `g` / `G` | 5 messages at a time; oldest (loads history) / newest |
+| `Ctrl-d` / `Ctrl-u`, `g` / `G` | half a screen down / up; oldest (loads history) / newest |
 | `Ctrl-v` / `Alt-v`, `PgDn` / `PgUp` | a screenful down / up — in the messages, the chat list, search, the files/links list, the picker and help |
 | `i`, then `Enter` | compose, send (`Alt-Enter` for a newline) |
 | `r` | reply to the message under the cursor |
