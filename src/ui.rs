@@ -1510,7 +1510,7 @@ fn input_height(app: &App, width: u16) -> u16 {
     }
     let inner_w = (width.saturating_sub(2) as usize).max(1);
     let lines = wrap_input(app.input.value(), inner_w).len().clamp(1, MAX_INPUT_LINES);
-    let banner = if app.reply_to.is_some() { 1 } else { 0 };
+    let banner = if app.reply_to.is_some() || app.editing.is_some() { 1 } else { 0 };
     lines as u16 + 2 + banner
 }
 
@@ -1544,14 +1544,29 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
                 rows[0],
             );
             area = rows[1];
+        } else if app.editing.is_some() {
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ✎ editing your message ", Style::default().fg(ACCENT).bold()),
+                    Span::styled("— Enter saves, Esc keeps it as it was", Style::default().fg(DIM)),
+                ])),
+                rows[0],
+            );
+            area = rows[1];
         }
 
+        let editing = app.editing.is_some();
         let block = Block::default()
             .padding(Padding::horizontal(1))
             .title_style(Style::default().fg(ACCENT))
-            .title(" message ")
+            .title(if editing { " edit " } else { " message " })
             .title_bottom(Line::from(Span::styled(
-                " Enter send · Alt-Enter newline · Esc cancel ",
+                if editing {
+                    " Enter save · Alt-Enter newline · Esc cancel "
+                } else {
+                    " Enter send · Alt-Enter newline · Esc cancel "
+                },
                 Style::default().fg(DIM),
             )));
         let inner = block.inner(area);
@@ -1576,12 +1591,16 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         // Keep the hint short enough for a phone-width pane.
         let narrow = area.width < 60;
-        let hint = match (app.active.is_some(), app.single_now, narrow) {
-            (true, true, true) => "  Esc back · i compose",
-            (true, true, false) => "  Esc  back to chats   i  compose   r  reply   ?  help",
-            (true, false, _) => "  i  compose   r  reply   ?  help",
-            (false, _, true) => "  Enter open · ? help",
-            (false, _, false) => "  Enter  open chat   ?  help",
+        // `e` is offered only when the message under the cursor is yours.
+        let mine = app.can_edit_selected();
+        let hint = match (app.active.is_some(), app.single_now, narrow, mine) {
+            (true, true, true, _) => "  Esc back · i compose",
+            (true, true, false, false) => "  Esc  back to chats   i  compose   r  reply   ?  help",
+            (true, true, false, true) => "  Esc  back to chats   i  compose   r  reply   e  edit   ?  help",
+            (true, false, _, false) => "  i  compose   r  reply   ?  help",
+            (true, false, _, true) => "  i  compose   r  reply   e  edit   ?  help",
+            (false, _, true, _) => "  Enter open · ? help",
+            (false, _, false, _) => "  Enter  open chat   ?  help",
         };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
@@ -1964,6 +1983,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "    i               compose",
         "                    Enter sends · Alt-Enter newline",
         "    r               reply to the message under ▌",
+        "    e               edit your message under ▌",
         "    R               mark chat read now",
         "    D               DM the author under ▌",
         "    W               whisper about the message under ▌",
@@ -2030,6 +2050,7 @@ fn draw_help_compact(f: &mut Frame, area: Rect, app: &mut App) {
         "   i        compose",
         "   A-Enter  newline",
         "   r        reply to ▌",
+        "   e        edit yours ▌",
         "   R        mark read",
         "   D        DM author",
         "   W        whisper",

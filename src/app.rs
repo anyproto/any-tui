@@ -154,6 +154,16 @@ pub enum SearchScope {
     AllSpaces,
 }
 
+/// A message being rewritten in the composer (`e`).
+pub struct Editing {
+    pub id: String,
+    /// The draft the edit pushed aside, put back when it's sent or cancelled.
+    pub draft: String,
+    /// (name, identity) of the mentions the message already had: relinked
+    /// on save even when the person isn't in this space's roster.
+    pub mentions: Vec<(String, String)>,
+}
+
 /// Relevance mode passed to the search engine.
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum SearchMode {
@@ -319,6 +329,8 @@ pub struct App {
     /// Lines scrolled up from the bottom. 0 == pinned to newest.
     pub scroll: usize,
     pub reply_to: Option<String>,
+    /// `e`: the message (yours) the composer is rewriting.
+    pub editing: Option<Editing>,
     pub toast: Option<(String, Instant)>,
     pub picker: Option<Picker>,
     pub search: Option<Search>,
@@ -453,6 +465,7 @@ impl App {
             input: Input::default(),
             scroll: 0,
             reply_to: None,
+            editing: None,
             toast: None,
             picker: None,
             search: None,
@@ -1076,6 +1089,7 @@ impl App {
         self.sel_msg = None;
         self.scroll = 0;
         self.reply_to = None;
+        self.cancel_edit();
         self.exhausted = false;
         self.loading = true;
         self.gallery = None;
@@ -1231,6 +1245,9 @@ impl App {
         if raw.is_empty() {
             return;
         }
+        if self.editing.is_some() {
+            return self.submit_edit(raw);
+        }
         // IRC-style commands; a refused one keeps the input for fixing.
         let cmd = match commands::parse(&raw) {
             Ok(c) => c,
@@ -1374,6 +1391,74 @@ impl App {
                 .await
             {
                 let _ = tx.send(Ev::Error(format!("send: {e}")));
+            }
+        });
+    }
+
+    /// `e`: rewrite the message under the cursor, if it's yours (and not an
+    /// agent's). Its text goes into the composer with mention links shown as
+    /// `@Name`; Enter sends it back as a `PATCH`.
+    pub fn start_edit(&mut self) {
+        if !self.can_edit_selected() {
+            let msg = if self.selected_message().is_some() {
+                "only your own messages can be edited"
+            } else {
+                "no message selected"
+            };
+            return self.toast(msg);
+        }
+        let m = self.selected_message().expect("checked above");
+        let id = m.id.clone();
+        let mentions = std::cell::RefCell::new(Vec::new());
+        let text = render_mentions(&m.text, |i| {
+            let name = self.mention_name(i);
+            if let Some(n) = &name {
+                mentions.borrow_mut().push((n.clone(), i.to_string()));
+            }
+            name
+        })
+        .0;
+        let draft = self.input.value().to_string();
+        self.reply_to = None;
+        self.editing = Some(Editing { id, draft, mentions: mentions.into_inner() });
+        self.input = Input::new(text);
+        self.hist_pos = None;
+        self.mode = Mode::Insert;
+        self.focus = Focus::Messages;
+    }
+
+    /// Whether `e` would edit the message under the cursor: yours, not an agent's.
+    pub fn can_edit_selected(&self) -> bool {
+        self.selected_message().is_some_and(|m| m.creator == self.me && m.agent.is_none())
+    }
+
+    /// Leaves edit mode, restoring the draft the edit pushed aside.
+    pub fn cancel_edit(&mut self) {
+        if let Some(e) = self.editing.take() {
+            self.input = Input::new(e.draft);
+        }
+    }
+
+    /// Sends the composer as the new text of the message being edited. Taken
+    /// verbatim — no command parsing, so a stored `/me …` or `s/…` stays text.
+    fn submit_edit(&mut self, text: String) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return self.toast("no chat open");
+        };
+        let Some(Editing { id, draft, mentions }) = self.editing.take() else { return };
+        let mut roster = self.roster(&chat.space_id);
+        roster.extend(mentions);
+        let text = link_mentions(&text, &chat.space_id, &roster);
+        let unchanged = self.msgs.iter().any(|m| m.id == id && m.text == text);
+        self.input = Input::new(draft);
+        self.mode = Mode::Normal;
+        if unchanged {
+            return;
+        }
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = api.edit_message(&chat.space_id, &chat.object_id, &id, &text).await {
+                let _ = tx.send(Ev::Error(format!("edit: {e}")));
             }
         });
     }

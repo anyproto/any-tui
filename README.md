@@ -183,6 +183,7 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `Ctrl-v` / `Alt-v`, `PgDn` / `PgUp` | a screenful down / up — in the messages, the chat list, search, the files/links list, the picker and help |
 | `i`, then `Enter` | compose, send (`Alt-Enter` for a newline) |
 | `r` | reply to the message under the cursor |
+| `e` | edit your message under the cursor (`Enter` saves, `Esc` cancels) |
 | `@Name<Tab>` | complete a mention from the space's roster |
 | `/` | search messages — see [Search](#search) |
 | `R` | mark the chat read now |

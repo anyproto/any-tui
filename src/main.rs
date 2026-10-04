@@ -429,6 +429,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 app.reply_to = None;
+                app.cancel_edit();
             }
             // Enter sends, so an explicit newline needs its own key. Alt-Enter
             // is the common one; Ctrl-J (handled by the editor) is the
@@ -576,6 +577,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.toast("no message selected");
             }
         }
+        // Edit the message under the cursor (yours only).
+        KeyCode::Char('e') => app.start_edit(),
         KeyCode::Char('R') => app.mark_read_now(),
         // DM the author of the message under the cursor.
         KeyCode::Char('D') => app.dm("", None),
