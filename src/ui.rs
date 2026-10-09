@@ -1595,10 +1595,10 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         let mine = app.can_edit_selected();
         let hint = match (app.active.is_some(), app.single_now, narrow, mine) {
             (true, true, true, _) => "  Esc back · i compose",
-            (true, true, false, false) => "  Esc  back to chats   i  compose   r  reply   ?  help",
-            (true, true, false, true) => "  Esc  back to chats   i  compose   r  reply   e  edit   ?  help",
-            (true, false, _, false) => "  i  compose   r  reply   ?  help",
-            (true, false, _, true) => "  i  compose   r  reply   e  edit   ?  help",
+            (true, true, false, false) => "  Esc  back to chats   i  compose   r  reply   y  copy   ?  help",
+            (true, true, false, true) => "  Esc  back to chats   i  compose   r  reply   e  edit   y  copy   ?  help",
+            (true, false, _, false) => "  i  compose   r  reply   y  copy   ?  help",
+            (true, false, _, true) => "  i  compose   r  reply   e  edit   y  copy   ?  help",
             (false, _, true, _) => "  Enter open · ? help",
             (false, _, false, _) => "  Enter  open chat   ?  help",
         };
@@ -1984,6 +1984,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "                    Enter sends · Alt-Enter newline",
         "    r               reply to the message under ▌",
         "    e               edit your message under ▌",
+        "    y               copy the message under ▌",
         "    R               mark chat read now",
         "    D               DM the author under ▌",
         "    W               whisper about the message under ▌",
@@ -2051,6 +2052,7 @@ fn draw_help_compact(f: &mut Frame, area: Rect, app: &mut App) {
         "   A-Enter  newline",
         "   r        reply to ▌",
         "   e        edit yours ▌",
+        "   y        copy ▌",
         "   R        mark read",
         "   D        DM author",
         "   W        whisper",

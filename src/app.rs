@@ -1395,6 +1395,21 @@ impl App {
         });
     }
 
+    /// `y`: copies the message under the cursor as it reads on screen —
+    /// mention links as `@Name`, markdown escapes undone.
+    pub fn copy_selected(&mut self) {
+        let Some(m) = self.selected_message() else {
+            return self.toast("no message selected");
+        };
+        let text = md_unescape(&render_mentions(&m.text, |i| self.mention_name(i)).0);
+        let n = text.chars().count();
+        let how = match crate::clipboard::copy(&text) {
+            crate::clipboard::Copied::Tool(t) => t,
+            crate::clipboard::Copied::Osc52 => "terminal (OSC 52)",
+        };
+        self.toast(format!("copied {n} chars via {how}"));
+    }
+
     /// `e`: rewrite the message under the cursor, if it's yours (and not an
     /// agent's). Its text goes into the composer with mention links shown as
     /// `@Name`; Enter sends it back as a `PATCH`.

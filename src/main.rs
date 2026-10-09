@@ -5,6 +5,7 @@
 
 mod api;
 mod app;
+mod clipboard;
 mod commands;
 mod edit;
 mod files;
@@ -579,6 +580,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         // Edit the message under the cursor (yours only).
         KeyCode::Char('e') => app.start_edit(),
+        // Copy the message under the cursor to the clipboard.
+        KeyCode::Char('y') => app.copy_selected(),
         KeyCode::Char('R') => app.mark_read_now(),
         // DM the author of the message under the cursor.
         KeyCode::Char('D') => app.dm("", None),

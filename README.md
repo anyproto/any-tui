@@ -184,6 +184,7 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `i`, then `Enter` | compose, send (`Alt-Enter` for a newline) |
 | `r` | reply to the message under the cursor |
 | `e` | edit your message under the cursor (`Enter` saves, `Esc` cancels) |
+| `y` | copy the message under the cursor (`pbcopy`, `wl-copy`, `xclip` / `xsel`; OSC 52 over SSH or without them — in tmux that needs `set-clipboard on`) |
 | `@Name<Tab>` | complete a mention from the space's roster |
 | `/` | search messages — see [Search](#search) |
 | `R` | mark the chat read now |
