@@ -578,6 +578,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.toast("no message selected");
             }
         }
+        // Jump to the message the one under the cursor replies to.
+        KeyCode::Char('J') => app.jump_to_reply(),
         // Edit the message under the cursor (yours only).
         KeyCode::Char('e') => app.start_edit(),
         // Copy the message under the cursor to the clipboard.

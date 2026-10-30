@@ -2045,6 +2045,21 @@ impl App {
         true
     }
 
+    /// `J`: move the cursor to the message the one under it replies to,
+    /// paging history until it loads (same path as a search hit).
+    pub fn jump_to_reply(&mut self) {
+        let Some(m) = self.selected_message() else {
+            self.toast("no message selected");
+            return;
+        };
+        let Some(target) = m.reply_to.clone() else {
+            self.toast("not a reply");
+            return;
+        };
+        self.pending_jump = Some(target);
+        self.try_resolve_jump();
+    }
+
     /// Something changed in the open chat: refresh the stats soon (the tick
     /// picks it up, at most every `STATS_EVERY`).
     pub fn stats_changed(&mut self) {
