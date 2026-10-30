@@ -70,9 +70,14 @@ Then run the TUI. With Nix, straight from the flake:
 
 ```sh
 nix run . -- --no-auto-read                # args after `--` go to any-tui
-nix run github:anyproto/any-tui            # or without a checkout
+nix run github:anyproto/any-tui/v0.3.0     # a release, without a checkout
+nix run github:anyproto/any-tui            # or the latest main
+nix profile install github:anyproto/any-tui/v0.3.0   # keep it on PATH
 nix build && ./result/bin/any-tui          # or build it once
 ```
+
+Releases are the `v*` tags (no GitHub Releases, no prebuilt binaries); the
+flake builds the tagged source.
 
 or with cargo:
 
