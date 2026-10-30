@@ -585,6 +585,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.toast("no message selected");
             }
         }
+        // Back to where the cursor was before the last jump.
+        KeyCode::Char('b') => app.jump_back(),
         // Edit the message under the cursor (yours only).
         KeyCode::Char('e') => app.start_edit(),
         // Copy the message under the cursor to the clipboard.

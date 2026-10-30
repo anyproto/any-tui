@@ -339,6 +339,9 @@ pub struct App {
     search_task: Option<JoinHandle<()>>,
     /// Message id we want the cursor on once its chat's history reaches it.
     pending_jump: Option<String>,
+    /// Where the cursor was before each jump — (chat object id, message id),
+    /// newest last — so `b` can walk back through them.
+    jump_stack: Vec<(String, String)>,
     pub show_help: bool,
     /// Lines the help overlay is scrolled down (clamped when drawn).
     pub help_scroll: usize,
@@ -477,6 +480,7 @@ impl App {
             search_gen: 0,
             search_task: None,
             pending_jump: None,
+            jump_stack: Vec::new(),
             show_help: false,
             help_scroll: 0,
             clear_screen: false,
@@ -2067,6 +2071,7 @@ impl App {
             self.toast("that chat isn't in your list");
             return true;
         }
+        self.push_jump_origin();
         self.open_chat_id(&w.chat_id);
         self.pending_jump = Some(w.msg_id);
         self.try_resolve_jump();
@@ -2080,9 +2085,40 @@ impl App {
         let Some(target) = self.selected_message().and_then(|m| m.reply_to.clone()) else {
             return false;
         };
+        self.push_jump_origin();
         self.pending_jump = Some(target);
         self.try_resolve_jump();
         true
+    }
+
+    /// Remembers the cursor's chat and message so `b` can return to it. Called
+    /// before every jump (reply, whisper, search hit, files / links entry).
+    fn push_jump_origin(&mut self) {
+        let (Some(chat), Some(msg)) = (self.active.clone(), self.sel_msg.clone()) else {
+            return;
+        };
+        self.jump_stack.push((chat, msg));
+        if self.jump_stack.len() > 50 {
+            self.jump_stack.remove(0);
+        }
+    }
+
+    /// `b`: back to where the cursor was before the last jump, re-opening
+    /// that chat when the jump crossed chats.
+    pub fn jump_back(&mut self) {
+        let Some((chat, msg)) = self.jump_stack.pop() else {
+            self.toast("nothing to go back to");
+            return;
+        };
+        if self.active.as_deref() != Some(chat.as_str()) {
+            if !self.chats.iter().any(|c| c.object_id == chat) {
+                self.toast("that chat isn't in your list");
+                return;
+            }
+            self.open_chat_id(&chat);
+        }
+        self.pending_jump = Some(msg);
+        self.try_resolve_jump();
     }
 
     /// Something changed in the open chat: refresh the stats soon (the tick
@@ -2195,6 +2231,7 @@ impl App {
     pub fn gallery_jump(&mut self) {
         let Some(item) = self.gallery_selected() else { return };
         self.gallery = None;
+        self.push_jump_origin();
         self.pending_jump = Some(item.msg_id);
         self.try_resolve_jump();
     }
@@ -2379,6 +2416,7 @@ impl App {
             return;
         };
         self.close_search();
+        self.push_jump_origin();
         self.pending_jump = Some(hit.msg_id.clone());
         self.sel = idx;
         self.user_selected = true;

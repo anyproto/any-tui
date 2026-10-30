@@ -190,6 +190,7 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `r` | reply to the message under the cursor |
 | `e` | edit your message under the cursor (`Enter` saves, `Esc` cancels) |
 | `Enter` | on a reply under the cursor: jump to the message it answers (pages history until it loads) |
+| `b` | back to where the cursor was before the last jump (reply, whisper, search hit, files / links entry); repeat to walk further back |
 | `y` | copy the message under the cursor (`pbcopy`, `wl-copy`, `xclip` / `xsel`; OSC 52 over SSH or without them — in tmux that needs `set-clipboard on`) |
 | `@Name<Tab>` | complete a mention from the space's roster |
 | `/` | search messages — see [Search](#search) |
