@@ -348,6 +348,7 @@ another client should keep its badges.
 | `--api <url>` | server base URL, default `http://127.0.0.1:7001/v1` |
 | `--no-auto-read` | never mark anything read |
 | `--layout auto\|split\|single` | pane layout, default `auto` |
+| `--agent-space <name\|id>` | the agent's space, default `bao`: heads the chat list, labelled `Agent` |
 | `--version` | print the version |
 
 ## More

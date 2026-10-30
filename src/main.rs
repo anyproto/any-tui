@@ -35,6 +35,10 @@ struct Args {
     /// two above. `z` hides or shows the chat list at runtime.
     #[arg(long, value_enum, default_value_t = LayoutArg::Auto)]
     layout: LayoutArg,
+    /// The agent's space, by name or id: it heads the chat list, labelled
+    /// `Agent`.
+    #[arg(long, default_value = "bao")]
+    agent_space: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -86,6 +90,7 @@ async fn main() -> Result<()> {
         health.version.clone(),
         !args.no_auto_read,
         args.layout.into(),
+        args.agent_space.clone(),
     );
     // Settings + composer history from the daemon's local store.
     let loaded = prefs::load(&api).await;

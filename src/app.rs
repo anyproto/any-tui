@@ -430,6 +430,9 @@ pub struct App {
     direct_at: Instant,
     /// The `/devices` overlay, while it's up.
     pub devices_view: Option<(Devices, HashMap<String, Liveness>)>,
+    /// The agent's space, by name (case-insensitive) or id — `--agent-space`,
+    /// default `bao`. It heads the chat list, labelled `Agent`.
+    pub agent_space: String,
 }
 
 impl App {
@@ -440,11 +443,13 @@ impl App {
         version: String,
         auto_read: bool,
         layout: Layout,
+        agent_space: String,
     ) -> App {
         App {
             api,
             tx,
             me,
+            agent_space,
             version,
             names: HashMap::new(),
             identities: Vec::new(),
@@ -736,11 +741,33 @@ impl App {
         Some(format!("@{}", self.display_name(peer)))
     }
 
-    /// True for the first space chat after the DM group — where the chat
-    /// list draws its `---` separator (`sort_chats` puts DMs first).
-    pub fn starts_space_group(&self, i: usize) -> bool {
-        let is_dm = |c: &Chat| self.spaces.iter().any(|s| s.id == c.space_id && s.is_dm());
-        i > 0 && !is_dm(&self.chats[i]) && is_dm(&self.chats[i - 1])
+    /// True when `space_id` is the agent's space (`--agent-space`, default
+    /// `bao`): matched by id or by name, case-insensitively.
+    pub fn is_agent_space(&self, space_id: &str) -> bool {
+        if space_id == self.agent_space {
+            return true;
+        }
+        self.spaces
+            .iter()
+            .any(|s| s.id == space_id && s.name.eq_ignore_ascii_case(&self.agent_space))
+    }
+
+    /// Which block of the chat list a space sits in: the agent's space,
+    /// then DMs, then the other spaces (`sort_chats` orders by this).
+    fn space_group(&self, space_id: &str) -> u8 {
+        if self.is_agent_space(space_id) {
+            0
+        } else if self.spaces.iter().any(|s| s.id == space_id && s.is_dm()) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// True for the first chat of a new group (agent → DMs → spaces) — where
+    /// the chat list draws its `---` separator.
+    pub fn starts_group(&self, i: usize) -> bool {
+        i > 0 && self.space_group(&self.chats[i].space_id) != self.space_group(&self.chats[i - 1].space_id)
     }
 
     /// Re-labels every chat from the current spaces (a rename, a DM peer
@@ -915,12 +942,13 @@ impl App {
         self.restore_selection(keep);
     }
 
-    /// Groups chats into DMs, then spaces, each group alphabetical by its
-    /// label (case-insensitive), then by most recent activity within each
-    /// space, so live chats float to the top.
+    /// Groups chats into the agent's space, then DMs, then spaces, each
+    /// group alphabetical by its label (case-insensitive), then by most
+    /// recent activity within each space, so live chats float to the top.
     fn sort_chats(&mut self) {
-        let dms: HashSet<&str> = self.spaces.iter().filter(|s| s.is_dm()).map(|s| s.id.as_str()).collect();
-        let key = |c: &Chat| (!dms.contains(c.space_id.as_str()), c.space_name.to_lowercase());
+        let groups: HashMap<String, u8> =
+            self.chats.iter().map(|c| (c.space_id.clone(), self.space_group(&c.space_id))).collect();
+        let key = |c: &Chat| (groups.get(&c.space_id).copied().unwrap_or(2), c.space_name.to_lowercase());
         self.chats.sort_by(|a, b| {
             key(a)
                 .cmp(&key(b))

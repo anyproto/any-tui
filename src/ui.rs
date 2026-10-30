@@ -255,11 +255,12 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         // Selection is the ▌ bar plus brighter text — same reasoning as the
         // sidebar: a background tint stops short on truncated rows.
         let label = app.pick_label(chat);
+        let is_agent = app.is_agent_space(&chat.space_id);
         let base = match (selected, chat.unread > 0) {
             (true, true) => Style::default().fg(SEL_UNREAD).add_modifier(Modifier::BOLD),
             (true, false) => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
             (false, true) => Style::default().fg(UNREAD),
-            (false, false) => Style::default().fg(Color::Gray),
+            (false, false) => Style::default().fg(if is_agent { AGENT } else { Color::Gray }),
         };
         let avail = width.saturating_sub(badge.width() + 3);
         let mut spans = vec![Span::styled(
@@ -360,9 +361,13 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             None => (String::new(), Style::default()),
         };
 
-        // DMs come first; `---` sets them apart from the spaces (in place of
-        // the blank spacer between spaces).
-        let group_break = app.starts_space_group(i);
+        // The agent's space, then DMs, then spaces; `---` sets the groups
+        // apart (in place of the blank spacer between spaces).
+        let group_break = app.starts_group(i);
+        let is_agent = app.is_agent_space(&chat.space_id);
+        // The agent's space is tagged `Agent` and drawn in the agent colour.
+        let tag = if is_agent { " Agent" } else { "" };
+        let tag_style = Style::default().fg(AGENT).add_modifier(Modifier::ITALIC);
         if group_break {
             lines.push(Line::from(Span::styled("---", Style::default().fg(DIM))));
         }
@@ -370,11 +375,13 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             if !lines.is_empty() && !group_break {
                 lines.push(Line::from(""));
             }
-            let name = truncate(&chat.space_name, width.saturating_sub(icon.width() + sync.width() + 1));
-            let pad = width.saturating_sub(icon.width() + name.width() + sync.width());
+            let name = truncate(&chat.space_name, width.saturating_sub(icon.width() + tag.width() + sync.width() + 1));
+            let pad = width.saturating_sub(icon.width() + name.width() + tag.width() + sync.width());
+            let head_color = if is_agent { AGENT } else { Color::White };
             lines.push(Line::from(vec![
-                Span::styled(name, Style::default().fg(Color::White).bold()),
+                Span::styled(name, Style::default().fg(head_color).bold()),
                 Span::styled(icon.clone(), icon_style),
+                Span::styled(tag, tag_style),
                 Span::raw(" ".repeat(pad)),
                 Span::styled(sync.clone(), sync_style),
             ]));
@@ -396,7 +403,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             (true, true) => Style::default().fg(SEL_UNREAD).add_modifier(Modifier::BOLD),
             (true, false) => Style::default().fg(SEL).add_modifier(Modifier::BOLD),
             (false, true) => Style::default().fg(UNREAD),
-            (false, false) => Style::default().fg(Color::Gray),
+            (false, false) => Style::default().fg(if is_agent { AGENT } else { Color::Gray }),
         };
 
         // Compact: one row per chat, `● 🧉 Gustavo   p2p 2`. Otherwise the
@@ -413,8 +420,10 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             (chat.label().to_string(), String::new())
         };
         let row_icon = if compact { icon.clone() } else { String::new() };
-        let label = truncate(&label, width.saturating_sub(3 + row_icon.width() + right.width() + badge.width()));
-        let pad = width.saturating_sub(2 + row_icon.width() + label.width() + right.width() + badge.width());
+        // Compact has no header row, so the `Agent` tag sits on the row.
+        let row_tag = if compact { tag } else { "" };
+        let label = truncate(&label, width.saturating_sub(3 + row_icon.width() + row_tag.width() + right.width() + badge.width()));
+        let pad = width.saturating_sub(2 + row_icon.width() + row_tag.width() + label.width() + right.width() + badge.width());
         let mut spans = vec![
             Span::styled(
                 if selected { "▌" } else { " " },
@@ -423,6 +432,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" "),
             Span::styled(label, name_style),
             Span::styled(row_icon, icon_style),
+            Span::styled(row_tag, tag_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(right, sync_style),
         ];
@@ -468,12 +478,12 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 fn selected_line_index(app: &App) -> usize {
     // Compact: one row per chat, plus the separator.
     if app.prefs.compact {
-        return app.sel + usize::from((1..=app.sel).any(|i| app.starts_space_group(i)));
+        return app.sel + usize::from((1..=app.sel).any(|i| app.starts_group(i)));
     }
     let mut idx = 0usize;
     let mut last_space = String::new();
     for (i, chat) in app.chats.iter().enumerate() {
-        let group_break = app.starts_space_group(i);
+        let group_break = app.starts_group(i);
         if group_break {
             idx += 1; // `---` between DMs and spaces
         }
