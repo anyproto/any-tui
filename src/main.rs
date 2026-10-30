@@ -534,8 +534,10 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char(' ') => app.open_picker(),
         KeyCode::Char('/') => app.open_search(),
         KeyCode::Enter => {
-            // On a whisper in a DM, Enter goes to the message it's about.
-            if app.focus == Focus::Messages && app.follow_whisper() {
+            // In the message pane Enter follows the link under the cursor: a
+            // whisper goes to the message it's about, a reply to the message
+            // it answers.
+            if app.focus == Focus::Messages && (app.follow_whisper() || app.jump_to_reply()) {
                 return;
             }
             app.user_selected = true;
@@ -583,8 +585,6 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.toast("no message selected");
             }
         }
-        // Jump to the message the one under the cursor replies to.
-        KeyCode::Char('J') => app.jump_to_reply(),
         // Edit the message under the cursor (yours only).
         KeyCode::Char('e') => app.start_edit(),
         // Copy the message under the cursor to the clipboard.
