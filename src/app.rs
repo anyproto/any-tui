@@ -1846,7 +1846,7 @@ impl App {
             None => return self.toast(format!("no one called {rest}")),
         };
         let author = match &m.agent {
-            Some(a) => a.name.clone(),
+            Some(a) => format!("{} ({})", a.name, self.display_name(&m.creator)),
             None => self.display_name(&m.creator),
         };
         let quoted = md_unescape(&render_mentions(&m.text, |i| self.mention_name(i)).0);

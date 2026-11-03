@@ -53,12 +53,17 @@ fn person_label(app: &App, identity: &str) -> (String, Color) {
     (iconed_name(app, identity, app.display_name(identity)), color)
 }
 
-/// `(A7hQ66M)` — the start of a named person's identity, shown after the name so
-/// two people who picked the same name stay apart. None for agents (their
-/// name is theirs) and for people shown by id already (no name known).
+/// The dim tag after an author's name. For a person: `(A7hQ66M)`, the start
+/// of their identity, shown after the name so two people who picked the same
+/// name stay apart (none for people shown by id already). For an agent: the
+/// member account it runs under, `✦ bao (km)` — agents sign as the human,
+/// so this is what maps the reply back to whose agent it is.
 fn id_tag(app: &App, m_agent: bool, identity: &str) -> Option<String> {
+    if m_agent {
+        return Some(format!("({})", app.display_name(identity)));
+    }
     let named = app.names.get(identity).is_some_and(|n| !n.is_empty());
-    (!m_agent && named).then(|| format!("({})", crate::model::short_id(identity)))
+    named.then(|| format!("({})", crate::model::short_id(identity)))
 }
 
 /// `🧉 Name` when the person's profile icon renders in a terminal.

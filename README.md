@@ -110,7 +110,8 @@ Wait for `anyrt serving space=… chat=…` in its log (the first boot also
 joins the published agent repos, so give it a moment). Now open
 `bao/General` in the TUI, `i`, type, `Enter`; the
 reply lands over SSE a few seconds later, rendered with a `✦` marker and the
-agent's name rather than your own. Other providers (OpenRouter, Ollama, …) are
+agent's name, followed by the member account it runs under (`✦ bao (km)`):
+agents sign as that person, so the tag says whose agent answered. Other providers (OpenRouter, Ollama, …) are
 one config row each — see anybao's
 [`docs/llm-models.md`](https://github.com/anyproto/anybao/blob/main/docs/llm-models.md).
 If the key is missing, bao posts a credential-request bubble into the chat;
