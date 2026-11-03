@@ -71,9 +71,9 @@ Then run the TUI. With Nix, straight from the flake:
 
 ```sh
 nix run . -- --no-auto-read                # args after `--` go to any-tui
-nix run github:anyproto/any-tui/v0.5.0     # a release, without a checkout
+nix run github:anyproto/any-tui/v0.6.0     # a release, without a checkout
 nix run github:anyproto/any-tui            # or the latest main
-nix profile install github:anyproto/any-tui/v0.5.0   # keep it on PATH
+nix profile install github:anyproto/any-tui/v0.6.0   # keep it on PATH
 nix build && ./result/bin/any-tui          # or build it once
 ```
 
