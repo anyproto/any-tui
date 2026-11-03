@@ -1,6 +1,7 @@
 use crate::api::{Api, FileInfo, SearchResults};
 use crate::files;
 use crate::commands::{self, Command};
+use crate::emoji;
 use crate::model::{
     AttachmentTarget, BaoBeat, BaoPresence, Chat, DirectPeers, Devices, Identity, Liveness, Message,
     SYSTEM, Space, SyncStatus, derive_bao_presence, direct_peers, peer_liveness,
@@ -164,6 +165,29 @@ pub struct Editing {
     /// (name, identity) of the mentions the message already had: relinked
     /// on save even when the person isn't in this space's roster.
     pub mentions: Vec<(String, String)>,
+}
+
+/// What the emoji picker does with the chosen emoji.
+#[derive(Clone, PartialEq, Debug)]
+pub enum EmojiTarget {
+    /// `R`: toggle a reaction on this message. `draft` is the composer text
+    /// put aside while the composer serves as the picker's query.
+    React { msg_id: String, draft: String },
+    /// `:` in the composer: replace the `:query` token whose colon is at
+    /// char index `start`.
+    Insert { start: usize },
+}
+
+/// The emoji picker: a fuzzy search over `emoji::table()` typed in the
+/// composer, its matches dropped down above the input box.
+pub struct EmojiPick {
+    pub target: EmojiTarget,
+    pub query: String,
+    pub sel: usize,
+    pub items: Vec<&'static emoji::Entry>,
+    /// Set once ↑/↓ moved the highlight: then Enter on a bare `:` picks the
+    /// highlighted emoji instead of sending the line.
+    pub navigated: bool,
 }
 
 /// Relevance mode passed to the search engine.
@@ -336,6 +360,10 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub picker: Option<Picker>,
     pub search: Option<Search>,
+    pub emoji: Option<EmojiPick>,
+    /// The colon (char index) whose inline picker was dismissed with Esc, so
+    /// it stays shut while that word is still being typed.
+    emoji_dismissed: Option<usize>,
     /// Bumped per keystroke; a returning result whose gen is stale is dropped.
     pub search_gen: u64,
     search_task: Option<JoinHandle<()>>,
@@ -488,6 +516,8 @@ impl App {
             toast: None,
             picker: None,
             search: None,
+            emoji: None,
+            emoji_dismissed: None,
             search_gen: 0,
             search_task: None,
             pending_jump: None,
@@ -1997,6 +2027,182 @@ impl App {
         let after: String = chars[cursor.min(chars.len())..].iter().collect();
         let new_cursor = (before.clone() + &completion).chars().count();
         self.input = Input::new(before + &completion + &after).with_cursor(new_cursor);
+    }
+
+    // ---- emoji picker ----------------------------------------------------
+
+    /// `R`: the composer becomes an emoji search; Enter toggles the chosen
+    /// emoji as your reaction on the message under the cursor.
+    pub fn start_react(&mut self) {
+        if self.is_system_active() {
+            return self.toast("nothing to react to here — open a chat");
+        }
+        let Some(m) = self.selected_message() else {
+            return self.toast("no message selected");
+        };
+        let msg_id = m.id.clone();
+        let draft = self.input.value().to_string();
+        self.input = Input::default();
+        self.hist_pos = None;
+        self.emoji = Some(EmojiPick {
+            target: EmojiTarget::React { msg_id, draft },
+            query: String::new(),
+            sel: 0,
+            items: Vec::new(),
+            navigated: false,
+        });
+        self.mode = Mode::Insert;
+        self.focus = Focus::Messages;
+        self.emoji_filter();
+    }
+
+    /// The message a reaction picker is for, when one is open.
+    pub fn react_target(&self) -> Option<&str> {
+        match &self.emoji {
+            Some(EmojiPick { target: EmojiTarget::React { msg_id, .. }, .. }) => Some(msg_id),
+            _ => None,
+        }
+    }
+
+    /// Re-derives the picker from the composer after an edit. For a reaction
+    /// the whole line is the query. Otherwise a `:word` the cursor is at the
+    /// end of opens the inline picker, a fully typed `:code:` is swapped for
+    /// its emoji at once, and leaving the word closes the picker.
+    pub fn emoji_refresh(&mut self) {
+        if self.react_target().is_some() {
+            let q = self.input.value().to_string();
+            if let Some(p) = &mut self.emoji {
+                p.query = q;
+            }
+            return self.emoji_filter();
+        }
+        let value = self.input.value().to_string();
+        let cursor = self.input.cursor();
+        let Some((start, query)) = emoji::token_at(&value, cursor) else {
+            self.emoji = None;
+            self.emoji_dismissed = None;
+            return;
+        };
+        if let Some(code) = query.strip_suffix(':') {
+            self.emoji = None;
+            if !code.is_empty() && !code.contains(':') {
+                if let Some(e) = emoji::by_code(code) {
+                    self.replace_span(start, cursor, e.glyph);
+                }
+            }
+            return;
+        }
+        if query.contains(':') || self.emoji_dismissed == Some(start) {
+            self.emoji = None;
+            return;
+        }
+        match &mut self.emoji {
+            Some(p) if p.target == (EmojiTarget::Insert { start }) => p.query = query,
+            _ => {
+                self.emoji = Some(EmojiPick {
+                    target: EmojiTarget::Insert { start },
+                    query,
+                    sel: 0,
+                    items: Vec::new(),
+                    navigated: false,
+                })
+            }
+        }
+        self.emoji_filter();
+    }
+
+    /// Recomputes the matches. The highlight goes back to the best hit as
+    /// the query changes, unless ↑/↓ chose one that is still listed.
+    pub fn emoji_filter(&mut self) {
+        let Some(p) = &mut self.emoji else { return };
+        let keep = if p.navigated { p.items.get(p.sel).map(|e| e.glyph) } else { None };
+        let items = emoji::search(&p.query);
+        p.sel = keep
+            .and_then(|g| items.iter().position(|e| e.glyph == g))
+            .unwrap_or(0)
+            .min(items.len().saturating_sub(1));
+        p.items = items;
+    }
+
+    pub fn emoji_move(&mut self, d: isize) {
+        if let Some(p) = &mut self.emoji {
+            if p.items.is_empty() {
+                return;
+            }
+            p.sel = (p.sel as isize + d).rem_euclid(p.items.len() as isize) as usize;
+            p.navigated = true;
+        }
+    }
+
+    /// Esc: a reaction picker gives the composer back as it was; an inline
+    /// one closes and stays closed for this `:word`.
+    pub fn emoji_cancel(&mut self) {
+        let Some(p) = self.emoji.take() else { return };
+        match p.target {
+            EmojiTarget::React { draft, .. } => self.restore_draft(draft),
+            EmojiTarget::Insert { start } => self.emoji_dismissed = Some(start),
+        }
+    }
+
+    /// Enter / Tab. Returns false when the key keeps its normal meaning: an
+    /// inline picker on a bare `:` with nothing chosen, so Enter still sends
+    /// a line that just ends in a colon.
+    pub fn emoji_accept(&mut self) -> bool {
+        let Some(p) = &self.emoji else { return false };
+        let chosen = p.items.get(p.sel).map(|e| e.glyph);
+        let bare = p.query.is_empty() && !p.navigated;
+        match p.target.clone() {
+            EmojiTarget::React { msg_id, draft } => {
+                let Some(glyph) = chosen else {
+                    self.toast("no emoji matches");
+                    return true;
+                };
+                self.send_reaction(&msg_id, glyph);
+                self.emoji = None;
+                self.restore_draft(draft);
+                true
+            }
+            EmojiTarget::Insert { start } => {
+                let Some(glyph) = chosen.filter(|_| !bare) else { return false };
+                self.emoji = None;
+                self.replace_span(start, self.input.cursor(), &format!("{glyph} "));
+                true
+            }
+        }
+    }
+
+    fn restore_draft(&mut self, draft: String) {
+        let n = draft.chars().count();
+        self.input = Input::new(draft).with_cursor(n);
+        self.mode = Mode::Normal;
+    }
+
+    /// Replaces chars `[start, end)` of the composer with `with`, leaving the
+    /// cursor right after it.
+    fn replace_span(&mut self, start: usize, end: usize, with: &str) {
+        let chars: Vec<char> = self.input.value().chars().collect();
+        let end = end.min(chars.len());
+        let start = start.min(end);
+        let before: String = chars[..start].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        let cursor = start + with.chars().count();
+        self.input = Input::new(before + with + &after).with_cursor(cursor);
+    }
+
+    /// Toggles `emoji` as your reaction on `msg_id` in the open chat. The
+    /// messages subscription brings the change back as an update.
+    fn send_reaction(&mut self, msg_id: &str, emoji: &str) {
+        let Some(chat) = self.active_chat().filter(|c| !c.is_system()).cloned() else {
+            return;
+        };
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let (id, emoji) = (msg_id.to_string(), emoji.to_string());
+        tokio::spawn(async move {
+            if let Err(e) = api.react(&chat.space_id, &chat.object_id, &id, &emoji).await {
+                let _ = tx.send(Ev::Error(format!("react: {e}")));
+            }
+        });
     }
 
     // ---- fuzzy picker ----------------------------------------------------

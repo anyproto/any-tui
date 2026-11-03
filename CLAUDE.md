@@ -13,7 +13,7 @@ file is for working on the code.
 
 ```sh
 cargo build            # or --release
-cargo test             # unit tests: model.rs, commands.rs, files.rs, fuzzy.rs, keymap.rs, app.rs
+cargo test             # unit tests: model.rs, commands.rs, files.rs, fuzzy.rs, emoji.rs, keymap.rs, app.rs
 cargo run -- --no-auto-read      # see flags below
 nix run . -- --no-auto-read      # the flake's app; `nix build` → ./result/bin/any-tui
 ```
@@ -352,7 +352,9 @@ badges):
 
 Code map: `api.rs` (REST + subscribe setup), `sse.rs` (frame parser),
 `model.rs` (`Space`/`Chat`/`Message` + record parsing, has tests), `fuzzy.rs`
-(scored subsequence matcher for the picker, has tests), `commands.rs` (composer
+(scored subsequence matcher for the picker, has tests), `emoji.rs` (the
+emoji picker's table from the `emojis` crate, its ranking, and the `:word`
+token detection behind the inline picker; has tests), `commands.rs` (composer
 command parser, has tests), `prefs.rs` (local-store settings + history),
 `files.rs` (attachment download / open / reveal, has tests),
 `keymap.rs` (`/langmap`: the user's keyboard,

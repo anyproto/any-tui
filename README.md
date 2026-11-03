@@ -195,8 +195,10 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | `b` | back to where the cursor was before the last jump (reply, whisper, search hit, files / links entry); repeat to walk further back |
 | `y` | copy the message under the cursor (`pbcopy`, `wl-copy`, `xclip` / `xsel`; OSC 52 over SSH or without them — in tmux that needs `set-clipboard on`) |
 | `@Name<Tab>` | complete a mention from the space's roster |
+| `:word` | emoji picker inline: type `:` at the start of a word and search (`:thu` → 👍); `Enter` / `Tab` inserts, `Esc` closes; a full `:code:` converts as you type |
 | `/` | search messages — see [Search](#search) |
-| `R` | mark the chat read now |
+| `R` | react to the message under the cursor: the composer becomes an emoji search, `Enter` toggles the chosen one |
+| `M` | mark the chat read now |
 | `D` | open a DM with the author of the message under the cursor |
 | `W` | whisper about the message under the cursor; on a whisper in a DM, `Enter` jumps to the message it's about |
 | `o` / `s` | open / save the attachments of the message under the cursor |

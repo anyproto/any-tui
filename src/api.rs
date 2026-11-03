@@ -516,6 +516,25 @@ impl Api {
         Ok(())
     }
 
+    /// Toggles `emoji` as your reaction on `msg_id`: on when absent, off when
+    /// present. The emoji travels in the path, percent-encoded; the body is
+    /// empty. The message comes back through the messages subscription as an
+    /// update carrying the new `reactions`.
+    pub async fn react(&self, space_id: &str, object_id: &str, msg_id: &str, emoji: &str) -> Result<()> {
+        let path = format!(
+            "/spaces/{space_id}/objects/{object_id}/chat/messages/{msg_id}/reactions/{}",
+            url_encode(emoji)
+        );
+        let resp = self
+            .http
+            .post(self.url(&path))
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        json_or_err(resp, &path).await?;
+        Ok(())
+    }
+
     /// Clears the unread reaction(s) on one message. A reaction is ordered
     /// after its target, so `mark_read` (which cuts at the message's own
     /// `_ver.id`) can never cover it. 204, idempotent, no-op without unread.

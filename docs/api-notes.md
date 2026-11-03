@@ -47,6 +47,13 @@ a reaction on an older message needs `…/{msgId}/reactions-read` (it's ordered
 after its target, so the read cut never reaches it). The "new" divider sits above
 the first `unread: true` record — which can be mid-history.
 
+**Reactions** toggle with `POST …/chat/messages/{msgId}/reactions/{emoji}`
+(the emoji percent-encoded in the path, empty body): on when you have not
+reacted with it, off when you have. The record comes back through the
+messages subscription with its `reactions` map updated — the client never
+patches it locally. The picker's table and shortcodes are the `emojis` crate
+(`src/emoji.rs`).
+
 **Sending** stamps `context: {spaceId, objectId, view: "chat"}` — the sender's
 view at send time, which agents reading the chat use to resolve "here".
 

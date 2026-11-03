@@ -1,4 +1,4 @@
-use crate::app::{App, Focus, GalleryKind, Mode, SearchMode, SearchOrder, SearchScope};
+use crate::app::{App, EmojiTarget, Focus, GalleryKind, Mode, SearchMode, SearchOrder, SearchScope};
 use crate::model::Liveness;
 use crate::model::{BaoPresence, action_body, find_ci, highlight_hits, leading_tag, md_unescape, parse_whisper, render_mentions};
 use chrono::{DateTime, Local, TimeZone};
@@ -582,6 +582,75 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(visible), inner);
 
     draw_input(f, app, rows[1]);
+    draw_emoji_popup(f, app, rows[0], rows[1]);
+}
+
+/// The emoji picker's matches, dropped down above the composer: a short
+/// list, the highlighted row carrying the ▌ bar, scrolled to keep it in view.
+fn draw_emoji_popup(f: &mut Frame, app: &App, above: Rect, input: Rect) {
+    let Some(p) = &app.emoji else { return };
+    if app.mode != Mode::Insert {
+        return;
+    }
+    let rows = p.items.len().clamp(1, 8) as u16;
+    let h = (rows + 2).min(above.height);
+    if h < 3 || input.width < 12 {
+        return;
+    }
+    let w = 48.min(input.width);
+    let rect = Rect {
+        x: input.x,
+        y: above.y + above.height - h,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let title = match p.target {
+        EmojiTarget::React { .. } => format!(" react ({}) ", p.items.len()),
+        EmojiTarget::Insert { .. } => format!(" emoji ({}) ", p.items.len()),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let width = inner.width as usize;
+    let h = inner.height as usize;
+    let offset = (p.sel + 1).saturating_sub(h);
+    let mut lines: Vec<Line> = Vec::new();
+    if p.items.is_empty() {
+        lines.push(Line::from(Span::styled("  no matches", Style::default().fg(DIM))));
+    }
+    for (i, e) in p.items.iter().enumerate().skip(offset).take(h) {
+        let selected = i == p.sel;
+        // Shortcodes can run long (`:hand_with_index_finger_and_thumb_crossed:`);
+        // the name is the identifier, so the code gives way first.
+        let code = if e.code.is_empty() { String::new() } else { one_line(&format!(":{}:", e.code), 18) };
+        // Emoji are two cells wide; pad the odd one-cell glyph to line up.
+        let glyph = format!("{}{} ", e.glyph, " ".repeat(2usize.saturating_sub(e.glyph.width())));
+        let name_w = width.saturating_sub(2 + glyph.width() + code.width() + 1);
+        let name = one_line(e.name, name_w);
+        let pad = name_w.saturating_sub(name.width()) + 1;
+        let base = if selected {
+            Style::default().fg(SEL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "▌ " } else { "  " },
+                Style::default().fg(if selected { ACCENT } else { Color::Reset }),
+            ),
+            Span::raw(glyph),
+            Span::styled(name, base),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(code, Style::default().fg(DIM)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The search view: ranked-then-time-sorted results fill the pane, the live
@@ -1590,7 +1659,11 @@ fn input_height(app: &App, width: u16) -> u16 {
     }
     let inner_w = (width.saturating_sub(2) as usize).max(1);
     let lines = wrap_input(app.input.value(), inner_w).len().clamp(1, MAX_INPUT_LINES);
-    let banner = if app.reply_to.is_some() || app.editing.is_some() { 1 } else { 0 };
+    let banner = if app.reply_to.is_some() || app.editing.is_some() || app.react_target().is_some() {
+        1
+    } else {
+        0
+    };
     lines as u16 + 2 + banner
 }
 
@@ -1599,7 +1672,33 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         let mut area = area;
         // Banner above the box: say exactly who is being replied to, since the
         // reply target is otherwise invisible once you start typing.
-        if let Some(rid) = &app.reply_to {
+        let reacting = app.react_target().is_some();
+        if let Some(mid) = app.react_target() {
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            let who = app
+                .msgs
+                .iter()
+                .find(|m| m.id == mid)
+                .map(|m| {
+                    format!(
+                        "{}: {}",
+                        app.display_name(&m.creator),
+                        one_line(&m.preview_text(), rows[0].width as usize)
+                    )
+                })
+                .unwrap_or_else(|| "…".to_string());
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ♥ react to ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        one_line(&who, rows[0].width.saturating_sub(13) as usize),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])),
+                rows[0],
+            );
+            area = rows[1];
+        } else if let Some(rid) = &app.reply_to {
             let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
             let who = app
                 .msgs
@@ -1640,9 +1739,17 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .padding(Padding::horizontal(1))
             .title_style(Style::default().fg(ACCENT))
-            .title(if editing { " edit " } else { " message " })
+            .title(if reacting {
+                " emoji "
+            } else if editing {
+                " edit "
+            } else {
+                " message "
+            })
             .title_bottom(Line::from(Span::styled(
-                if editing {
+                if reacting {
+                    " type to search · ↑ ↓ choose · Enter react · Esc cancel "
+                } else if editing {
                     " Enter save · Alt-Enter newline · Esc cancel "
                 } else {
                     " Enter send · Alt-Enter newline · Esc cancel "
@@ -2063,12 +2170,15 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "  Messages",
         "    i               compose",
         "                    Enter sends · Alt-Enter newline",
+        "    :word           emoji picker inline (Enter / Tab inserts,",
+        "                    :code: typed out converts at once)",
         "    r               reply to the message under ▌",
         "    Enter           on a reply: jump to the message it answers",
         "    b               back to where you jumped from",
         "    e               edit your message under ▌",
         "    y               copy the message under ▌",
-        "    R               mark chat read now",
+        "    R               react: pick an emoji for the message under ▌",
+        "    M               mark chat read now",
         "    D               DM the author under ▌",
         "    W               whisper about the message under ▌",
         "    o / s           open / save its attachments",
@@ -2135,12 +2245,14 @@ fn draw_help_compact(f: &mut Frame, area: Rect, app: &mut App) {
         "  Message",
         "   i        compose",
         "   A-Enter  newline",
+        "   :word    emoji picker",
         "   r        reply to ▌",
         "   Enter    jump to replied",
         "   b        jump back",
         "   e        edit yours ▌",
         "   y        copy ▌",
-        "   R        mark read",
+        "   R        react to ▌",
+        "   M        mark read",
         "   D        DM author",
         "   W        whisper",
         "   o / s    open/save file",

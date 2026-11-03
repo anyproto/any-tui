@@ -9,6 +9,7 @@ mod clipboard;
 mod commands;
 mod edit;
 mod files;
+mod emoji;
 mod fuzzy;
 mod keymap;
 mod model;
@@ -439,6 +440,47 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
+    // The emoji picker rides on the composer: these keys pick, every other
+    // key edits the query (the line itself) in the Insert branch below.
+    if app.emoji.is_some() && app.mode == Mode::Insert {
+        let handled = match k.code {
+            KeyCode::Esc => {
+                app.emoji_cancel();
+                true
+            }
+            KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => false,
+            KeyCode::Enter | KeyCode::Tab => app.emoji_accept(),
+            KeyCode::Down => {
+                app.emoji_move(1);
+                true
+            }
+            KeyCode::Up => {
+                app.emoji_move(-1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                app.emoji_move(1);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                app.emoji_move(-1);
+                true
+            }
+            KeyCode::PageDown => {
+                app.emoji_move(8);
+                true
+            }
+            KeyCode::PageUp => {
+                app.emoji_move(-8);
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            return;
+        }
+    }
+
     // Cycle chats in sidebar order from anywhere, including while reading.
     if ctrl && matches!(k.code, KeyCode::Char('n')) {
         app.select_delta(1);
@@ -473,6 +515,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
             _ => {
                 edit::apply_edit_key(&mut app.input, &k, true);
             }
+        }
+        // A `:word` under the cursor opens the inline emoji picker; the
+        // reaction picker re-reads its query.
+        if app.mode == Mode::Insert {
+            app.emoji_refresh();
         }
         return;
     }
@@ -617,7 +664,10 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('e') => app.start_edit(),
         // Copy the message under the cursor to the clipboard.
         KeyCode::Char('y') => app.copy_selected(),
-        KeyCode::Char('R') => app.mark_read_now(),
+        // React to the message under the cursor: the composer turns into an
+        // emoji search.
+        KeyCode::Char('R') => app.start_react(),
+        KeyCode::Char('M') => app.mark_read_now(),
         // DM the author of the message under the cursor.
         KeyCode::Char('D') => app.dm("", None),
         // Whisper about the message under the cursor (to its author).
