@@ -209,6 +209,19 @@ The composer and the picker query support readline editing (`Ctrl-a`/`Ctrl-e`,
 In the composer `↑` / `↓` recall lines you sent before.
 
 Unread shows as a count after the chat, `(2)` — `(@2)` in red when
+To keep the shortcuts working under a non-Latin keyboard layout, teach the
+app your layout once with `/langmap`: type `/langmap ` (a space after it),
+switch to your layout, and type the three physical rows left to right, top
+to bottom — the keys labelled `qwertyuiop[]`, `asdfghjkl;'`, `zxcvbnm,./`
+(spaces between rows are fine, and the first ten or more keys are enough).
+The app pairs what arrived with those positions, so on a phonetic layout
+`й` moves down like `j`, on ЙЦУКЕН `о` does, and `Ctrl-<key>` chords follow
+too. `/langmap jcuken` is a preset for ЙЦУКЕН; bare `/langmap` shows the
+map, `/langmap off` clears it. Typed text is never remapped — only
+shortcuts and chords — and the map persists with your other settings. The
+terminal gives the app only characters, never physical key codes, which is
+why it has to learn the layout from you.
+
 something unread mentions you, `(★2)` in violet for a highlight word, capped
 at `(999+)` — the same in the list, the picker and the status bar.
 
@@ -251,6 +264,7 @@ text goes out as-is.
 | `/compact` (`C`) | toggle an IRC-log layout: one `HH:MM Name text` line per message with per-day dividers, and one line per chat in the list (`🧉 Gustavo   p2p (2)`) |
 | `/icons [safe\|off\|full]` | how icons and emoji are drawn — see [Emoji and odd terminals](#emoji-and-odd-terminals); bare, the next mode |
 | `/nick <name>` (`/name`) | rename yourself (keeps your description and icon); bare, it shows your current name and short id |
+| `/langmap [rows\|jcuken\|off]` | make the shortcuts work under another keyboard layout — see [Keys](#keys); bare, show the map |
 | `/devices` | your account's devices: this one, which are online (and over what) or when last seen, which one runs bao |
 | `/help` | the command list |
 
@@ -264,7 +278,7 @@ Nicks get a stable colour hashed from the identity, and the member's profile
 icon in front when a terminal can draw it — an emoji (`🧉 Gustavo`) or a
 common icon-pack glyph as a Unicode stand-in (`★ Ann`); picture avatars aren't
 shown. Spaces get theirs the same way in the chat list, in the icon's colour
-(`🪐 Anytwo Assembly`, `↗ Any Team`), and a DM shows the other person's icon. Highlights, away, compact, icons and the recall history persist in the
+(`🪐 Anytwo Assembly`, `↗ Any Team`), and a DM shows the other person's icon. Highlights, away, compact, icons, langmap and the recall history persist in the
 daemon's device-local store (`/v1/local`, collection `any_tui`) — they don't
 sync to your other devices, and `/away` is not visible to anyone else yet.
 

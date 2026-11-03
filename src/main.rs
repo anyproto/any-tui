@@ -10,6 +10,7 @@ mod commands;
 mod edit;
 mod files;
 mod fuzzy;
+mod keymap;
 mod model;
 mod prefs;
 mod sse;
@@ -313,6 +314,13 @@ fn handle(app: &mut App, ev: Ev) {
 }
 
 fn on_key(app: &mut App, k: KeyEvent) {
+    // `/langmap`: a non-Latin layout sends its own characters; map them
+    // back to the keys the shortcuts are bound to, except where the key is text.
+    let typing = app.picker.is_some() || app.search.is_some() || app.mode == Mode::Insert;
+    let k = match &app.langmap {
+        Some(m) => m.translate(k, typing),
+        None => k,
+    };
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && matches!(k.code, KeyCode::Char('c')) {
         app.quit = true;

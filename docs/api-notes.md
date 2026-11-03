@@ -142,6 +142,7 @@ Contract, verified against the server source:
 | `model.rs` | `Space`, `Chat`, `Message` and record parsing |
 | `fuzzy.rs` | scored subsequence matcher behind the `Space` picker |
 | `commands.rs` | IRC-style composer commands (`/me`, `/dm`, `s///`, …) |
+| `keymap.rs` | `/langmap`: the user's layout, learned by typing the QWERTY rows, mapped back onto the shortcut keys |
 | `prefs.rs` | settings + composer history in the device-local store (`/v1/local`) |
 | `files.rs` | attachment download, open (`xdg-open`/`open`) and reveal-in-file-manager |
 | `app.rs` | state, event enum, picker, subscription tasks |

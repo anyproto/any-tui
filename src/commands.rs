@@ -19,7 +19,7 @@ const UNFLIP: &str = r"┬─┬ノ( º \_ ºノ)";
 /// The idle marker `/away` uses when given no emoji of its own.
 pub const DEFAULT_AWAY: &str = "💤";
 
-pub const HELP: &str = "/me /shrug /tableflip /unflip · /dm /msg /w /accept · /join /hl /unhl /away /back /compact /icons /devices /nick · s/old/new/ · // literal";
+pub const HELP: &str = "/me /shrug /tableflip /unflip · /dm /msg /w /accept · /join /hl /unhl /away /back /compact /icons /langmap /devices /nick · s/old/new/ · // literal";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -41,6 +41,9 @@ pub enum Command {
     Icons(String),
     /// `/devices`: your account's devices, which runs bao, which are online.
     Devices,
+    /// `/langmap [rows|preset|off]`: shortcut keys under another layout;
+    /// bare, show the current map.
+    Langmap(String),
     /// `/nick <name>` (`/name`): rename yourself; bare, show your name.
     Nick(String),
     /// `/dm [@name | identity]` — a person, or (empty) the author under the
@@ -94,6 +97,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "compact" => Command::Compact,
         "icons" => Command::Icons(arg.to_string()),
         "devices" => Command::Devices,
+        "langmap" => Command::Langmap(arg.to_string()),
         "nick" | "name" => Command::Nick(arg.to_string()),
         "dm" | "query" => Command::Dm(arg.to_string()),
         "msg" if arg.is_empty() => return Err(need("@name <text>")),

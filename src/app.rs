@@ -388,6 +388,8 @@ pub struct App {
     pub ticks: u64,
     /// Settings kept in the daemon's local store (`prefs.rs`).
     pub prefs: Prefs,
+    /// `/langmap`, built from `prefs.langmap`; `None` when off.
+    pub langmap: Option<crate::keymap::Langmap>,
     /// False when the local store was unreachable: nothing persists.
     pub prefs_ok: bool,
     /// Sent composer lines, oldest first, for ↑/↓ recall.
@@ -504,6 +506,7 @@ impl App {
             bao: HashMap::new(),
             ticks: 0,
             prefs: Prefs::default(),
+            langmap: None,
             prefs_ok: false,
             history: Vec::new(),
             hist_pos: None,
@@ -536,6 +539,7 @@ impl App {
         self.prefs = l.prefs;
         self.history = l.history;
         self.prefs_ok = l.ok;
+        self.langmap = crate::keymap::Langmap::parse(&self.prefs.langmap).ok();
     }
 
     fn save_prefs(&self) {
@@ -1381,6 +1385,30 @@ impl App {
                     crate::model::EmojiMode::Full => "icons: full — every emoji as sent (may misdraw over tmux/mosh)",
                 });
             }
+            Command::Langmap(arg) => match arg.as_str() {
+                "" => match &self.langmap {
+                    Some(m) => self.toast(format!("langmap: {} — /langmap off to clear", m.source())),
+                    None => self.toast(format!(
+                        "langmap: off — type /langmap, switch layout, type the rows {} (or /langmap jcuken)",
+                        crate::keymap::QWERTY
+                    )),
+                },
+                "off" => {
+                    self.langmap = None;
+                    self.prefs.langmap.clear();
+                    self.save_prefs();
+                    self.toast("langmap: off");
+                }
+                _ => match crate::keymap::Langmap::parse(&arg) {
+                    Ok(m) => {
+                        self.prefs.langmap = m.source().to_string();
+                        self.toast(format!("langmap: {} — shortcuts follow your layout now", m.source()));
+                        self.langmap = Some(m);
+                        self.save_prefs();
+                    }
+                    Err(e) => self.toast(format!("/langmap: {e}")),
+                },
+            },
             Command::Dm(target) => self.dm(&target, None),
             Command::Msg(rest) => match commands::resolve_person(&rest, &self.people()) {
                 Some((_, "")) => self.toast("usage: /msg @name <text>"),

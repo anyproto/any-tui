@@ -33,6 +33,10 @@ pub struct Prefs {
     /// The old on/off switch; still read so `off` carries over.
     #[serde(default)]
     pub hide_icons: bool,
+    /// `/langmap`: the QWERTY rows typed under the user's layout (see
+    /// `keymap::Langmap`); empty when off.
+    #[serde(default)]
+    pub langmap: String,
 }
 
 impl Prefs {

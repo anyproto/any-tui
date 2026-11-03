@@ -13,7 +13,7 @@ file is for working on the code.
 
 ```sh
 cargo build            # or --release
-cargo test             # unit tests: model.rs, commands.rs, files.rs, fuzzy.rs, app.rs
+cargo test             # unit tests: model.rs, commands.rs, files.rs, fuzzy.rs, keymap.rs, app.rs
 cargo run -- --no-auto-read      # see flags below
 nix run . -- --no-auto-read      # the flake's app; `nix build` → ./result/bin/any-tui
 ```
@@ -52,7 +52,7 @@ else it is a real account with real chats, so testing needs care:
   `:7002` — `tui-test`, `bob-test`, their DM), and **delete them afterwards**
   (`DELETE …/chat/messages/{id}`). Never send, `/dm`, rename or accept on a
   real account (e.g. `:7009`): read-only there, with `--no-auto-read`; and
-  note `/compact`, `/icons`, `/hl` write that account's local prefs — put
+  note `/compact`, `/icons`, `/hl`, `/langmap` write that account's local prefs — put
   them back. Discover ids at runtime rather than hardcoding:
   ```sh
   curl -s http://127.0.0.1:7001/v1/spaces | jq '.spaces[]|{name,id}'
@@ -355,7 +355,10 @@ Code map: `api.rs` (REST + subscribe setup), `sse.rs` (frame parser),
 (scored subsequence matcher for the picker, has tests), `commands.rs` (composer
 command parser, has tests), `prefs.rs` (local-store settings + history),
 `files.rs` (attachment download / open / reveal, has tests),
-`app.rs` (state, `Ev`,
+`keymap.rs` (`/langmap`: the user's layout,
+learned by typing the QWERTY rows under it, maps a non-Latin shortcut key
+back to the key at that position; applied at the top of `on_key` except for
+plain keys in a text field; has tests), `app.rs` (state, `Ev`,
 picker, subscription tasks), `ui.rs` (rendering, wrapping, scroll geometry,
 layout), `main.rs` (CLI, terminal, keymap, loop).
 
