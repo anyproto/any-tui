@@ -71,9 +71,9 @@ Then run the TUI. With Nix, straight from the flake:
 
 ```sh
 nix run . -- --no-auto-read                # args after `--` go to any-tui
-nix run github:anyproto/any-tui/v0.4.0     # a release, without a checkout
+nix run github:anyproto/any-tui/v0.5.0     # a release, without a checkout
 nix run github:anyproto/any-tui            # or the latest main
-nix profile install github:anyproto/any-tui/v0.4.0   # keep it on PATH
+nix profile install github:anyproto/any-tui/v0.5.0   # keep it on PATH
 nix build && ./result/bin/any-tui          # or build it once
 ```
 
@@ -391,6 +391,15 @@ another client should keep its badges.
 | `--layout auto\|split\|single` | pane layout, default `auto` |
 | `--agent-space <name\|id>` | the agent's space, default `bao`: heads the chat list, labelled `Agent` |
 | `--version` | print the version |
+
+## Todo
+
+- A `nix run` bundle that starts the whole stack at once — any-tui, the
+  `any` server and the bao agent — instead of three checkouts and three
+  commands.
+- Binary releases: prebuilt `any-tui` for Linux and macOS attached to each
+  GitHub release, for people without nix or cargo. Today the only install
+  paths are `nix run` / `nix profile install` and `cargo build`.
 
 ## More
 
