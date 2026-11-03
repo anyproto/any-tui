@@ -3,7 +3,7 @@ use crate::files;
 use crate::commands::{self, Command};
 use crate::model::{
     AttachmentTarget, BaoBeat, BaoPresence, Chat, DirectPeers, Devices, Identity, Liveness, Message,
-    Space, SyncStatus, derive_bao_presence, direct_peers, peer_liveness,
+    SYSTEM, Space, SyncStatus, derive_bao_presence, direct_peers, peer_liveness,
     extract_urls, highlight_hits, icon_color, icon_glyph, parse_whisper, whisper_text,
     link_mentions, md_unescape, render_mentions,
 };
@@ -11,12 +11,14 @@ use crate::prefs::{self, HISTORY_MAX, Prefs};
 use crate::sse::{Frame, SseReader};
 use tui_input::Input;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 /// How many messages the live window holds, and the history page size.
 const WINDOW: usize = 150;
+/// Lines the system buffer keeps (`App::log`).
+const SYSTEM_CAP: usize = 500;
 const PAGE: usize = 100;
 
 /// How long a chat must stay open before auto-read fires. Long enough that
@@ -388,6 +390,10 @@ pub struct App {
     pub ticks: u64,
     /// Settings kept in the daemon's local store (`prefs.rs`).
     pub prefs: Prefs,
+    /// The system buffer's lines (`model::SYSTEM`, `App::log`), newest
+    /// last; `msgs` is a copy of it while the buffer is open.
+    system_log: Vec<Message>,
+    system_seq: u64,
     /// `/langmap`, built from `prefs.langmap`; `None` when off.
     pub langmap: Option<crate::keymap::Langmap>,
     /// False when the local store was unreachable: nothing persists.
@@ -401,6 +407,9 @@ pub struct App {
     pending_open: Option<String>,
     /// Incoming DM requests, as last fetched.
     pub pending_dms: Vec<Space>,
+    /// Requests already announced, so a poll that still lists one you've
+    /// accepted (the server drops it a moment later) doesn't repeat it.
+    pending_seen: HashSet<String>,
     /// Attached files' metadata by file id, fetched once per file as
     /// messages carrying them load.
     pub file_infos: HashMap<String, FileInfo>,
@@ -460,7 +469,7 @@ impl App {
             identities: Vec::new(),
             spaces: Vec::new(),
             chat_subs: HashMap::new(),
-            chats: Vec::new(),
+            chats: vec![Chat::system()],
             sel: 0,
             user_selected: false,
             active: None,
@@ -506,6 +515,8 @@ impl App {
             bao: HashMap::new(),
             ticks: 0,
             prefs: Prefs::default(),
+            system_log: Vec::new(),
+            system_seq: 0,
             langmap: None,
             prefs_ok: false,
             history: Vec::new(),
@@ -513,6 +524,7 @@ impl App {
             hist_draft: String::new(),
             pending_open: None,
             pending_dms: Vec::new(),
+            pending_seen: HashSet::new(),
             file_infos: HashMap::new(),
             files_requested: HashSet::new(),
             downloads: HashMap::new(),
@@ -556,6 +568,20 @@ impl App {
 
     /// Folds a beat in — last write per publisher wins.
     pub fn apply_bao_beat(&mut self, beat: BaoBeat) {
+        // State and role flips go to the system buffer (beats repeat every
+        // 10s, so only a change is worth a line).
+        let changed = self
+            .bao
+            .get(&beat.identity)
+            .is_none_or(|(b, _)| b.state != beat.state || b.active != beat.active);
+        if changed {
+            let role = if beat.active { "active" } else { "standby" };
+            let what = match (&beat.run, beat.state.as_str()) {
+                (Some(r), "working") if !r.title.is_empty() => format!(" — {}", r.title),
+                _ => String::new(),
+            };
+            self.log(format!("✦ bao {} ({role}){what}", beat.state));
+        }
         self.bao
             .insert(beat.identity.clone(), (beat, Instant::now()));
     }
@@ -592,6 +618,25 @@ impl App {
     /// seen, drops chats and subscriptions of spaces that are gone. Called at
     /// startup and whenever the space-list subscription signals a change.
     pub fn set_spaces(&mut self, spaces: Vec<Space>) {
+        // Joins and leaves go to the system buffer; the first listing is
+        // summed up instead.
+        let notes: Vec<String> = if self.spaces.is_empty() {
+            vec![format!("{} spaces", spaces.len())]
+        } else {
+            let joined = spaces
+                .iter()
+                .filter(|s| !self.spaces.iter().any(|o| o.id == s.id))
+                .map(|s| format!("joined {}", self.space_desc(s)));
+            let left = self
+                .spaces
+                .iter()
+                .filter(|o| !spaces.iter().any(|s| s.id == o.id))
+                .map(|s| format!("left {}", self.space_desc(s)));
+            joined.chain(left).collect()
+        };
+        for n in notes {
+            self.log(n);
+        }
         let live: HashSet<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
         let gone: Vec<String> = self
             .chat_subs
@@ -648,6 +693,56 @@ impl App {
         self.relabel_chats();
     }
 
+    /// "space X" / "the DM with @Y", for the system buffer.
+    fn space_desc(&self, s: &Space) -> String {
+        if s.is_dm() {
+            let peer = self.dm_peers.get(&s.id).map(|p| format!("@{}", self.display_name(p)));
+            let who = if !s.name.is_empty() { s.name.clone() } else { peer.unwrap_or_else(|| "someone".to_string()) };
+            format!("the DM with {who}")
+        } else if s.name.is_empty() {
+            format!("space {}", crate::model::short_id(&s.id))
+        } else {
+            format!("space {}", s.name)
+        }
+    }
+
+    pub fn is_system_active(&self) -> bool {
+        self.active.as_deref() == Some(SYSTEM)
+    }
+
+    /// Appends a line to the system buffer (see `model::SYSTEM`): the row's
+    /// preview and unread follow, and the open buffer scrolls with it as a
+    /// chat would. Every toast lands here too, so the buffer is the record of
+    /// what the client said.
+    pub fn log(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        self.system_seq += 1;
+        let m = Message::system_line(self.system_seq, text.clone(), at);
+        self.system_log.push(m.clone());
+        if self.system_log.len() > SYSTEM_CAP {
+            self.system_log.remove(0);
+        }
+        let open = self.is_system_active();
+        if let Some(c) = self.chats.iter_mut().find(|c| c.is_system()) {
+            c.last_text = Some(text);
+            c.last_at = at;
+            if !open {
+                c.unread += 1;
+            }
+        }
+        if open {
+            let follow = self.at_newest();
+            self.msgs.push(m);
+            if self.msgs.len() > SYSTEM_CAP {
+                self.msgs.remove(0);
+            }
+            if follow {
+                self.select_newest();
+            }
+        }
+    }
+
     pub fn display_name(&self, identity: &str) -> String {
         if let Some(n) = self.names.get(identity) {
             if !n.is_empty() {
@@ -685,7 +780,9 @@ impl App {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now()));
+        let msg = msg.into();
+        self.log(msg.clone());
+        self.toast = Some((msg, Instant::now()));
     }
 
     /// Shows or hides the chat list. Hiding it leaves the messages as the only
@@ -763,12 +860,14 @@ impl App {
     /// Which block of the chat list a space sits in: the agent's space,
     /// then DMs, then the other spaces (`sort_chats` orders by this).
     fn space_group(&self, space_id: &str) -> u8 {
-        if self.is_agent_space(space_id) {
+        if space_id == SYSTEM {
             0
-        } else if self.spaces.iter().any(|s| s.id == space_id && s.is_dm()) {
+        } else if self.is_agent_space(space_id) {
             1
-        } else {
+        } else if self.spaces.iter().any(|s| s.id == space_id && s.is_dm()) {
             2
+        } else {
+            3
         }
     }
 
@@ -919,6 +1018,14 @@ impl App {
             (m.creator != self.me || m.agent.is_some())
                 && !highlight_hits(&m.text, &self.prefs.highlights).is_empty()
         });
+        // An unread arrival you'd want to know about while looking elsewhere
+        // — a mention, a highlight word, a whisper — gets a line in the
+        // system buffer, where it stays once the badge is gone.
+        let who = msg.as_ref().map(|m| match &m.agent {
+            Some(a) => format!("✦ {}", a.name),
+            None => self.display_name(&m.creator),
+        });
+        let mut note: Option<String> = None;
         if let Some(c) = self.chats.iter_mut().find(|c| c.object_id == object_id) {
             match msg {
                 // A bare "…" ping isn't worth previewing; leave the prior one.
@@ -929,6 +1036,17 @@ impl App {
                     if hl && c.unread > 0 && m.unread {
                         c.hl = true;
                     }
+                    if m.unread && m.creator != self.me && self.active.as_deref() != Some(object_id) {
+                        let who = who.unwrap_or_default();
+                        let body = preview.clone().unwrap_or_default();
+                        if let Some(w) = parse_whisper(&m.text) {
+                            note = Some(format!("🔒 {who} whispered about {}: {}", w.label.trim_start_matches("↪ "), w.body));
+                        } else if m.mentions_me(&self.me) {
+                            note = Some(format!("@you in {} — {who}: {body}", c.qualified()));
+                        } else if hl {
+                            note = Some(format!("★ in {} — {who}: {body}", c.qualified()));
+                        }
+                    }
                     c.last_text = preview;
                     c.last_creator = m.creator.clone();
                     c.last_agent = m.agent.as_ref().map(|a| a.name.clone());
@@ -936,6 +1054,9 @@ impl App {
                 }
                 None => c.last_text = Some(String::new()),
             }
+        }
+        if let Some(n) = note {
+            self.log(n);
         }
         self.sort_chats();
         self.restore_selection(keep);
@@ -956,7 +1077,7 @@ impl App {
     fn sort_chats(&mut self) {
         let groups: HashMap<String, u8> =
             self.chats.iter().map(|c| (c.space_id.clone(), self.space_group(&c.space_id))).collect();
-        let key = |c: &Chat| (groups.get(&c.space_id).copied().unwrap_or(2), c.space_name.to_lowercase());
+        let key = |c: &Chat| (groups.get(&c.space_id).copied().unwrap_or(3), c.space_name.to_lowercase());
         self.chats.sort_by(|a, b| {
             key(a)
                 .cmp(&key(b))
@@ -987,7 +1108,7 @@ impl App {
     // ---- messages --------------------------------------------------------
 
     pub fn mark_read_now(&mut self) {
-        let Some(chat) = self.active_chat().cloned() else {
+        let Some(chat) = self.active_chat().filter(|c| !c.is_system()).cloned() else {
             return;
         };
         let Some(last) = self.msgs.last().cloned() else {
@@ -1133,6 +1254,18 @@ impl App {
         self.files.clear();
         self.links.clear();
         self.whispers.clear();
+        if chat.is_system() {
+            // Local only: no subscription, no stats, no read state.
+            self.loading = false;
+            self.exhausted = true;
+            self.msgs = self.system_log.clone();
+            self.msg_total = Some(self.msgs.len() as u64);
+            if let Some(c) = self.chats.iter_mut().find(|c| c.is_system()) {
+                c.unread = 0;
+            }
+            self.select_newest();
+            return;
+        }
         self.refresh_stats();
         self.refresh_sync();
         self.msg_task = Some(spawn_messages_sub(
@@ -1176,6 +1309,10 @@ impl App {
         let Some(chat) = self.active_chat().cloned() else {
             return;
         };
+        if chat.is_system() {
+            self.exhausted = true;
+            return;
+        }
         // Page by `_ver.id` range from the oldest message we hold. A record
         // without one (older build) can't anchor a range, so history ends there.
         let before = match self.msgs.first() {
@@ -1292,10 +1429,15 @@ impl App {
                 return;
             }
         };
-        // Only posting and editing need an open chat; the rest work anywhere.
-        let chat = self.active_chat().cloned();
+        // Only posting and editing need an open chat; the rest work anywhere,
+        // the system buffer included — that is what it is for.
+        let chat = self.active_chat().filter(|c| !c.is_system()).cloned();
         if chat.is_none() && matches!(cmd, Command::Send(_) | Command::Edit { .. }) {
-            self.toast("no chat open");
+            self.toast(if self.is_system_active() {
+                "the system buffer takes commands only — /help lists them"
+            } else {
+                "no chat open"
+            });
             return;
         }
         self.input.reset();
@@ -1637,6 +1779,7 @@ impl App {
     pub fn dm(&mut self, target: &str, text: Option<String>) {
         let identity = if target.trim().is_empty() {
             match self.selected_message() {
+                Some(m) if m.creator.is_empty() => return self.toast("usage: /dm @name | identity"),
                 Some(m) if m.creator != self.me => m.creator.clone(),
                 Some(_) => return self.toast("that's you — /dm @name, or put ▌ on someone else"),
                 None => return self.toast("usage: /dm @name | identity"),
@@ -1681,7 +1824,7 @@ impl App {
     /// sent into the DM with `name` as a link to that message plus the text
     /// (`model::whisper_text`). Both of you then see it under the message.
     fn whisper(&mut self, rest: &str) {
-        let Some(chat) = self.active_chat().cloned() else {
+        let Some(chat) = self.active_chat().filter(|c| !c.is_system()).cloned() else {
             return self.toast("open a chat and put ▌ on the message first");
         };
         let Some(m) = self.selected_message().cloned() else {
@@ -1706,6 +1849,9 @@ impl App {
 
     /// `W`: start a whisper to the author of the message under the cursor.
     pub fn start_whisper(&mut self) {
+        if self.is_system_active() {
+            return self.toast("open a chat and put ▌ on the message first");
+        }
         let Some(m) = self.selected_message().cloned() else {
             return self.toast("put ▌ on the message to whisper about");
         };
@@ -1730,17 +1876,26 @@ impl App {
     }
 
     pub fn set_pending_dms(&mut self, pending: Vec<Space>) {
-        let new: Vec<&Space> = pending
+        let lines: Vec<String> = pending
             .iter()
-            .filter(|p| !self.pending_dms.iter().any(|o| o.id == p.id))
+            .filter(|p| self.pending_seen.insert(p.id.clone()))
+            .map(|p| {
+                let name = if p.name.is_empty() { "someone" } else { p.name.as_str() };
+                if p.is_dm() {
+                    format!("✉ DM request from {name} — /accept {name}")
+                } else {
+                    format!("✉ invite to {name} — /accept {name}")
+                }
+            })
             .collect();
-        if let Some(p) = new.first() {
-            let name = if p.name.is_empty() { "someone" } else { p.name.as_str() };
-            self.toast(if p.is_dm() {
-                format!("DM request from {name} — /accept to open it")
+        // The first one toasts (and so lands in the system buffer); the rest
+        // only go to the buffer.
+        for (i, l) in lines.into_iter().enumerate() {
+            if i == 0 {
+                self.toast(l);
             } else {
-                format!("you were added to {name} — /accept to join")
-            });
+                self.log(l);
+            }
         }
         self.pending_dms = pending;
     }
@@ -1770,7 +1925,7 @@ impl App {
             // chats in. A DM is also set up and opened.
             if !space.is_dm() {
                 let _ = tx.send(match api.accept_invite(&space.id).await {
-                    Ok(()) => Ev::Toast(format!("joined {}", space.name)),
+                    Ok(()) => Ev::Toast(format!("accepted the invite to {}", space.name)),
                     Err(e) => Ev::Error(format!("accept {}: {e}", space.name)),
                 });
                 return;
@@ -1956,7 +2111,7 @@ impl App {
 
     /// Re-reads the open chat's space sync status (a cheap GET).
     pub fn refresh_sync(&self) {
-        if let Some(sp) = self.active_chat().map(|c| c.space_id.clone()) {
+        if let Some(sp) = self.active_chat().filter(|c| !c.is_system()).map(|c| c.space_id.clone()) {
             self.fetch_sync(vec![sp]);
         }
     }
@@ -2038,6 +2193,10 @@ impl App {
     pub fn refresh_stats(&mut self) {
         let Some(chat) = self.active_chat().cloned() else { return };
         self.stats_dirty = false;
+        if chat.is_system() {
+            self.msg_total = Some(self.msgs.len() as u64);
+            return;
+        }
         self.stats_at = Instant::now();
         let (api, tx) = (self.api.clone(), self.tx.clone());
         tokio::spawn(async move {

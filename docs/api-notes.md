@@ -139,7 +139,7 @@ Contract, verified against the server source:
 | --- | --- |
 | `api.rs` | REST calls + subscription setup |
 | `sse.rs` | SSE frame parser (`ready`/`snapshot`/`changes`/`closed`) |
-| `model.rs` | `Space`, `Chat`, `Message` and record parsing |
+| `model.rs` | `Space`, `Chat`, `Message` and record parsing; `SYSTEM`, the client-side system buffer's id |
 | `fuzzy.rs` | scored subsequence matcher behind the `Space` picker |
 | `commands.rs` | IRC-style composer commands (`/me`, `/dm`, `s///`, …) |
 | `keymap.rs` | `/langmap`: the user's layout, learned by typing the QWERTY rows, mapped back onto the shortcut keys |

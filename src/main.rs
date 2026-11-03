@@ -101,6 +101,17 @@ async fn main() -> Result<()> {
         app.toast("local store unavailable — settings won't persist");
     }
     app.set_identities(identities);
+    // The system buffer opens first, like an IRC status window, with who
+    // and where we are.
+    app.log(format!(
+        "any-tui {} · {} at {} · you are {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        app.version,
+        args.api,
+        app.display_name(&app.me),
+        model::short_id(&app.me),
+    ));
+    app.log("commands work here without a chat open — /help lists them");
 
     // One live subscription per space keeps unread counts and the chat list
     // fresh; the space-list subscription adds/removes those as spaces come and go.
@@ -111,6 +122,7 @@ async fn main() -> Result<()> {
     // Sync status flips (nodes / LAN / iroh p2p peers), for the status bar.
     spawn_sync_sub(api.clone(), tx.clone());
     app.check_pending_dms();
+    app.activate_selected();
 
     // Terminal input runs on its own blocking thread.
     {
@@ -585,7 +597,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('r') => {
             // Reply to the message under the cursor — the one drawn with the
             // accent bar — not just whatever happens to be newest.
-            if let Some(m) = app.selected_message() {
+            if app.is_system_active() {
+                app.toast("nothing to reply to here — open a chat");
+            } else if let Some(m) = app.selected_message() {
                 app.reply_to = Some(m.id.clone());
                 app.mode = Mode::Insert;
                 app.focus = Focus::Messages;

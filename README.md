@@ -7,7 +7,8 @@ agent from a terminal — including over ssh from a phone.
 
 It feels like an IRC client where it can: `/me`, `/dm` and `/msg`,
 `s/typo/fix/`, highlight words, nick colours and member icons, a compact
-one-line-per-message layout. Beyond that: direct messages, whispers (a private
+one-line-per-message layout, and a `system` buffer — the status window —
+that takes commands with no chat open and keeps the client's own log. Beyond that: direct messages, whispers (a private
 note on a group message, for one person), search across one chat or every
 space, each chat's files and links, attachments opened or saved on Linux and
 macOS, and how every space is syncing — through sync nodes, the local network,
@@ -242,10 +243,34 @@ open chat's title becomes a `‹ Esc` breadcrumb. `--layout single|split|auto`
 overrides the width check. The bottom bar always lists unread activity in the
 chats you are *not* looking at.
 
+## System buffer
+
+The first row of the chat list is `system`: the client's own buffer, the IRC
+status window. The app opens it at start. It is not a chat on the server —
+nothing you do there leaves the terminal — but it works like one: `i` opens
+the composer, and every command runs from it without a chat open (`/accept`,
+`/dm`, `/join`, `/langmap`, `/nick`, …); a plain line is refused. It lists,
+with a time, what the client tells you — every passing notice stays here —
+and what happens to the account while you look elsewhere:
+
+| line | when |
+| --- | --- |
+| `any-tui 0.4.0 · any v0.3.5 … · you are tolya (A7hQ66M)` | at start |
+| `✉ DM request from Bob — /accept Bob`, `✉ invite to Team — /accept Team` | someone opens a 1-1 with you or adds you to a space |
+| `joined space Team`, `left the DM with @Bob` | the space list changes |
+| `@you in Team/General — Bob: …`, `★ in …` | an unread mention or highlight word in a chat that is not open |
+| `🔒 Bob whispered about Alice: hi there: …` | a whisper arrives in a DM |
+| `✦ bao working (active) — summarise the thread` | bao's state or role flips (bao `boot` / `idle` / `working` / `shutdown`) |
+
+Unread lines badge the row like a chat, so `n` reaches it too. The buffer
+keeps the last 500 lines, in memory only; `y` copies the line under the
+cursor.
+
 ## Commands
 
 The composer takes IRC-style commands — `i` opens it even with no chat open,
-for `/dm`, `/join`, `/accept` and the like. An unknown `/word` is refused
+for `/dm`, `/join`, `/accept` and the like, and the [system buffer](#system-buffer)
+is the place to type them. An unknown `/word` is refused
 rather than sent, and `//text` sends a literal leading slash; `/usr/bin`-like
 text goes out as-is.
 

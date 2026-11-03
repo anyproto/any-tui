@@ -290,6 +290,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
 
         let preview = match &chat.last_text {
             Some(t) if t.is_empty() => "no messages".to_string(),
+            Some(t) if chat.is_system() => one_line(t, width),
             Some(t) => preview_line(&preview_sender(app, chat), t, width),
             None => "…".to_string(),
         };
@@ -371,7 +372,8 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         if group_break {
             lines.push(Line::from(Span::styled("---", Style::default().fg(DIM))));
         }
-        if !compact && chat.space_id != last_space {
+        // The system buffer is one row, no space header above it.
+        if !compact && chat.space_id != last_space && !chat.is_system() {
             if !lines.is_empty() && !group_break {
                 lines.push(Line::from(""));
             }
@@ -448,6 +450,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         // this is what actually distinguishes them.
         let preview = match &chat.last_text {
             Some(t) if t.is_empty() => "no messages".to_string(),
+            Some(t) if chat.is_system() => one_line(t, width),
             Some(t) => preview_line(&preview_sender(app, chat), t, width),
             None => "…".to_string(),
         };
@@ -487,7 +490,7 @@ fn selected_line_index(app: &App) -> usize {
         if group_break {
             idx += 1; // `---` between DMs and spaces
         }
-        if chat.space_id != last_space {
+        if chat.space_id != last_space && !chat.is_system() {
             if idx > 0 && !group_break {
                 idx += 1; // blank spacer between spaces
             }
@@ -1113,6 +1116,9 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
         )));
         return (lines, ranges);
     }
+    if app.active_chat().is_some_and(|c| c.is_system()) {
+        return render_log(app, width);
+    }
     if app.msgs.is_empty() {
         lines.push(Line::from(Span::styled(
             if app.loading {
@@ -1421,6 +1427,65 @@ fn render_messages(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
 
 /// `📎 name · size` for a file (the sender's kind until its metadata
 /// lands), `🔗 url` for a web link. Also the file id, to find its download.
+/// The system buffer: `HH:MM  text`, wrapped under a hanging indent, with
+/// day dividers; the cursor bar works as in a chat so lines can be copied.
+fn render_log(app: &App, width: usize) -> (Vec<Line<'static>>, MsgRanges) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut ranges: MsgRanges = Vec::new();
+    if app.msgs.is_empty() {
+        lines.push(Line::from(Span::styled("  nothing yet", Style::default().fg(DIM))));
+        return (lines, ranges);
+    }
+    let text_w = width.saturating_sub(2).max(10);
+    let sel_id = app.sel_msg.clone().unwrap_or_default();
+    let mut prev_time = 0f64;
+    for m in &app.msgs {
+        if fmt_day(m.created_at) != fmt_day(prev_time) {
+            lines.push(Line::from(Span::styled(
+                format!("  ── {} ──", fmt_day(m.created_at)),
+                Style::default().fg(DIM),
+            )));
+        }
+        let start_line = lines.len();
+        let time = fmt_clock(m.created_at);
+        let hang = time.width() + 1;
+        let style = Style::default().fg(log_color(&m.text));
+        for (n, l) in wrap(&m.text, text_w.saturating_sub(hang)).into_iter().enumerate() {
+            let lead = if n == 0 { time.clone() } else { " ".repeat(time.width()) };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(lead, Style::default().fg(DIM)),
+                Span::raw(" "),
+                Span::styled(l, style),
+            ]));
+        }
+        let end_line = lines.len();
+        ranges.push((m.id.clone(), start_line, end_line));
+        if m.id == sel_id && app.focus == Focus::Messages {
+            for l in lines.iter_mut().take(end_line).skip(start_line) {
+                let mut spans = vec![Span::styled("▌", Style::default().fg(ACCENT)), Span::raw(" ")];
+                spans.extend(l.spans.iter().skip(1).cloned());
+                *l = Line::from(spans);
+            }
+        }
+        prev_time = m.created_at;
+    }
+    (lines, ranges)
+}
+
+/// A log line's colour from what it reports: pings, highlights, whispers,
+/// requests, bao — the rest plain.
+fn log_color(text: &str) -> Color {
+    match text.chars().next() {
+        Some('@') => MENTION,
+        Some('★') => HIGHLIGHT,
+        Some('🔒') => Color::LightMagenta,
+        Some('✉') => ACCENT,
+        Some('✦') => AGENT,
+        _ => Color::Reset,
+    }
+}
+
 fn attachment_label(app: &App, a: &crate::model::Attachment) -> (String, Option<String>) {
     use crate::model::AttachmentTarget;
     match a.target() {
@@ -1723,7 +1788,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     // The open chat's size, right-aligned: its width is held back from the
     // unread list, and it goes first when even the short form won't fit.
     let stats_txt = match app.msg_total {
-        Some(n) if app.active.is_some() => {
+        Some(n) if app.active.is_some() && !app.is_system_active() => {
             let long = format!("{n} msgs · {} files · {} links ", app.files.len(), app.links.len());
             let short = format!("{n}m {}f {}l ", app.files.len(), app.links.len());
             if narrow { short } else { long }
@@ -1985,6 +2050,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "    from:@name      filter by sender",
         "",
         "  Chat list",
+        "    system          first row: commands + client events",
         "    z               show / hide the chat list",
         "    C               compact: one line per message / chat",
         "                    (it hides itself anyway under 80 cols)",

@@ -808,6 +808,14 @@ fn is_word_char(c: Option<char>) -> bool {
     matches!(c, Some(c) if c.is_alphanumeric() || c == '_')
 }
 
+/// The system buffer's space and object id. It is a client-side pseudo-chat,
+/// the IRC status window: it sits first in the chat list, takes the composer
+/// commands without a real chat open, and lists what the client tells you
+/// (every toast) plus account-level events — DM requests and invites, spaces
+/// joined or left, mentions and highlights in chats you are not looking at,
+/// whispers, bao's state flips. Never touches the API (`App::log`).
+pub const SYSTEM: &str = "any-tui:system";
+
 /// A chat object inside a space. `unread` drives the sidebar badges and the
 /// status bar, and is kept live by the per-space objects subscription.
 #[derive(Debug, Clone)]
@@ -918,7 +926,35 @@ impl Chat {
     }
 
     pub fn qualified(&self) -> String {
+        if self.is_system() {
+            return self.label().to_string();
+        }
         format!("{}/{}", self.space_name, self.label())
+    }
+
+    /// The system buffer (see [`SYSTEM`]).
+    pub fn is_system(&self) -> bool {
+        self.space_id == SYSTEM
+    }
+
+    /// The system buffer's row. Its `unread` counts lines logged while it
+    /// was not open; `last_text` is the newest line.
+    pub fn system() -> Chat {
+        Chat {
+            space_id: SYSTEM.to_string(),
+            space_name: "system".to_string(),
+            object_id: SYSTEM.to_string(),
+            name: "system".to_string(),
+            unread: 0,
+            unread_mentions: 0,
+            unread_reactions: 0,
+            pos: String::new(),
+            last_text: Some(String::new()),
+            last_creator: String::new(),
+            last_agent: None,
+            last_at: 0.0,
+            hl: false,
+        }
     }
 }
 
@@ -1115,6 +1151,25 @@ impl Message {
     }
 
     /// True when this message pings `me` (a text mention or a reply to me).
+    /// A line of the system buffer: no author, ordered by `n` (its `ver`).
+    pub fn system_line(n: u64, text: String, at: f64) -> Message {
+        Message {
+            id: format!("sys-{n}"),
+            ver: format!("{n:012}"),
+            text,
+            creator: String::new(),
+            agent: None,
+            created_at: at,
+            modified_at: at,
+            reply_to: None,
+            mentions: Vec::new(),
+            unread: false,
+            unread_reactions: false,
+            reactions: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
     pub fn mentions_me(&self, me: &str) -> bool {
         !me.is_empty() && self.mentions.iter().any(|m| m == me)
     }

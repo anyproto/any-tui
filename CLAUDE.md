@@ -374,7 +374,18 @@ layout), `main.rs` (CLI, terminal, keymap, loop).
   Applies to sidebar, picker, and the message cursor (`▌` bar).
 - **Picker items are keyed by `object_id`, not list index.** The chat list
   re-sorts by recency on every new message; a stale index opens the wrong chat.
-- Chats sort the agent's space first (`--agent-space`, default `bao`, drawn
+- **The `system` buffer is a pseudo-chat, not a server object** (`model::SYSTEM`
+  as both its space and object id, `Chat::is_system`, `App::log`). It is
+  always the first row, opens at startup, and never touches the API: every
+  path that would (messages subscription, history paging, stats, sync, mark
+  read, reply, whisper, DM-the-author) is guarded on `is_system()` — a new
+  per-chat fetch needs the same guard or it 404s against `any-tui:system`.
+  Every `toast` also appends to it, so it is the client's log; events that
+  deserve a line but no toast call `log` directly (space joins/leaves,
+  mentions/highlights/whispers elsewhere, bao flips, extra pending requests).
+  Its unread is lines logged while it was not open; nothing clears it on the
+  server.
+- Chats sort the system buffer first, then the agent's space (`--agent-space`, default `bao`, drawn
   in `AGENT` with an `Agent` tag), then DMs, then spaces, each group alphabetical by label
   (case-insensitive), then most-recent-activity, then sidebar pos
   (`miniapp.pos`).
