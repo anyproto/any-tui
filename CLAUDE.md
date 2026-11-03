@@ -355,9 +355,9 @@ Code map: `api.rs` (REST + subscribe setup), `sse.rs` (frame parser),
 (scored subsequence matcher for the picker, has tests), `commands.rs` (composer
 command parser, has tests), `prefs.rs` (local-store settings + history),
 `files.rs` (attachment download / open / reveal, has tests),
-`keymap.rs` (`/langmap`: the user's layout,
-learned by typing the QWERTY rows under it, maps a non-Latin shortcut key
-back to the key at that position; applied at the top of `on_key` except for
+`keymap.rs` (`/langmap`: the user's keyboard,
+learned by typing its rows in the Latin layout and again in the other one,
+maps a non-Latin shortcut key back to the key at that position; applied at the top of `on_key` except for
 plain keys in a text field; has tests), `app.rs` (state, `Ev`,
 picker, subscription tasks), `ui.rs` (rendering, wrapping, scroll geometry,
 layout), `main.rs` (CLI, terminal, keymap, loop).

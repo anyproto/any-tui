@@ -212,17 +212,27 @@ In the composer `↑` / `↓` recall lines you sent before.
 
 Unread shows as a count after the chat, `(2)` — `(@2)` in red when
 To keep the shortcuts working under a non-Latin keyboard layout, teach the
-app your layout once with `/langmap`: type `/langmap ` (a space after it),
-switch to your layout, and type the three physical rows left to right, top
-to bottom — the keys labelled `qwertyuiop[]`, `asdfghjkl;'`, `zxcvbnm,./`
-(spaces between rows are fine, and the first ten or more keys are enough).
-The app pairs what arrived with those positions, so on a phonetic layout
-`й` moves down like `j`, on ЙЦУКЕН `о` does, and `Ctrl-<key>` chords follow
-too. `/langmap jcuken` is a preset for ЙЦУКЕН; bare `/langmap` shows the
-map, `/langmap off` clears it. Typed text is never remapped — only
-shortcuts and chords — and the map persists with your other settings. The
-terminal gives the app only characters, never physical key codes, which is
-why it has to learn the layout from you.
+app your keyboard once with `/langmap`. It takes **two strings: the keys
+typed in English, then the same keys typed in the local layout**. Type
+`/langmap `, run your fingers over the keyboard in English, type a space,
+switch layout, and run over the same keys again. On a QWERTY board with
+Russian phonetic that is
+
+```
+/langmap qwertyuiopasdfghjklzxcvbnm явертыуиопасдфгхйклзжцвбнм
+```
+
+and on a Colemak-DH 3x5 split it is `/langmap qwfpbjluy;arstgmneiozxcdvkh,./
+явфпбйлуыьарстгмнеиозжцдвкх,./`. Any keys in any order work, as long as
+both strings are the same keys; spaces between rows are fine (the first
+half of the groups is English, the rest local). The app pairs the two
+position by position, so `й` moves down like `j` wherever `j` is, and
+`Ctrl-<key>` chords follow too. `/langmap jcuken` is a preset for QWERTY +
+ЙЦУКЕН; bare `/langmap` shows the map, `/langmap off` clears it. Typed
+text is never remapped — only shortcuts and chords — and the map persists
+with your other settings. The terminal gives the app only characters,
+never physical key codes, which is why it has to learn the keyboard from
+you.
 
 something unread mentions you, `(★2)` in violet for a highlight word, capped
 at `(999+)` — the same in the list, the picker and the status bar.
@@ -290,7 +300,7 @@ text goes out as-is.
 | `/compact` (`C`) | toggle an IRC-log layout: one `HH:MM Name text` line per message with per-day dividers, and one line per chat in the list (`🧉 Gustavo   p2p (2)`) |
 | `/icons [safe\|off\|full]` | how icons and emoji are drawn — see [Emoji and odd terminals](#emoji-and-odd-terminals); bare, the next mode |
 | `/nick <name>` (`/name`) | rename yourself (keeps your description and icon); bare, it shows your current name and short id |
-| `/langmap [rows\|jcuken\|off]` | make the shortcuts work under another keyboard layout — see [Keys](#keys); bare, show the map |
+| `/langmap <english> <local>` | make the shortcuts work under a local keyboard layout: two strings, the same keys typed in English and then in the local layout — see [Keys](#keys); `jcuken` is a preset, `off` clears, bare shows the map |
 | `/devices` | your account's devices: this one, which are online (and over what) or when last seen, which one runs bao |
 | `/help` | the command list |
 

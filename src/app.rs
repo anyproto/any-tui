@@ -1540,10 +1540,7 @@ impl App {
             Command::Langmap(arg) => match arg.as_str() {
                 "" => match &self.langmap {
                     Some(m) => self.toast(format!("langmap: {} — /langmap off to clear", m.source())),
-                    None => self.toast(format!(
-                        "langmap: off — type /langmap, switch layout, type the rows {} (or /langmap jcuken)",
-                        crate::keymap::QWERTY
-                    )),
+                    None => self.toast(format!("langmap: off — {} (or /langmap jcuken for ЙЦУКЕН)", crate::keymap::HINT)),
                 },
                 "off" => {
                     self.langmap = None;

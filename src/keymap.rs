@@ -6,10 +6,10 @@
 //! to read instead — terminals, tmux and mosh carry only characters (the
 //! kitty protocol's "base layout key" is the one exception, and crossterm
 //! drops it while parsing). Layouts also differ too much to guess
-//! (ЙЦУКЕН, several phonetic variants, …), so the map comes from the
-//! keyboard itself: the user switches to their layout and types the three
-//! physical rows `qwertyuiop[] asdfghjkl;' zxcvbnm,./`. What arrives is that
-//! layout's character for each position, paired here with [`QWERTY`] — the
+//! (ЙЦУКЕН, several phonetic variants, and the Latin side may be Colemak
+//! rather than QWERTY), so the map comes from the keyboard itself: the user
+//! types their keyboard's rows in the Latin layout, then the same keys in
+//! the other layout, and the two are paired position by position — the
 //! same idea as vim's `langmap`.
 //!
 //! The map is applied only where the key is a shortcut: chords (Ctrl / Alt)
@@ -19,14 +19,17 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 
-/// The physical rows, left to right, top to bottom, as a US layout labels
-/// them. A `/langmap` string is this sequence typed under another layout.
-pub const QWERTY: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,./";
+/// Named layouts that are the same everywhere, for `/langmap <name>`:
+/// the QWERTY rows, then the same keys under that layout.
+const PRESETS: &[(&str, &str)] = &[(
+    "jcuken",
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./ йцукенгшщзхъфывапролджэячсмитьбю.",
+)];
 
-/// Named layouts that are the same everywhere, for `/langmap <name>`.
-const PRESETS: &[(&str, &str)] = &[("jcuken", "йцукенгшщзхъфывапролджэячсмитьбю.")];
+/// What a bare `/langmap` says when nothing is set.
+pub const HINT: &str = "two strings: the keys typed in English, then the same keys typed in the local layout — e.g. /langmap qwertyuiop явертыуиоп";
 
-/// At least this many positions, so a stray word never becomes a map.
+/// At least this many keys, so a stray word never becomes a map.
 const MIN_KEYS: usize = 10;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,24 +40,48 @@ pub struct Langmap {
 }
 
 impl Langmap {
-    /// Builds the map from `layout`: [`QWERTY`] typed under the user's
-    /// layout (whitespace between rows is fine), or a preset name. Letters
-    /// map in both cases, so `о` → `j` also gives `О` → `J`.
+    /// Builds the map from `layout`: the keyboard's rows typed under the
+    /// user's Latin layout, then the same keys typed under the other
+    /// layout, paired position by position — so neither the Latin layout
+    /// (QWERTY, Colemak, …) nor the board (a 3x5 split has no `[` `]` `'`)
+    /// is assumed. Whitespace splits the text into groups; the first half
+    /// of the groups is one layout, the second half the other, and the
+    /// ASCII half is taken as the Latin one whichever came first. A preset
+    /// name stands for a known pair. Letters map in both cases, so
+    /// `о` → `j` also gives `О` → `J`.
     pub fn parse(layout: &str) -> Result<Langmap, String> {
         let layout = PRESETS
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(layout.trim()))
             .map(|(_, l)| *l)
             .unwrap_or(layout);
-        let chars: Vec<char> = layout.chars().filter(|c| !c.is_whitespace()).collect();
-        let max = QWERTY.chars().count();
-        if chars.len() < MIN_KEYS || chars.len() > max {
+        let groups: Vec<&str> = layout.split_whitespace().collect();
+        if groups.is_empty() || groups.len() % 2 != 0 {
+            return Err(HINT.to_string());
+        }
+        let (a, b) = groups.split_at(groups.len() / 2);
+        let a: Vec<char> = a.concat().chars().collect();
+        let b: Vec<char> = b.concat().chars().collect();
+        let ascii = |v: &[char]| v.iter().all(char::is_ascii);
+        let (latin, other) = if ascii(&a) {
+            (a, b)
+        } else if ascii(&b) {
+            (b, a)
+        } else {
+            return Err(format!("one half must be your Latin layout — {HINT}"));
+        };
+        if latin.len() != other.len() {
             return Err(format!(
-                "type the keys {QWERTY} under your layout ({MIN_KEYS}–{max} of them, left to right, top to bottom)"
+                "{} keys in one layout, {} in the other — type the same keys both times",
+                latin.len(),
+                other.len()
             ));
         }
+        if latin.len() < MIN_KEYS {
+            return Err(format!("{MIN_KEYS} keys at least — {HINT}"));
+        }
         let mut map = HashMap::new();
-        for (from, to) in chars.iter().copied().zip(QWERTY.chars()) {
+        for (from, to) in other.iter().copied().zip(latin.iter().copied()) {
             if from == to {
                 continue;
             }
@@ -65,7 +92,8 @@ impl Langmap {
                 }
             }
         }
-        Ok(Langmap { map, source: chars.iter().collect() })
+        let source = format!("{} {}", latin.iter().collect::<String>(), other.iter().collect::<String>());
+        Ok(Langmap { map, source })
     }
 
     /// The string the map was built from.
@@ -106,29 +134,46 @@ fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
 mod tests {
     use super::*;
 
-    const PHONETIC: &str = "яверты уиопшщ асдфгх йкльэ зжцвбнм,./";
+    // A full-width board: 12 / 11 / 10 keys, one group per row.
+    // A Colemak-DH 3x5 board with a Russian phonetic layout on top: the
+    // same keys typed in the Latin layout, then in the Russian one.
+    const COLEMAK: &str = "qwfpbjluy;arstgmneiozxcdvkh,./";
+    const PHONETIC_OVER_COLEMAK: &str = "явфпбйлуыьарстгмнеиозжцдвкх,./";
 
     fn key(c: char, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), m)
     }
 
+    fn colemak() -> Langmap {
+        Langmap::parse(&format!("{COLEMAK} {PHONETIC_OVER_COLEMAK}")).unwrap()
+    }
+
     #[test]
-    fn presets_cover_the_rows() {
-        for (_, l) in PRESETS {
-            assert_eq!(l.chars().count(), QWERTY.chars().count());
+    fn presets_pair_up() {
+        for (name, _) in PRESETS {
+            Langmap::parse(name).unwrap();
         }
     }
 
     #[test]
-    fn rows_pair_with_qwerty_positions() {
-        let m = Langmap::parse(PHONETIC).unwrap();
+    fn keys_pair_position_by_position() {
+        let m = colemak();
         assert_eq!(m.latin('й'), Some('j'));
-        assert_eq!(m.latin('к'), Some('k'));
-        assert_eq!(m.latin('я'), Some('q'));
+        assert_eq!(m.latin('ф'), Some('f'));
+        assert_eq!(m.latin('н'), Some('n'));
+        assert_eq!(m.latin('ь'), Some(';'));
         assert_eq!(m.latin('З'), Some('Z'));
         assert_eq!(m.latin(','), None, "identity keys are not mapped");
         assert_eq!(m.latin('j'), None);
-        assert_eq!(m.source(), PHONETIC.replace(' ', ""));
+        assert_eq!(m.source(), format!("{COLEMAK} {PHONETIC_OVER_COLEMAK}"));
+    }
+
+    #[test]
+    fn halves_may_come_in_either_order_and_in_rows() {
+        let swapped = Langmap::parse(&format!("{PHONETIC_OVER_COLEMAK} {COLEMAK}")).unwrap();
+        assert_eq!(swapped, colemak());
+        let rows = Langmap::parse("qwfpbjluy; arstgmneio zxcdvkh,./ явфпбйлуыь арстгмнеио зжцдвкх,./").unwrap();
+        assert_eq!(rows, colemak());
     }
 
     #[test]
@@ -140,21 +185,17 @@ mod tests {
     }
 
     #[test]
-    fn a_prefix_of_the_rows_is_enough() {
-        let m = Langmap::parse("явертыуиоп").unwrap();
-        assert_eq!(m.latin('п'), Some('p'));
-        assert_eq!(m.latin('й'), None);
-    }
-
-    #[test]
-    fn too_short_or_too_long_is_refused() {
-        assert!(Langmap::parse("яверты").is_err());
-        assert!(Langmap::parse(&format!("{PHONETIC}ё")).is_err());
+    fn mismatches_are_refused() {
+        assert!(Langmap::parse(COLEMAK).is_err(), "one layout only");
+        assert!(Langmap::parse("qwfpbjluy; явфпбйлуыь зжц").is_err(), "odd groups");
+        assert!(Langmap::parse("qwfpbjluy;arst явфпбйлуыь").is_err(), "lengths differ");
+        assert!(Langmap::parse("qwfpb явфпб").is_err(), "too short");
+        assert!(Langmap::parse("явфпбйлуыь йцукенгшщз").is_err(), "no Latin half");
     }
 
     #[test]
     fn plain_key_maps_only_outside_a_text_field() {
-        let m = Langmap::parse(PHONETIC).unwrap();
+        let m = colemak();
         let k = key('й', KeyModifiers::NONE);
         assert_eq!(m.translate(k, false).code, KeyCode::Char('j'));
         assert_eq!(m.translate(k, true).code, KeyCode::Char('й'));
@@ -162,7 +203,7 @@ mod tests {
 
     #[test]
     fn chords_map_everywhere_and_keep_modifiers() {
-        let m = Langmap::parse(PHONETIC).unwrap();
+        let m = colemak();
         let t = m.translate(key('н', KeyModifiers::CONTROL), true);
         assert_eq!(t.code, KeyCode::Char('n'));
         assert_eq!(t.modifiers, KeyModifiers::CONTROL);
