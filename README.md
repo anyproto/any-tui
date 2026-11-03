@@ -181,7 +181,7 @@ Navigation is vim-flavoured; `?` shows this list in the app, `q` quits.
 | key | action |
 | --- | --- |
 | `j` / `k` | move; in the list each chat opens as you land on it |
-| `Enter` or `l` / `Esc` or `h` | step into the open chat / back to the list |
+| `Enter` or `l` / `Esc` or `h` | step into the open chat / back to the list; from the list `Esc` goes on to the [system buffer](#system-buffer), so repeating it reaches it from anywhere |
 | `Space` | fuzzy-find any chat (`stg` finds **s**ync **t**eam: **g**eneral) |
 | `Ctrl-n` / `Ctrl-p` | next / previous chat without leaving the message pane |
 | `n` | jump to the next chat with unread, wherever it is |

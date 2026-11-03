@@ -2031,7 +2031,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &mut App) {
         "    Ctrl-n / Ctrl-p next / previous chat",
         "    j / k, ↓ / ↑    move chat · move message cursor",
         "    Enter / l       step into the chat",
-        "    Esc / h         back to chat list",
+        "    Esc / h         back to chat list; Esc again: system",
         "    Tab             switch pane",
         "    n               next chat with unread",
         "    g / G           oldest / newest message",

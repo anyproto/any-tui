@@ -805,6 +805,16 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
+    /// Puts the list cursor on the system buffer and opens it (the end of
+    /// the Esc chain); focus stays on the list.
+    pub fn go_system(&mut self) {
+        let Some(i) = self.chats.iter().position(|c| c.is_system()) else { return };
+        self.sel = i;
+        self.user_selected = true;
+        self.activate_selected();
+        self.back_to_list();
+    }
+
     /// A space's icon as a terminal glyph: a DM shows the other person's
     /// profile icon, any other space its own. None with `/icons` off.
     /// Also its `icon:v2` colour name, if any.

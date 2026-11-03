@@ -528,6 +528,10 @@ fn on_key(app: &mut App, k: KeyEvent) {
                 app.show_help = false;
             } else if app.reply_to.is_some() {
                 app.reply_to = None;
+            } else if k.code == KeyCode::Esc && app.focus == Focus::Sidebar && !app.sidebar_hidden {
+                // Esc keeps going: composer → chat → list → the system
+                // buffer, so it is reachable from anywhere by repeating it.
+                app.go_system();
             } else {
                 // Primary way back to the chat list when it's the hidden pane.
                 app.back_to_list();

@@ -394,7 +394,10 @@ layout), `main.rs` (CLI, terminal, keymap, loop).
 - Layout auto-collapses to one pane below `NARROW_COLS = 80`. `z` is a separate
   axis — `App::sidebar_hidden`, "show/hide the chat list", honoured at any
   width; hiding forces `Focus::Messages` (nothing else is left to focus) and
-  `back_to_list` (Esc) un-hides, so Esc always means "back to the chats".
+  `back_to_list` (Esc) un-hides, so Esc always means "back to the chats" —
+  and one more Esc on the list opens the system buffer (`go_system`), the
+  end of the chain composer → chat → list → system. `h` / Left / Backspace
+  stop at the list.
 
 ## Conventions
 
