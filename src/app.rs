@@ -145,6 +145,9 @@ pub struct Picker {
     pub query: Input,
     pub sel: usize,
     pub items: Vec<PickItem>,
+    /// Set once ↑/↓ moved the highlight: only then does it stay on that chat
+    /// as the query changes. Otherwise it follows the best match.
+    pub navigated: bool,
 }
 
 /// How wide the search reaches. The `/search` endpoint is per-space, so `Chat`
@@ -1481,6 +1484,9 @@ impl App {
             return;
         }
         self.input.reset();
+        // An accepted line ends the composing: back to NORMAL. A command
+        // that wants the composer again sets INSERT itself below.
+        self.mode = Mode::Normal;
         self.remember(raw);
         match cmd {
             Command::Send(text) => self.send_text(&chat.expect("checked above"), text),
@@ -2222,6 +2228,7 @@ impl App {
             query: Input::default(),
             sel: 0,
             items: Vec::new(),
+            navigated: false,
         });
         self.picker_filter();
     }
@@ -2235,7 +2242,7 @@ impl App {
     pub fn picker_filter(&mut self) {
         let Some(p) = &self.picker else { return };
         let query = p.query.value().to_string();
-        let keep = p.items.get(p.sel).map(|i| i.object_id.clone());
+        let keep = if p.navigated { p.items.get(p.sel).map(|i| i.object_id.clone()) } else { None };
 
         let mut scored: Vec<(i32, PickItem)> = Vec::new();
         for chat in self.chats.iter() {
@@ -2257,8 +2264,8 @@ impl App {
         let items: Vec<PickItem> = scored.into_iter().map(|(_, i)| i).collect();
 
         if let Some(p) = &mut self.picker {
-            // Hold the highlight on the same chat when possible, so typing
-            // doesn't yank the selection out from under you.
+            // The highlight follows the best match. Once ↑/↓ chose a chat it
+            // stays on that chat while the chat is still listed.
             p.sel = keep
                 .and_then(|c| items.iter().position(|i| i.object_id == c))
                 .unwrap_or(0)
@@ -2278,6 +2285,7 @@ impl App {
                 x if x > last => last,
                 x => x,
             };
+            p.navigated = true;
         }
     }
 
