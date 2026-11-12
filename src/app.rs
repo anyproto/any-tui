@@ -1501,7 +1501,7 @@ impl App {
                 let t = if self.prefs.highlights.is_empty() {
                     "no highlight words — /hl <word> adds one".to_string()
                 } else {
-                    format!("highlights: {}", self.prefs.highlights.join(", "))
+                    format!("highlights (all chats): {}", self.prefs.highlights.join(", "))
                 };
                 self.toast(t);
             }
@@ -1510,7 +1510,7 @@ impl App {
                     self.prefs.highlights.push(w.clone());
                     self.save_prefs();
                 }
-                self.toast(format!("highlighting \"{w}\""));
+                self.toast(format!("highlighting \"{w}\" in all chats"));
             }
             Command::Unhighlight(w) => {
                 let before = self.prefs.highlights.len();
@@ -1519,7 +1519,7 @@ impl App {
                     self.toast(format!("\"{w}\" wasn't highlighted"));
                 } else {
                     self.save_prefs();
-                    self.toast(format!("stopped highlighting \"{w}\""));
+                    self.toast(format!("stopped highlighting \"{w}\" in all chats"));
                 }
             }
             Command::Join(q) => self.join(&q),
